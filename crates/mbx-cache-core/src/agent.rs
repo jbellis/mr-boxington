@@ -1988,7 +1988,13 @@ impl CacheAgent {
             bail!("invalid shim warning");
         }
         let mut warnings = self.warnings.lock().unwrap();
-        if !warnings.contains(&message) && warnings.len() < MAX_WARNINGS {
+        if !warnings.contains(&message) {
+            // An acknowledgement promises the diagnostic was surfaced. A
+            // fatal shim error uses the same transport and must be able to
+            // fall back locally when this channel can no longer display it.
+            if warnings.len() >= MAX_WARNINGS {
+                bail!("shim warning limit reached");
+            }
             eprintln!("mbx[warning]: {message}");
             self.emit(|| AgentEvent::Warning {
                 message: message.clone(),

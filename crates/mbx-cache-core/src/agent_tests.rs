@@ -193,12 +193,25 @@ async fn stops_surfacing_shim_warnings_at_the_cap() {
         .with_observer(observer.clone());
 
     for index in 0..MAX_WARNINGS + 10 {
-        agent
+        let response = agent
             .respond(AgentRequest::RecordWarning {
                 message: format!("unique failure {index}"),
             })
             .await;
+        if index < MAX_WARNINGS {
+            assert!(matches!(response, AgentResponse::WarningRecorded));
+        } else {
+            assert!(matches!(response, AgentResponse::Error { .. }));
+        }
     }
+
+    // A message already surfaced remains acknowledged even after the cap.
+    let response = agent
+        .respond(AgentRequest::RecordWarning {
+            message: "unique failure 0".into(),
+        })
+        .await;
+    assert!(matches!(response, AgentResponse::WarningRecorded));
 
     assert_eq!(
         observer.0.load(Ordering::Relaxed),
