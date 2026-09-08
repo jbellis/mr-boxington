@@ -240,10 +240,11 @@ fn rustc_workspace_wrapper_is_preserved_without_becoming_the_compiler() {
 
 #[cfg(unix)]
 #[test]
-fn a_mid_compilation_input_edit_discards_the_result() {
+fn a_mid_compilation_input_edit_is_silent_and_withholds_the_result() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let store = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     write_dependent_project(project.path());
 
@@ -267,6 +268,7 @@ fn a_mid_compilation_input_edit_discards_the_result() {
         .current_dir(project.path())
         .args(["check", "--offline", "--verbose"])
         .env("MBX_CACHE_DIR", store.path())
+        .env("MBX_STATS_REPORT", reports.path().join("race.json"))
         .env("MBX_TARGET_VIEWS", "0")
         .env("MBX_LEARNED_INCREMENTAL", "0")
         .env("CARGO_INCREMENTAL", "0")
@@ -278,6 +280,7 @@ fn a_mid_compilation_input_edit_discards_the_result() {
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("MBX_LOG")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = child.spawn().expect("mbx should run");
@@ -310,48 +313,38 @@ fn a_mid_compilation_input_edit_discards_the_result() {
     let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !output.status.success(),
-        "the invalid compilation must fail"
+        !output.status.success() && stderr.contains("cannot find function `added` in crate `base`"),
+        "the dependent should report its own stale-input error after mbx preserves the base compiler result: {stderr}"
     );
     assert!(
-        stderr
-            .contains("mbx[error]: compilation result was discarded: compiler input was modified"),
-        "the mutation should be diagnosed as an error: {stderr}"
+        !stderr.contains("mbx[warning]") && !stderr.contains("mbx[error]"),
+        "routine input invalidation must be silent: {stderr}"
     );
     assert!(
-        !stderr.contains("mbx[warning]: compilation result was discarded"),
-        "a fatal rejection must retain its severity: {stderr}"
+        !stderr.contains("compilation result was discarded")
+            && !stderr.contains("result was not stored")
+            && !stderr.contains("compiler input was modified"),
+        "the invalidation detail must not reach Cargo's compiler stream: {stderr}"
     );
     assert!(
-        !stderr.contains("Checking above"),
-        "Cargo must not compile a dependent against the stale metadata: {stderr}"
+        stderr.contains("Checking above"),
+        "Cargo should continue with the dependent after the successful compiler result: {stderr}"
     );
 
-    let mut fingerprint_replays = Vec::new();
-    let fingerprint_root = project.path().join("target/debug/.fingerprint");
-    for unit in std::fs::read_dir(&fingerprint_root).unwrap().flatten() {
-        let Ok(files) = std::fs::read_dir(unit.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            if path
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("output-"))
-                && std::fs::read_to_string(&path)
-                    .is_ok_and(|output| output.contains("compilation result was discarded"))
-            {
-                fingerprint_replays.push(path);
-            }
-        }
+    for diagnostic in [
+        "compilation result was discarded",
+        "result was not stored",
+        "compiler input was modified",
+    ] {
+        let fingerprints = cargo_fingerprints_containing(project.path(), diagnostic);
+        assert!(
+            fingerprints.is_empty(),
+            "the routine invalidation diagnostic must not enter Cargo fingerprints ({diagnostic}): {fingerprints:?}"
+        );
     }
-    assert!(
-        fingerprint_replays.is_empty(),
-        "the rejected-result diagnostic must not enter Cargo fingerprints: {fingerprint_replays:?}"
-    );
 
     let deps = project.path().join("target/debug/deps");
-    let stale_outputs = std::fs::read_dir(deps)
+    let compiler_outputs = std::fs::read_dir(deps)
         .unwrap()
         .filter_map(Result::ok)
         .map(|entry| entry.file_name().to_string_lossy().into_owned())
@@ -361,47 +354,55 @@ fn a_mid_compilation_input_edit_discards_the_result() {
         })
         .collect::<Vec<_>>();
     assert!(
-        stale_outputs.is_empty(),
-        "the stale compiler outputs should be removed: {stale_outputs:?}"
+        !compiler_outputs.is_empty(),
+        "the successful compiler outputs should remain usable: {compiler_outputs:?}"
     );
 
-    // A shim diagnostic is delivered by the live session rather than through
-    // the compiler stream. Cargo must therefore have no rejected-result
-    // message to replay when the same source is compiled successfully.
-    let retry = Command::new(env!("CARGO_BIN_EXE_mbx"))
-        .current_dir(project.path())
-        .args(["check", "--offline"])
-        .env("MBX_CACHE_DIR", store.path())
-        .env("MBX_TARGET_VIEWS", "0")
-        .env("MBX_LEARNED_INCREMENTAL", "0")
-        .env("CARGO_INCREMENTAL", "0")
-        .env("RUSTC", &wrapper)
-        .env("TEST_REAL_RUSTC", which::which("rustc").unwrap())
-        .env("TEST_COMPILER_FINISHED", &compiled)
-        .env("TEST_RELEASE_COMPILER", &release)
-        .env_remove("MBX_SOCKET")
-        .env_remove("CARGO_TARGET_DIR")
-        .env_remove("RUSTC_WRAPPER")
-        .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .output()
-        .unwrap();
-    let retry_stderr = String::from_utf8_lossy(&retry.stderr);
-    assert!(
-        retry.status.success(),
-        "the unchanged retry should succeed: {retry_stderr}"
+    // Force a fresh target directory in an equivalent checkout. The source is
+    // the exact post-race source, so a cache hit here would prove that the
+    // unstable base result was published under its current action key.
+    let second = tempfile::tempdir().unwrap();
+    write_dependent_project(second.path());
+    std::fs::write(
+        second.path().join("base/src/lib.rs"),
+        "pub fn value() -> u32 { 1 }\npub fn added() -> u32 { 2 }\n",
+    )
+    .unwrap();
+    std::fs::write(
+        second.path().join("above/src/lib.rs"),
+        "pub fn doubled() -> u32 { base::value() }\n",
+    )
+    .unwrap();
+    let (second_stats, second_stderr) = build_with(
+        second.path(),
+        store.path(),
+        &reports.path().join("second.json"),
+        &[("MBX_TARGET_VIEWS", "0"), ("MBX_LEARNED_INCREMENTAL", "0")],
     );
     assert!(
-        !retry_stderr.contains("compilation result was discarded"),
-        "Cargo must not replay the rejected-result diagnostic: {retry_stderr}"
+        second_stats["compiler"]["unconsulted"]["invocations"]
+            .as_u64()
+            .is_some_and(|invocations| invocations > 0),
+        "the fresh equivalent checkout must compile the withheld result: {second_stats}"
+    );
+    assert_eq!(
+        second_stats["hits"].as_u64().unwrap_or_default(),
+        0,
+        "the raced base artifact must not be restorable under its post-edit key: {second_stats}"
+    );
+    assert!(
+        !second_stderr.contains("mbx[warning]") && !second_stderr.contains("mbx[error]"),
+        "the fresh build must remain free of routine mbx diagnostics: {second_stderr}"
     );
 }
 
 #[cfg(unix)]
 #[test]
-fn a_mid_compilation_build_script_edit_discards_the_execution_only_result() {
+fn a_mid_compilation_build_script_edit_is_silent_and_withholds_execution_cache() {
     use std::os::unix::fs::PermissionsExt as _;
 
     let store = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     write_execution_cached_project(project.path(), true);
 
@@ -422,6 +423,7 @@ fn a_mid_compilation_build_script_edit_discards_the_execution_only_result() {
         .current_dir(project.path())
         .args(["build", "--offline", "--verbose"])
         .env("MBX_CACHE_DIR", store.path())
+        .env("MBX_STATS_REPORT", reports.path().join("race.json"))
         .env("MBX_CACHE_LINKS", "0")
         .env("MBX_BUILD_SCRIPT_EXECUTION", "1")
         .env("MBX_TARGET_VIEWS", "0")
@@ -433,6 +435,7 @@ fn a_mid_compilation_build_script_edit_discards_the_execution_only_result() {
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("MBX_LOG")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     let mut child = child.spawn().expect("mbx should run");
@@ -459,12 +462,70 @@ fn a_mid_compilation_build_script_edit_discards_the_execution_only_result() {
     let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        !output.status.success(),
-        "the invalid build-script compilation must fail"
+        output.status.success(),
+        "a successful build-script compiler result must remain successful: {stderr}"
     );
     assert!(
-        stderr.contains("compilation result was discarded: compiler input was modified"),
-        "the build-script mutation should be diagnosed: {stderr}"
+        !stderr.contains("mbx[warning]") && !stderr.contains("mbx[error]"),
+        "routine build-script invalidation must be silent: {stderr}"
+    );
+    assert!(
+        !stderr.contains("compilation result was discarded")
+            && !stderr.contains("result was not stored")
+            && !stderr.contains("compiler input was modified"),
+        "the build-script invalidation detail must not reach Cargo's compiler stream: {stderr}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(project.path().join("runs")).unwrap(),
+        "1",
+        "Cargo should execute the successful local build-script result"
+    );
+
+    for diagnostic in [
+        "compilation result was discarded",
+        "result was not stored",
+        "compiler input was modified",
+    ] {
+        let fingerprints = cargo_fingerprints_containing(project.path(), diagnostic);
+        assert!(
+            fingerprints.is_empty(),
+            "the routine build-script invalidation diagnostic must not enter Cargo fingerprints ({diagnostic}): {fingerprints:?}"
+        );
+    }
+
+    // A fresh equivalent checkout must execute its own build script. If the
+    // raced compiler had installed or published an execution entry, this
+    // would restore the result and leave `runs` absent.
+    let second = tempfile::tempdir().unwrap();
+    write_execution_cached_project(second.path(), true);
+    let build_script = second.path().join("build.rs");
+    let mut source = std::fs::read_to_string(&build_script).unwrap();
+    source.push_str("\n// edited while rustc was running\n");
+    std::fs::write(build_script, source).unwrap();
+    let (second_stats, second_stderr) = build_with(
+        second.path(),
+        store.path(),
+        &reports.path().join("second.json"),
+        &[
+            ("MBX_CACHE_LINKS", "0"),
+            ("MBX_BUILD_SCRIPT_EXECUTION", "1"),
+            ("MBX_TARGET_VIEWS", "0"),
+        ],
+    );
+    assert!(
+        second_stats["compiler"]["bypass"]["invocations"]
+            .as_u64()
+            .is_some_and(|invocations| invocations > 0),
+        "the fresh checkout must compile its build script: {second_stats}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(second.path().join("runs")).unwrap(),
+        "1",
+        "the fresh checkout must execute rather than restore a stale build script result"
+    );
+    assert!(
+        !second_stderr.contains("mbx[warning]") && !second_stderr.contains("mbx[error]"),
+        "the fresh build must remain free of routine mbx diagnostics: {second_stderr}"
     );
 }
 
@@ -3743,4 +3804,33 @@ fn cc_publication_failures_are_visible_without_counting_a_second_outcome() {
             "{stats}"
         );
     }
+}
+
+fn cargo_fingerprints_containing(project: &Path, message: &str) -> Vec<std::path::PathBuf> {
+    let fingerprint_root = project.join("target/debug/.fingerprint");
+    let mut matches = Vec::new();
+    for unit in std::fs::read_dir(&fingerprint_root).expect("Cargo fingerprint root should exist") {
+        let unit = unit.expect("Cargo fingerprint entry should be readable");
+        if !unit
+            .file_type()
+            .expect("Cargo fingerprint type should be readable")
+            .is_dir()
+        {
+            continue;
+        }
+        for file in std::fs::read_dir(unit.path()).expect("Cargo fingerprint files should exist") {
+            let file = file.expect("Cargo fingerprint file should be readable");
+            let path = file.path();
+            if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("output-"))
+                && std::fs::read_to_string(&path)
+                    .expect("Cargo fingerprint output should be readable")
+                    .contains(message)
+            {
+                matches.push(path);
+            }
+        }
+    }
+    matches
 }

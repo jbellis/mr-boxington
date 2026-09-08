@@ -1,6 +1,6 @@
 use super::*;
 use crate::manifest_snapshot;
-use mbx_cache_core::NoFileDigestCache;
+use mbx_cache_core::{FileIdentity, FileObjectIdentity, FileObservation, NoFileDigestCache};
 use std::collections::BTreeSet;
 
 #[test]
@@ -286,25 +286,30 @@ fn precompile_snapshot_does_not_depend_on_the_host_clock() {
         &NoFileDigestCache,
     )
     .expect("discovery");
-    let snapshot = mbx_cache_core::FileSnapshot::capture(&source)
-        .unwrap()
-        .unwrap();
-    let before = BTreeMap::from([(source.clone(), snapshot)]);
+    let observation = FileObservation::capture(&source).unwrap().unwrap();
+    let before = BTreeMap::from([(source.clone(), observation)]);
 
     discovered
-        .verify_not_modified_since_with_snapshots(SystemTime::UNIX_EPOCH, &before)
+        .verify_not_modified_since_with_observations(SystemTime::UNIX_EPOCH, &before)
         .expect("an unchanged identity is independent of clock offset");
 
     std::fs::write(&source, "int a(void) { return 1; }\n").expect("rewrite");
+    let changed = CcDiscoveredInputs::collect(
+        root,
+        BTreeSet::from([source.clone()]),
+        BTreeSet::new(),
+        &NoFileDigestCache,
+    )
+    .expect("changed input can still be observed");
     assert_eq!(
-        discovered
-            .verify_not_modified_since_with_snapshots(
+        changed
+            .verify_not_modified_since_with_observations(
                 SystemTime::now() + std::time::Duration::from_secs(60),
                 &before,
             )
             .unwrap_err()
             .kind(),
-        "input-modified-during-compilation"
+        "input-changed"
     );
 }
 
@@ -517,60 +522,75 @@ fn parses_msvc_source_dependencies() {
     );
 }
 
-/// A ledger that answers one known identity with a fixed digest.
-struct SentinelLedger {
-    known: FileIdentity,
-    digest: CacheDigest,
-}
-
-impl FileDigestCache for SentinelLedger {
-    fn find(&self, _scope: FileDigestScope, files: &[FileIdentity]) -> Vec<Option<CacheDigest>> {
-        files
-            .iter()
-            .map(|file| (*file == self.known).then(|| self.digest.clone()))
-            .collect()
-    }
-
-    fn record(&self, _scope: FileDigestScope, _entries: Vec<RecordedFileDigest>) {}
-}
-
-/// Verification confirms an input by the identity `collect` recorded rather
-/// than by reading it again, and reads it again once that identity has moved.
-/// Only where the identity carries a change time.
-#[cfg(unix)]
+/// Final verification compares a fresh shared observation with the one that
+/// produced the action key, so an overwrite is a cache miss even when the
+/// compiler's local output remains successful.
 #[test]
-fn verification_trusts_an_unchanged_identity_and_rereads_a_changed_one() {
+fn verification_rejects_a_changed_digest() {
     let directory = tempfile::tempdir().expect("tempdir");
     let root = directory.path();
     let header = write(root, "a.h", "int a(void);\n");
-    let metadata = std::fs::metadata(&header).expect("metadata");
-    // Hashing could never produce the sentinel, so a verify that passes can
-    // only have trusted the identity.
-    let sentinel = CacheDigest {
-        algorithm: "blake3".into(),
-        hash: "c".repeat(64),
-        size: metadata.len(),
-    };
-    let ledger = SentinelLedger {
-        known: FileIdentity::describe(&header, &metadata).expect("identity"),
-        digest: sentinel.clone(),
-    };
     let discovered = CcDiscoveredInputs::collect(
         root,
         BTreeSet::from([header.clone()]),
         BTreeSet::from([root.to_path_buf()]),
-        &ledger,
+        &NoFileDigestCache,
     )
     .expect("discovery");
-    assert_eq!(discovered.files().next().expect("input").digest, sentinel);
 
-    discovered.verify().expect("an unchanged identity verifies");
+    discovered
+        .verify()
+        .expect("an unchanged observation verifies");
 
-    // Same length, new bytes: the write moves the identity, so the file is
-    // read again and the sentinel no longer describes it.
+    // Same-length new bytes must be classified as changed by content, not as
+    // an indeterminate timestamp race.
     std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(&header, "int b(void);\n").expect("rewrite");
     assert_eq!(discovered.verify().unwrap_err().kind(), "input-changed");
+}
+
+#[test]
+fn observation_matching_tolerates_timestamp_churn_but_not_replacement() {
+    let path = PathBuf::from("/workspace/include/a.h");
+    let digest = CacheDigest::blake3(b"int a(void);\n");
+    let object = FileObjectIdentity {
+        device_major: 8,
+        device_minor: 1,
+        mount_id: 42,
+        inode: 7,
+    };
+    let before_identity = FileIdentity {
+        path: path.clone(),
+        len: digest.size,
+        modified: SystemTime::UNIX_EPOCH,
+        changed: Some((1, 0)),
+        object: Some(object.clone()),
+    };
+    let mut timestamp_churn = before_identity.clone();
+    timestamp_churn.modified = SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1);
+    timestamp_churn.changed = Some((2, 0));
+    let observation = FileObservation {
+        identity: before_identity,
+        digest: digest.clone(),
+    };
+
+    assert_eq!(
+        observation.compare(Some(&timestamp_churn), &digest),
+        FileObservationMatch::Reusable
+    );
+
+    let mut replacement = timestamp_churn;
+    replacement.object = Some(FileObjectIdentity { inode: 8, ..object });
+    assert_eq!(
+        observation.compare(Some(&replacement), &digest),
+        FileObservationMatch::Indeterminate
+    );
+
+    let changed = CacheDigest::blake3(b"int b(void);\n");
+    assert_eq!(
+        observation.compare(Some(&replacement), &changed),
+        FileObservationMatch::Changed
+    );
 }
 
 /// The list the shim writes for a caller reads back through the same parser,

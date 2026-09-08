@@ -1,47 +1,39 @@
 use eyre::{Context, Result};
-use mbx_cache_core::FileSnapshot;
+use mbx_cache_core::FileObservation;
 use std::collections::BTreeMap;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Capture clock-independent snapshots for compiler inputs known up front.
-#[cfg(unix)]
-pub(crate) fn snapshot_compiler_inputs<'a>(
+/// Establish content observations for compiler inputs known up front.
+pub(crate) fn observe_compiler_inputs<'a>(
     paths: impl IntoIterator<Item = &'a Path>,
-) -> std::io::Result<BTreeMap<PathBuf, FileSnapshot>> {
+) -> std::io::Result<BTreeMap<PathBuf, FileObservation>> {
     let digests = crate::session::file_digest_cache();
+    let paths = paths.into_iter().map(Path::to_path_buf).collect::<Vec<_>>();
+    let observations = FileObservation::capture_many(paths.iter().map(PathBuf::as_path), digests)
+        .map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("failed to observe compiler inputs: {error}"),
+        )
+    })?;
     paths
         .into_iter()
-        .map(|path| {
-            let snapshot = FileSnapshot::capture_with_cache(path, digests).map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "failed to capture compiler input snapshot for {}: {error}",
-                        path.display()
-                    ),
-                )
-            })?;
-            let snapshot = snapshot.ok_or_else(|| {
+        .zip(observations)
+        .map(|(path, observation)| {
+            let observation = observation.ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::Unsupported,
                     format!(
-                        "filesystem supplied no snapshot for compiler input {}",
+                        "filesystem supplied no observation for compiler input {}",
                         path.display()
                     ),
                 )
             })?;
-            Ok((path.to_path_buf(), snapshot))
+            Ok((path, observation))
         })
         .collect()
-}
-
-#[cfg(not(unix))]
-pub(crate) fn snapshot_compiler_inputs<'a>(
-    _paths: impl IntoIterator<Item = &'a Path>,
-) -> std::io::Result<BTreeMap<PathBuf, FileSnapshot>> {
-    Ok(BTreeMap::new())
 }
 
 /// Find the workspace root above `start`.
@@ -509,16 +501,15 @@ pub fn random_string(length: usize) -> String {
 mod tests {
     use super::*;
 
-    #[cfg(unix)]
     #[test]
-    fn compiler_input_snapshot_fails_closed() {
+    fn compiler_input_observation_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
         let missing = directory.path().join("missing-input");
-        let error = snapshot_compiler_inputs([missing.as_path()]).unwrap_err();
+        let error = observe_compiler_inputs([missing.as_path()]).unwrap_err();
         assert!(
             error
                 .to_string()
-                .contains("failed to capture compiler input snapshot")
+                .contains("failed to observe compiler inputs")
         );
     }
 

@@ -1,5 +1,17 @@
 use super::*;
 
+#[cfg(unix)]
+fn success_status() -> std::process::ExitStatus {
+    use std::os::unix::process::ExitStatusExt as _;
+    std::process::ExitStatus::from_raw(0)
+}
+
+#[cfg(windows)]
+fn success_status() -> std::process::ExitStatus {
+    use std::os::windows::process::ExitStatusExt as _;
+    std::process::ExitStatus::from_raw(0)
+}
+
 /// Only a toolchain's own compiler is pinned: a proxy or shim has no
 /// `rustc_driver` beside it, and its bytes say nothing about the toolchain
 /// it will pick.
@@ -637,62 +649,57 @@ fn materialized_outputs_are_independent_from_the_cas() {
 }
 
 #[test]
-fn only_compiler_input_mutations_invalidate_local_outputs() {
-    let path = PathBuf::from("src/lib.rs");
-    let identity = FileIdentity {
-        path: path.clone(),
-        len: 6,
-        modified: SystemTime::UNIX_EPOCH,
-        changed: Some((1, 2)),
-        object: None,
-    };
-    let snapshot = FileSnapshot::from(identity);
-    let snapshots = Ok(BTreeMap::from([(path.clone(), snapshot)]));
-    let changed =
-        eyre::Report::new(BypassReason::InputChanged(path.clone())).wrap_err("publication failed");
-    let overlapping = eyre::Report::new(BypassReason::InputModifiedDuringCompilation(path));
-
-    assert!(compiler_input_was_modified(&changed, &snapshots));
-    assert!(compiler_input_was_modified(&overlapping, &snapshots));
-    assert!(!compiler_input_was_modified(
-        &eyre::eyre!("the cache is unavailable"),
-        &snapshots
-    ));
-}
-
-#[test]
-fn timestamp_only_input_overlap_does_not_invalidate_local_outputs() {
+fn input_validation_bypasses_are_routine_but_unexpected_failures_are_not() {
+    let changed = eyre::Report::new(BypassReason::InputChanged("src/lib.rs".into()));
     let overlapping = eyre::Report::new(BypassReason::InputModifiedDuringCompilation(
         "src/module.rs".into(),
     ));
+    let unreadable = eyre::Report::new(BypassReason::InputRead {
+        path: "src/missing.rs".into(),
+        message: "gone".into(),
+    });
 
-    assert!(!compiler_input_was_modified(
-        &overlapping,
-        &Ok(BTreeMap::new())
-    ));
+    assert!(is_routine_cache_outcome(&changed));
+    assert!(is_routine_cache_outcome(&overlapping));
+    assert!(is_routine_cache_outcome(&unreadable));
+    assert!(is_routine_cache_outcome(&eyre::Report::new(
+        std::io::Error::new(std::io::ErrorKind::WouldBlock, "unstable observation")
+    )));
+    assert!(!is_routine_cache_outcome(&eyre::eyre!(
+        "the cache is unavailable"
+    )));
+    assert!(!is_routine_cache_outcome(&eyre::Report::new(
+        std::io::Error::other("the store failed")
+    )));
 }
 
 #[test]
-fn discards_every_modeled_compiler_output() {
+fn successful_compiler_output_is_replayed_after_validation_bypass() {
     let directory = tempfile::tempdir().unwrap();
-    let metadata = directory.path().join("libfixture.rmeta");
-    let library = directory.path().join("libfixture.rlib");
+    let output_file = directory.path().join("libfixture.rlib");
     let dep_info = directory.path().join("fixture.d");
-    for path in [&metadata, &library, &dep_info] {
-        std::fs::write(path, b"output").unwrap();
-    }
-    let outputs = RustcOutputs {
-        directory: directory.path().to_path_buf(),
-        files: vec![metadata.clone(), library.clone()],
-        dep_info: dep_info.clone(),
+    std::fs::write(&output_file, b"compiled output").unwrap();
+    std::fs::write(&dep_info, b"compiled dependencies").unwrap();
+
+    let output = Output {
+        status: success_status(),
+        stdout: b"rustc stdout\n".to_vec(),
+        stderr: b"rustc stderr\n".to_vec(),
     };
+    let mut replayed = None;
+    let exit = replay_compiler_output_with(&output, |output| {
+        replayed = Some((output.stdout.clone(), output.stderr.clone()));
+        Ok(())
+    })
+    .unwrap();
 
-    discard_compiler_outputs(&outputs).unwrap();
-
-    assert!(!metadata.exists());
-    assert!(!library.exists());
-    assert!(!dep_info.exists());
-    discard_compiler_outputs(&outputs).unwrap();
+    assert_eq!(exit, ExitCode::SUCCESS);
+    assert_eq!(
+        replayed,
+        Some((output.stdout.clone(), output.stderr.clone()))
+    );
+    assert_eq!(std::fs::read(&output_file).unwrap(), b"compiled output");
+    assert_eq!(std::fs::read(&dep_info).unwrap(), b"compiled dependencies");
 }
 
 #[test]

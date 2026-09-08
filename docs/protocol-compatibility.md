@@ -25,7 +25,7 @@ the handshake and do not exchange cache requests. Adding, removing, or changing
 a request or response therefore requires incrementing `AGENT_PROTOCOL_VERSION`.
 
 `crates/mbx-cache-core/tests/agent_protocol.rs` exercises every request and
-response variant against `tests/fixtures/agent-protocol-v9.jsonl`. Its exhaustive
+response variant against `tests/fixtures/agent-protocol-v10.jsonl`. Its exhaustive
 matches make a newly added variant fail to compile until the fixture and the
 protocol-version decision are reviewed together.
 
@@ -45,13 +45,17 @@ has the agent read a ledger miss once and hand the digest to every shim that
 asked for it at the same time. v8 adds `pins` to `store_executable_identity`:
 the files a probe read, as they were when it read them, whose presence, length
 and modification time let the agent keep a compiler or linker identity across
-sessions instead of probing it in every build. The client and agent still require exact
-protocol and application-version equality, including when different
-applications ship them.
+sessions instead of probing it in every build.
 
 Agent protocol v9 adds `record_debug` and `debug_recorded`. Routine shim logs
 carry their original module target and are filtered by the session logger.
 They do not consume the warning/error diagnostic allowance.
+
+v10 distinguishes an unavailable
+file-digest resolver from one that attempted a read but could not bind it to a
+stable file identity, so a shim can fall back for the former and bypass without
+retrying the latter. The client and agent still require exact protocol and
+application-version equality, including when different applications ship them.
 
 ## Remote cache protocol
 

@@ -33,7 +33,8 @@ pub(crate) use prefetch::select_prefetch_actions;
 
 pub use file_digest::{
     FileDigestCache, FileDigestResolution, FileDigestScope, FileIdentity, FileObjectIdentity,
-    FileSnapshot, NoFileDigestCache, RecordedFileDigest, digest_file,
+    FileObservation, FileObservationMatch, FileObservationResolution, FileSnapshot,
+    NoFileDigestCache, RecordedFileDigest, digest_file,
 };
 pub use manifest::{is_task_identity, task_manifest_actions};
 use manifest::{
@@ -2140,20 +2141,16 @@ impl CacheAgent {
         #[cfg(test)]
         self.file_digest_reads.fetch_add(1, Ordering::Relaxed);
         let path = file.path.clone();
+        let expected = file.clone();
         let resolved = tokio::task::spawn_blocking(move || {
-            let resolution = digest_file(scope, &path)?;
-            let current = std::fs::metadata(&path)
-                .and_then(|metadata| FileIdentity::for_digest_cache(&path, &metadata));
-            Ok::<_, std::io::Error>((resolution, current?))
+            file_digest::digest_file_for_identity(scope, &path, &expected)
         })
         .await;
-        let Ok(Ok((resolution, current))) = resolved else {
-            return FileDigestResolution::Unresolved;
+        let Ok(Ok(resolution)) = resolved else {
+            return FileDigestResolution::Indeterminate;
         };
         let resolution = match resolution {
-            FileDigestResolution::Digest(digest)
-                if current.as_ref() == Some(&file) && digest.size == file.len =>
-            {
+            FileDigestResolution::Digest(digest) => {
                 let _ = self.record_file_digests(
                     scope,
                     vec![RecordedFileDigest {
@@ -2163,12 +2160,11 @@ impl CacheAgent {
                 );
                 FileDigestResolution::Digest(digest)
             }
-            FileDigestResolution::EmbeddedTimestampMacro if current.as_ref() == Some(&file) => {
+            FileDigestResolution::EmbeddedTimestampMacro => {
                 FileDigestResolution::EmbeddedTimestampMacro
             }
-            FileDigestResolution::Digest(_)
-            | FileDigestResolution::EmbeddedTimestampMacro
-            | FileDigestResolution::Unresolved => FileDigestResolution::Unresolved,
+            FileDigestResolution::Indeterminate => FileDigestResolution::Indeterminate,
+            FileDigestResolution::Unresolved => FileDigestResolution::Unresolved,
         };
         *lock.resolution.lock().unwrap() = Some(resolution.clone());
         resolution

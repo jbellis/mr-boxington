@@ -11,7 +11,7 @@ use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
-const AGENT_FIXTURE: &str = include_str!("fixtures/agent-protocol-v9.jsonl");
+const AGENT_FIXTURE: &str = include_str!("fixtures/agent-protocol-v10.jsonl");
 
 fn digest() -> CacheDigest {
     CacheDigest {
@@ -119,7 +119,7 @@ fn requests() -> Vec<(&'static str, AgentRequest)> {
         (
             "request.hello",
             AgentRequest::Hello {
-                protocol: 9,
+                protocol: 10,
                 client_version: "0.3.0".into(),
             },
         ),
@@ -303,7 +303,7 @@ fn responses() -> Vec<(&'static str, AgentResponse)> {
         (
             "response.hello",
             AgentResponse::Hello {
-                protocol: 9,
+                protocol: 10,
                 agent_version: "0.3.0".into(),
             },
         ),
@@ -440,6 +440,7 @@ fn responses() -> Vec<(&'static str, AgentResponse)> {
                 resolutions: vec![
                     FileDigestResolution::Digest(digest()),
                     FileDigestResolution::EmbeddedTimestampMacro,
+                    FileDigestResolution::Indeterminate,
                     FileDigestResolution::Unresolved,
                 ],
             },
@@ -467,7 +468,7 @@ fn assert_fixture<T: Serialize>(expected: &mut BTreeMap<&str, &str>, name: &str,
 }
 
 #[test]
-fn agent_protocol_v9_shapes_match_the_conformance_fixture() {
+fn agent_protocol_v10_shapes_match_the_conformance_fixture() {
     let mut expected = fixture();
     for line in AGENT_FIXTURE.lines() {
         let (name, json) = line
@@ -545,7 +546,7 @@ fn agent_protocol_v9_shapes_match_the_conformance_fixture() {
 
 #[test]
 fn protocol_constants_match_the_contract() {
-    assert_eq!(AGENT_PROTOCOL_VERSION, 9);
+    assert_eq!(AGENT_PROTOCOL_VERSION, 10);
     assert_eq!(PROTOCOL_VERSION, 1);
     assert_eq!(
         ACTION_RESULT_MEDIA_TYPE,

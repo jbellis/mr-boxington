@@ -82,7 +82,7 @@ pub struct FileIdentity {
     pub modified: SystemTime,
     /// Platform metadata-change token, where one exists.
     pub changed: Option<(i64, i64)>,
-    /// Stable object identity used when an NFS client's change time is not.
+    /// Stable object identity where the platform exposes one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub object: Option<FileObjectIdentity>,
 }
@@ -91,11 +91,11 @@ pub struct FileIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FileObjectIdentity {
-    /// Device major number reported by `statx`.
+    /// Device identifier's major or high-order component.
     pub device_major: u32,
-    /// Device minor number reported by `statx`.
+    /// Device identifier's minor or low-order component.
     pub device_minor: u32,
-    /// Mount identifier in this mount namespace.
+    /// Mount identifier in this mount namespace, or zero when unavailable.
     pub mount_id: u64,
     /// Inode number within the mounted filesystem.
     pub inode: u64,
@@ -110,7 +110,7 @@ impl FileIdentity {
             len: metadata.len(),
             modified: metadata.modified().ok()?,
             changed: change_token(metadata),
-            object: None,
+            object: metadata_object_identity(metadata),
         })
     }
 
@@ -150,72 +150,577 @@ impl FileIdentity {
     }
 }
 
-/// A pre-operation snapshot that can prove whether a file's contents changed.
+/// A content observation established for one file object.
 ///
-/// Most filesystems provide a stable metadata-change token, so the inexpensive
-/// identity is sufficient. Linux NFS can reconcile client and server timestamps
-/// after a writer has closed the file, making two metadata reads disagree
-/// without any intervening write. Those files carry a content digest instead,
-/// while retaining length and file identity to detect replacement. Callers use
-/// the same comparison either way and do not need to know which filesystem
-/// supplied the file.
+/// An observation is the unit used when a caller needs to compare a file
+/// before and after an operation. The digest is never returned (or recorded in
+/// a [`FileDigestCache`]) until the read that produced it has been associated
+/// with the identity of the file that was read. A changing file therefore
+/// yields [`io::ErrorKind::WouldBlock`] instead of a potentially mismatched
+/// identity/digest pair. As with ordinary build-tool freshness checks, this
+/// assumes inputs are not adversarially changed and restored, including their
+/// observable timestamps, entirely between observations.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FileSnapshot {
-    identity: FileIdentity,
-    content: Option<CacheDigest>,
+pub struct FileObservation {
+    /// Identity of the file object observed while reading its contents.
+    pub identity: FileIdentity,
+    /// Content digest read from that file object.
+    pub digest: CacheDigest,
 }
 
-impl FileSnapshot {
-    /// Capture the strongest comparison the file's filesystem can support.
+/// How a later input observation compares with an earlier one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileObservationMatch {
+    /// The bytes and file object are compatible with reuse.
+    Reusable,
+    /// The later digest proves that the input bytes differ.
+    Changed,
+    /// The bytes match, but the available identity cannot establish that the
+    /// same file object was observed (for example, a local replacement where
+    /// no object identity is available).
+    Indeterminate,
+}
+
+/// Result of observing an input under a digest scope.
+///
+/// C/C++ input scanning has one additional result: a timestamp preprocessor
+/// macro makes the digest unsuitable for action reuse. Keeping that result in
+/// the shared observation layer lets both compiler adapters use the same
+/// identity/read validation without duplicating the scan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FileObservationResolution {
+    /// A validated file observation.
+    Observation(FileObservation),
+    /// A C/C++ input contains a time-dependent preprocessor macro.
+    EmbeddedTimestampMacro,
+}
+
+impl FileObservation {
+    /// Capture and hash `path` in one attempt without consulting a digest
+    /// cache.
     pub fn capture(path: &Path) -> io::Result<Option<Self>> {
-        let metadata = std::fs::metadata(path)?;
-        capture_file_snapshot(
-            path,
-            &NoFileDigestCache,
-            metadata_identity_is_unreliable(path, &metadata)?,
-            metadata,
-        )
+        Self::capture_with_cache(path, &NoFileDigestCache)
     }
 
-    /// Capture a snapshot while reusing or publishing a content digest through
-    /// the session ledger when the filesystem requires one.
+    /// Read `path` and retain the bytes while establishing their observation.
+    ///
+    /// Output publication uses this when it must inspect and hash the same
+    /// bytes. Returning both avoids a second full-file read while preserving
+    /// the identity checks used by ordinary observations.
+    pub fn capture_with_contents(path: &Path) -> io::Result<Option<(Self, Vec<u8>)>> {
+        let metadata = std::fs::metadata(path)?;
+        if !metadata.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("observation path is not a regular file: {}", path.display()),
+            ));
+        }
+        let unreliable = metadata_identity_is_unreliable(path, &metadata)?;
+        let file = std::fs::File::open(path)?;
+        let before = file.metadata()?;
+        let mut contents = Vec::new();
+        (&file).read_to_end(&mut contents)?;
+        let after = file.metadata()?;
+        let digest = CacheDigest::blake3(&contents);
+        let Some(current) = current_file_identity(path, unreliable)? else {
+            return Ok(None);
+        };
+        if !handle_observation_is_stable(path, &before, &after, &current, unreliable, digest.size)?
+        {
+            return Err(unstable_capture_error());
+        }
+        Ok(Some((
+            Self {
+                identity: current,
+                digest,
+            },
+            contents,
+        )))
+    }
+
+    /// Capture `path`, resolving one cached digest when available.
+    ///
+    /// A cached digest is accepted only when the path still has the exact
+    /// identity used for the lookup. On a cache miss, the file is opened once,
+    /// hashed through that handle, and checked against the path after the read
+    /// completes. There are deliberately no retries: `WouldBlock` is an
+    /// indeterminate cache-validation result and callers should continue with
+    /// their ordinary compiler path.
     pub fn capture_with_cache(
         path: &Path,
         digests: &dyn FileDigestCache,
     ) -> io::Result<Option<Self>> {
-        let metadata = std::fs::metadata(path)?;
-        capture_file_snapshot(
-            path,
-            digests,
-            metadata_identity_is_unreliable(path, &metadata)?,
-            metadata,
-        )
+        let mut observations = Self::capture_many(std::iter::once(path), digests)?;
+        Ok(observations.pop().flatten())
     }
 
-    /// Whether `identity` and `content` still describe this snapshot.
-    ///
-    /// A content-backed snapshot ignores both timestamps: NFS can reconcile
-    /// mtime as well as ctime without a content change. Matching endpoint
-    /// digests cannot detect an intervening edit that restores the original
-    /// bytes. Digest-cache lookup still uses timestamps to decide when a
-    /// digest needs refreshing; this comparison performs no additional reads.
-    pub fn matches(&self, identity: Option<&FileIdentity>, content: &CacheDigest) -> bool {
-        self.content.as_ref().map_or_else(
-            || identity == Some(&self.identity),
-            |before| {
-                before == content
-                    && identity.is_some_and(|after| {
-                        self.identity.path == after.path
-                            && self.identity.len == after.len
-                            && self.identity.object == after.object
+    /// Capture several paths while resolving all available cached digests in
+    /// one batch. Results retain input order. A single unstable path returns
+    /// [`io::ErrorKind::WouldBlock`] for the batch, allowing the caller to
+    /// bypass cache publication without accepting any partial observations.
+    pub fn capture_many<'a, I, P>(
+        paths: I,
+        digests: &dyn FileDigestCache,
+    ) -> io::Result<Vec<Option<Self>>>
+    where
+        I: IntoIterator<Item = &'a P>,
+        P: AsRef<Path> + ?Sized + 'a,
+    {
+        Self::capture_many_with_scope(FileDigestScope::Content, paths, digests).map(
+            |observations| {
+                observations
+                    .into_iter()
+                    .map(|observation| match observation {
+                        Some(FileObservationResolution::Observation(observation)) => {
+                            Some(observation)
+                        }
+                        Some(FileObservationResolution::EmbeddedTimestampMacro) => {
+                            unreachable!("content observation cannot contain timestamp macros")
+                        }
+                        None => None,
                     })
+                    .collect()
             },
         )
     }
 
-    /// Whether a mismatch proves the file's contents changed.
+    /// Capture one path under `scope`, preserving scope-specific outcomes such
+    /// as [`FileObservationResolution::EmbeddedTimestampMacro`].
+    pub fn capture_with_scope(
+        path: &Path,
+        scope: FileDigestScope,
+        digests: &dyn FileDigestCache,
+    ) -> io::Result<Option<FileObservationResolution>> {
+        let mut observations =
+            Self::capture_many_with_scope(scope, std::iter::once(path), digests)?;
+        Ok(observations.pop().flatten())
+    }
+
+    /// Capture several paths under `scope` while resolving all available
+    /// cached digests in one batch. Results retain input order. A single
+    /// unstable path returns [`io::ErrorKind::WouldBlock`] for the batch,
+    /// allowing the caller to bypass cache publication without accepting any
+    /// partial observations.
+    pub fn capture_many_with_scope<'a, I, P>(
+        scope: FileDigestScope,
+        paths: I,
+        digests: &dyn FileDigestCache,
+    ) -> io::Result<Vec<Option<FileObservationResolution>>>
+    where
+        I: IntoIterator<Item = &'a P>,
+        P: AsRef<Path> + ?Sized + 'a,
+    {
+        let mut inputs = Vec::new();
+        for path in paths {
+            let path = path.as_ref();
+            let metadata = std::fs::metadata(path)?;
+            if !metadata.is_file() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("observation path is not a regular file: {}", path.display()),
+                ));
+            }
+            let unreliable = metadata_identity_is_unreliable(path, &metadata)?;
+            let cache_identity = digest_cache_identity(path, &metadata, unreliable)?;
+            let identity = cache_identity
+                .clone()
+                .or_else(|| FileIdentity::describe(path, &metadata));
+            inputs.push(CaptureInput {
+                path: path.to_path_buf(),
+                unreliable,
+                cache_identity,
+                identity,
+            });
+        }
+
+        let queries = inputs
+            .iter()
+            .filter_map(|input| input.cache_identity.clone())
+            .collect::<Vec<_>>();
+        let mut resolutions = digests.resolve(scope, &queries).into_iter();
+        let mut observations = Vec::with_capacity(inputs.len());
+        let mut fresh = Vec::new();
+        for input in inputs {
+            let Some(identity) = input.identity else {
+                observations.push(None);
+                continue;
+            };
+            let resolution = input
+                .cache_identity
+                .as_ref()
+                .and_then(|_| resolutions.next())
+                .unwrap_or(FileDigestResolution::Unresolved);
+            match resolution {
+                FileDigestResolution::Digest(digest) => {
+                    if digest.size != identity.len {
+                        return Err(unstable_capture_error());
+                    }
+                    let current = current_file_identity(&input.path, input.unreliable)?;
+                    if current.as_ref() != Some(&identity) {
+                        return Err(unstable_capture_error());
+                    }
+                    observations.push(Some(FileObservationResolution::Observation(Self {
+                        identity,
+                        digest,
+                    })));
+                    continue;
+                }
+                FileDigestResolution::EmbeddedTimestampMacro
+                    if scope == FileDigestScope::CcInput =>
+                {
+                    // A cached macro result carries no content digest, but it
+                    // is still valid only for the identity used to resolve
+                    // it. Do not rescan the file and lose batch coalescing.
+                    let current = current_file_identity(&input.path, input.unreliable)?;
+                    if current.as_ref() != Some(&identity) {
+                        return Err(unstable_capture_error());
+                    }
+                    observations.push(Some(FileObservationResolution::EmbeddedTimestampMacro));
+                    continue;
+                }
+                FileDigestResolution::EmbeddedTimestampMacro => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "content digest resolver returned a cc-only outcome",
+                    ));
+                }
+                FileDigestResolution::Indeterminate => return Err(unstable_capture_error()),
+                FileDigestResolution::Unresolved => {}
+            }
+
+            let (resolution, digest_size, before, after) = digest_open_file(scope, &input.path)?;
+            let current = current_file_identity(&input.path, input.unreliable)?;
+            let Some(current) = current else {
+                observations.push(None);
+                continue;
+            };
+            if !handle_observation_is_stable(
+                &input.path,
+                &before,
+                &after,
+                &current,
+                input.unreliable,
+                digest_size,
+            )? {
+                return Err(unstable_capture_error());
+            }
+            if resolution == FileDigestResolution::EmbeddedTimestampMacro {
+                observations.push(Some(FileObservationResolution::EmbeddedTimestampMacro));
+                continue;
+            }
+            let digest = resolution
+                .into_digest()
+                .ok_or_else(|| io::Error::other("content digest resolution returned no digest"))?;
+            // The digest has now been checked against both the handle and the
+            // pathname. Recording it under `current` is important on NFS,
+            // where mtime may reconcile while a read is in progress: the
+            // bytes belong to the object, length, and final identity observed.
+            // Defer the batch record until every input has validated so a
+            // later unstable input cannot leave a partial ledger update.
+            fresh.push(RecordedFileDigest {
+                file: current.clone(),
+                digest: digest.clone(),
+            });
+            observations.push(Some(FileObservationResolution::Observation(Self {
+                identity: current,
+                digest,
+            })));
+        }
+        if !fresh.is_empty() {
+            digests.record(scope, fresh);
+        }
+        Ok(observations)
+    }
+
+    /// Classify a later identity and digest against this observation.
+    ///
+    /// Timestamps are intentionally excluded from this comparison. The digest
+    /// establishes the bytes, while the path, length, and object
+    /// identity ensure that the comparison did not silently cross a replaced
+    /// file. Cache lookup still uses the complete platform-specific identity.
+    /// Matching endpoints cannot prove that a writer briefly changed and then
+    /// restored the same object while the compiler ran; normal builds are
+    /// assumed not to perform that adversarial sequence.
+    pub fn compare(
+        &self,
+        identity: Option<&FileIdentity>,
+        digest: &CacheDigest,
+    ) -> FileObservationMatch {
+        let Some(identity) = identity else {
+            return if self.digest == *digest {
+                FileObservationMatch::Indeterminate
+            } else {
+                FileObservationMatch::Changed
+            };
+        };
+        if self.digest != *digest {
+            return FileObservationMatch::Changed;
+        }
+        if self.digest.size != self.identity.len || digest.size != identity.len {
+            return FileObservationMatch::Indeterminate;
+        }
+        if self.identity == *identity
+            || (self.identity.path == identity.path
+                && self.identity.len == identity.len
+                && self.identity.object.is_some()
+                && self.identity.object == identity.object)
+        {
+            FileObservationMatch::Reusable
+        } else {
+            FileObservationMatch::Indeterminate
+        }
+    }
+
+    /// Whether `identity` and `digest` describe a reusable version of this
+    /// observation.
+    pub fn matches(&self, identity: Option<&FileIdentity>, digest: &CacheDigest) -> bool {
+        self.compare(identity, digest) == FileObservationMatch::Reusable
+    }
+}
+
+struct CaptureInput {
+    path: PathBuf,
+    unreliable: bool,
+    cache_identity: Option<FileIdentity>,
+    identity: Option<FileIdentity>,
+}
+
+fn unstable_capture_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::WouldBlock,
+        "file changed while capturing its content observation",
+    )
+}
+
+fn current_file_identity(path: &Path, unreliable: bool) -> io::Result<Option<FileIdentity>> {
+    let metadata = std::fs::metadata(path)?;
+    current_file_identity_from_metadata(path, &metadata, unreliable)
+}
+
+fn current_file_identity_from_metadata(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+    unreliable: bool,
+) -> io::Result<Option<FileIdentity>> {
+    digest_cache_identity(path, metadata, unreliable)
+        .map(|identity| identity.or_else(|| FileIdentity::describe(path, metadata)))
+}
+
+fn digest_open_file(
+    scope: FileDigestScope,
+    path: &Path,
+) -> io::Result<(
+    FileDigestResolution,
+    u64,
+    std::fs::Metadata,
+    std::fs::Metadata,
+)> {
+    let file = std::fs::File::open(path)?;
+    let before = file.metadata()?;
+    let (resolution, size) = digest_reader(scope, &file)?;
+    let after = file.metadata()?;
+    Ok((resolution, size, before, after))
+}
+
+/// Resolve one file only when the open handle, its final pathname, and the
+/// identity supplied by the caller still name the same stable contents.
+pub(super) fn digest_file_for_identity(
+    scope: FileDigestScope,
+    path: &Path,
+    expected: &FileIdentity,
+) -> io::Result<FileDigestResolution> {
+    let (resolution, size, before, after) = digest_open_file(scope, path)?;
+    // The expected identity was already qualified at the caller. On Linux,
+    // the qualified NFS form is the one with an object identity and no ctime;
+    // derive policy from it so a concurrent cross-mount rename cannot poison
+    // the filesystem-policy memo while this read is being rejected.
+    #[cfg(target_os = "linux")]
+    let unreliable = expected.changed.is_none() && expected.object.is_some();
+    #[cfg(not(target_os = "linux"))]
+    let unreliable = false;
+    let Some(current) = current_file_identity(path, unreliable)? else {
+        return Err(unstable_capture_error());
+    };
+    if current != *expected
+        || !handle_observation_is_stable(path, &before, &after, &current, unreliable, size)?
+    {
+        return Err(unstable_capture_error());
+    }
+    Ok(resolution)
+}
+
+fn digest_reader(
+    scope: FileDigestScope,
+    file: &std::fs::File,
+) -> io::Result<(FileDigestResolution, u64)> {
+    let mut reader = std::io::BufReader::new(file);
+    let mut hasher = blake3::Hasher::new();
+    let mut size = 0_u64;
+    let longest_macro = TIMESTAMP_MACROS
+        .iter()
+        .map(|macro_name| macro_name.len())
+        .max()
+        .unwrap_or_default();
+    let mut window = Vec::with_capacity(DIGEST_BUFFER_BYTES + longest_macro);
+    let mut chunk = vec![0_u8; DIGEST_BUFFER_BYTES];
+    let mut found_timestamp_macro = false;
+    loop {
+        let read = reader.read(&mut chunk)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&chunk[..read]);
+        size = size
+            .checked_add(read as u64)
+            .ok_or_else(|| io::Error::other("file length overflowed u64"))?;
+        if scope == FileDigestScope::CcInput && !found_timestamp_macro {
+            window.extend_from_slice(&chunk[..read]);
+            found_timestamp_macro = TIMESTAMP_MACROS
+                .iter()
+                .any(|macro_name| contains_subslice(&window, macro_name));
+            let keep = window.len().saturating_sub(longest_macro.saturating_sub(1));
+            window.drain(..keep);
+        }
+    }
+    if found_timestamp_macro {
+        Ok((FileDigestResolution::EmbeddedTimestampMacro, size))
+    } else {
+        Ok((
+            FileDigestResolution::Digest(CacheDigest {
+                algorithm: "blake3".into(),
+                hash: hasher.finalize().to_hex().to_string(),
+                size,
+            }),
+            size,
+        ))
+    }
+}
+
+fn handle_observation_is_stable(
+    path: &Path,
+    before: &std::fs::Metadata,
+    after: &std::fs::Metadata,
+    current: &FileIdentity,
+    unreliable: bool,
+    digest_size: u64,
+) -> io::Result<bool> {
+    if before.len() != after.len() || after.len() != digest_size || current.len != digest_size {
+        return Ok(false);
+    }
+    if unreliable {
+        #[cfg(target_os = "linux")]
+        {
+            let before_modified = before.modified()?;
+            let after_modified = after.modified()?;
+            return Ok(current.object.as_ref().is_some_and(|object| {
+                before_modified == after_modified
+                    && after_modified == current.modified
+                    && metadata_matches_object(before, object)
+                    && metadata_matches_object(after, object)
+            }));
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (path, before, after, current);
+            return Ok(false);
+        }
+    }
+    let before = FileIdentity::describe(path, before);
+    let after = FileIdentity::describe(path, after);
+    Ok(before.is_some() && before == after && after.as_ref() == Some(current))
+}
+
+#[cfg(target_os = "linux")]
+fn metadata_object_identity(metadata: &std::fs::Metadata) -> Option<FileObjectIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let device = metadata.dev();
+    let major = ((device >> 8) & 0x0fff) | ((device >> 32) & 0xfffff000);
+    let minor = (device & 0x00ff) | ((device >> 12) & 0xffffff00);
+    Some(FileObjectIdentity {
+        device_major: major.try_into().ok()?,
+        device_minor: minor.try_into().ok()?,
+        mount_id: 0,
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn metadata_object_identity(metadata: &std::fs::Metadata) -> Option<FileObjectIdentity> {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let device = metadata.dev();
+    Some(FileObjectIdentity {
+        device_major: (device >> 32) as u32,
+        device_minor: device as u32,
+        mount_id: 0,
+        inode: metadata.ino(),
+    })
+}
+
+#[cfg(not(unix))]
+fn metadata_object_identity(_metadata: &std::fs::Metadata) -> Option<FileObjectIdentity> {
+    None
+}
+
+/// Compare the device and inode in `metadata` with a `statx` object identity.
+/// `statx` also supplies a mount id, which is intentionally left to the path
+/// check: an fd has no portable mount-id query, while the final path identity
+/// still catches a replacement on another mount.
+#[cfg(target_os = "linux")]
+fn metadata_matches_object(metadata: &std::fs::Metadata, object: &FileObjectIdentity) -> bool {
+    metadata_object_identity(metadata).is_some_and(|metadata| {
+        metadata.device_major == object.device_major
+            && metadata.device_minor == object.device_minor
+            && metadata.inode == object.inode
+    })
+}
+
+/// Legacy snapshot wrapper retained for adapters that have not migrated to
+/// [`FileObservation`]. New code should carry the observation directly; this
+/// wrapper no longer has a separate metadata-versus-content capture path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileSnapshot {
+    identity: FileIdentity,
+    observation: Option<FileObservation>,
+}
+
+impl FileSnapshot {
+    /// Capture a validated content observation for compatibility callers.
+    pub fn capture(path: &Path) -> io::Result<Option<Self>> {
+        FileObservation::capture(path).map(|observation| {
+            observation.map(|observation| Self {
+                identity: observation.identity.clone(),
+                observation: Some(observation),
+            })
+        })
+    }
+
+    /// Capture a validated content observation using the session digest cache.
+    pub fn capture_with_cache(
+        path: &Path,
+        digests: &dyn FileDigestCache,
+    ) -> io::Result<Option<Self>> {
+        FileObservation::capture_with_cache(path, digests).map(|observation| {
+            observation.map(|observation| Self {
+                identity: observation.identity.clone(),
+                observation: Some(observation),
+            })
+        })
+    }
+
+    /// Whether a later identity and digest still match this compatibility
+    /// snapshot.
+    pub fn matches(&self, identity: Option<&FileIdentity>, content: &CacheDigest) -> bool {
+        self.observation.as_ref().map_or_else(
+            || identity == Some(&self.identity),
+            |observation| observation.matches(identity, content),
+        )
+    }
+
+    /// Whether this snapshot carries content evidence for a later comparison.
     pub fn proves_content_change(&self) -> bool {
-        self.content.is_some() || self.identity.changed.is_some()
+        self.observation.is_some() || self.identity.changed.is_some()
     }
 }
 
@@ -223,7 +728,7 @@ impl From<FileIdentity> for FileSnapshot {
     fn from(identity: FileIdentity) -> Self {
         Self {
             identity,
-            content: None,
+            observation: None,
         }
     }
 }
@@ -266,58 +771,6 @@ fn metadata_identity_is_unreliable(
     _metadata: &std::fs::Metadata,
 ) -> io::Result<bool> {
     Ok(false)
-}
-
-fn capture_file_snapshot(
-    path: &Path,
-    digests: &dyn FileDigestCache,
-    content_identity: bool,
-    metadata: std::fs::Metadata,
-) -> io::Result<Option<FileSnapshot>> {
-    let cache_identity = digest_cache_identity(path, &metadata, content_identity)?;
-    let Some(identity) = cache_identity
-        .clone()
-        .or_else(|| FileIdentity::describe(path, &metadata))
-    else {
-        return Ok(None);
-    };
-    let content = if content_identity {
-        let resolved = cache_identity
-            .as_ref()
-            .and_then(|identity| {
-                digests
-                    .resolve(FileDigestScope::Content, std::slice::from_ref(identity))
-                    .pop()
-            })
-            .unwrap_or(FileDigestResolution::Unresolved);
-        let (digest, fresh) = match resolved {
-            FileDigestResolution::Digest(digest) => (digest, false),
-            FileDigestResolution::EmbeddedTimestampMacro | FileDigestResolution::Unresolved => {
-                let digest = digest_file(FileDigestScope::Content, path)?
-                    .into_digest()
-                    .ok_or_else(|| {
-                        io::Error::other("content digest resolution returned no digest")
-                    })?;
-                (digest, true)
-            }
-        };
-        if fresh
-            && let Some(file) = cache_identity
-            && file.len == digest.size
-        {
-            digests.record(
-                FileDigestScope::Content,
-                vec![RecordedFileDigest {
-                    file,
-                    digest: digest.clone(),
-                }],
-            );
-        }
-        Some(digest)
-    } else {
-        None
-    };
-    Ok(Some(FileSnapshot { identity, content }))
 }
 
 fn digest_cache_identity(
@@ -457,6 +910,9 @@ pub enum FileDigestResolution {
     Digest(CacheDigest),
     /// A C/C++ input contains a time-dependent preprocessor macro.
     EmbeddedTimestampMacro,
+    /// A resolver attempted to observe the file, but could not associate the
+    /// result with a stable identity. Callers must bypass rather than retry.
+    Indeterminate,
     /// No shared resolver was available; the caller must read the file.
     Unresolved,
 }
@@ -466,7 +922,7 @@ impl FileDigestResolution {
     pub fn into_digest(self) -> Option<CacheDigest> {
         match self {
             Self::Digest(digest) => Some(digest),
-            Self::EmbeddedTimestampMacro | Self::Unresolved => None,
+            Self::EmbeddedTimestampMacro | Self::Indeterminate | Self::Unresolved => None,
         }
     }
 }
@@ -475,44 +931,7 @@ impl FileDigestResolution {
 /// same pass.
 pub fn digest_file(scope: FileDigestScope, path: &Path) -> io::Result<FileDigestResolution> {
     let file = std::fs::File::open(path)?;
-    let mut reader = std::io::BufReader::new(file);
-    let mut hasher = blake3::Hasher::new();
-    let mut size = 0_u64;
-    let longest_macro = TIMESTAMP_MACROS
-        .iter()
-        .map(|macro_name| macro_name.len())
-        .max()
-        .unwrap_or_default();
-    let mut window = Vec::with_capacity(DIGEST_BUFFER_BYTES + longest_macro);
-    let mut chunk = vec![0_u8; DIGEST_BUFFER_BYTES];
-    let mut found_timestamp_macro = false;
-    loop {
-        let read = reader.read(&mut chunk)?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&chunk[..read]);
-        size = size
-            .checked_add(read as u64)
-            .ok_or_else(|| io::Error::other("file length overflowed u64"))?;
-        if scope == FileDigestScope::CcInput && !found_timestamp_macro {
-            window.extend_from_slice(&chunk[..read]);
-            found_timestamp_macro = TIMESTAMP_MACROS
-                .iter()
-                .any(|macro_name| contains_subslice(&window, macro_name));
-            let keep = window.len().saturating_sub(longest_macro.saturating_sub(1));
-            window.drain(..keep);
-        }
-    }
-    if found_timestamp_macro {
-        Ok(FileDigestResolution::EmbeddedTimestampMacro)
-    } else {
-        Ok(FileDigestResolution::Digest(CacheDigest {
-            algorithm: "blake3".into(),
-            hash: hasher.finalize().to_hex().to_string(),
-            size,
-        }))
-    }
+    digest_reader(scope, &file).map(|(resolution, _)| resolution)
 }
 
 fn contains_subslice(haystack: &[u8], needle: &[u8]) -> bool {
@@ -570,6 +989,376 @@ impl FileDigestCache for NoFileDigestCache {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    struct ReplacingDigestCache {
+        replacements: std::sync::atomic::AtomicUsize,
+        contents: &'static [u8],
+        timestamp_only: bool,
+        recorded: Mutex<Vec<RecordedFileDigest>>,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl FileDigestCache for ReplacingDigestCache {
+        fn find(&self, _: FileDigestScope, files: &[FileIdentity]) -> Vec<Option<CacheDigest>> {
+            if self
+                .replacements
+                .fetch_update(
+                    std::sync::atomic::Ordering::Relaxed,
+                    std::sync::atomic::Ordering::Relaxed,
+                    |remaining| remaining.checked_sub(1),
+                )
+                .is_ok()
+            {
+                // A writer finishes before resolution returns, while no
+                // compiler has started. The old inode is still live when the
+                // replacement is created, making the identity change exact.
+                let path = &files[0].path;
+                if self.timestamp_only {
+                    std::fs::File::options()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+                        .unwrap();
+                } else {
+                    let replacement = path.with_extension("replacement");
+                    std::fs::write(&replacement, self.contents).unwrap();
+                    std::fs::rename(replacement, path).unwrap();
+                }
+            }
+            vec![None; files.len()]
+        }
+
+        fn record(&self, _: FileDigestScope, entries: Vec<RecordedFileDigest>) {
+            self.recorded.lock().unwrap().extend(entries);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observation_uses_the_replacement_identity_after_resolution() {
+        for contents in [
+            b"original bytes".as_slice(),
+            b"a different replacement".as_slice(),
+        ] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("input.rmeta");
+            std::fs::write(&path, b"original bytes").unwrap();
+            let cache = ReplacingDigestCache {
+                replacements: 1.into(),
+                contents,
+                timestamp_only: false,
+                recorded: Mutex::new(Vec::new()),
+            };
+            let observation = FileObservation::capture_with_cache(&path, &cache)
+                .unwrap()
+                .unwrap();
+            let current =
+                FileIdentity::describe(&path, &std::fs::metadata(&path).unwrap()).unwrap();
+            let digest = CacheDigest::blake3_file(&path).unwrap();
+            assert!(observation.matches(Some(&current), &digest));
+            assert!(
+                cache
+                    .recorded
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|record| record.file == current && record.digest == digest),
+                "a digest must never be published under the replaced file's identity"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_unstable_cached_digest_returns_would_block_without_retrying() {
+        struct UpdatingCache {
+            calls: std::sync::atomic::AtomicUsize,
+            recorded: Mutex<Vec<RecordedFileDigest>>,
+        }
+        impl FileDigestCache for UpdatingCache {
+            fn find(&self, _: FileDigestScope, files: &[FileIdentity]) -> Vec<Option<CacheDigest>> {
+                self.calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let path = &files[0].path;
+                let digest = CacheDigest::blake3_file(path).unwrap();
+                std::fs::write(path, b"after!").unwrap();
+                vec![Some(digest)]
+            }
+
+            fn record(&self, _: FileDigestScope, entries: Vec<RecordedFileDigest>) {
+                self.recorded.lock().unwrap().extend(entries);
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.rmeta");
+        std::fs::write(&path, b"before!").unwrap();
+        let cache = UpdatingCache {
+            calls: 0.into(),
+            recorded: Mutex::new(Vec::new()),
+        };
+        let result = FileObservation::capture_with_cache(&path, &cache);
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+        assert_eq!(cache.calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert!(cache.recorded.lock().unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observation_accepts_timestamp_reconciliation_before_hashing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.rmeta");
+        std::fs::write(&path, b"original bytes").unwrap();
+        let cache = ReplacingDigestCache {
+            replacements: 1.into(),
+            contents: b"original bytes",
+            timestamp_only: true,
+            recorded: Mutex::new(Vec::new()),
+        };
+        let observation = FileObservation::capture_with_cache(&path, &cache)
+            .unwrap()
+            .unwrap();
+        let current = FileIdentity::describe(&path, &std::fs::metadata(&path).unwrap()).unwrap();
+        let digest = CacheDigest::blake3_file(&path).unwrap();
+        assert!(observation.matches(Some(&current), &digest));
+        assert_eq!(
+            *cache.recorded.lock().unwrap(),
+            vec![RecordedFileDigest {
+                file: current,
+                digest
+            }],
+            "only the reconciled cache identity should be published"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cached_digest_changed_during_resolution_is_not_reused() {
+        struct UpdatingCache(std::sync::atomic::AtomicBool);
+        impl FileDigestCache for UpdatingCache {
+            fn find(&self, _: FileDigestScope, files: &[FileIdentity]) -> Vec<Option<CacheDigest>> {
+                let path = &files[0].path;
+                let digest = CacheDigest::blake3_file(path).unwrap();
+                if self.0.swap(false, std::sync::atomic::Ordering::Relaxed) {
+                    // The old cache entry answered correctly when queried,
+                    // but a same-length write completed before it returned.
+                    // Only mtime changes in the NFS cache identity.
+                    std::fs::write(path, b"after!").unwrap();
+                    std::fs::File::options()
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                        .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
+                        .unwrap();
+                }
+                vec![Some(digest)]
+            }
+
+            fn record(&self, _: FileDigestScope, _: Vec<RecordedFileDigest>) {
+                panic!("both attempts should reuse cached digests");
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.rmeta");
+        std::fs::write(&path, b"before").unwrap();
+        let result = FileObservation::capture_with_cache(&path, &UpdatingCache(true.into()));
+        assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[test]
+    fn observations_resolve_a_batch_and_record_only_validated_pairs() {
+        struct BatchCache {
+            resolves: std::sync::atomic::AtomicUsize,
+            recorded: Mutex<Vec<RecordedFileDigest>>,
+        }
+        impl FileDigestCache for BatchCache {
+            fn resolve(
+                &self,
+                _: FileDigestScope,
+                files: &[FileIdentity],
+            ) -> Vec<FileDigestResolution> {
+                self.resolves
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                vec![FileDigestResolution::Unresolved; files.len()]
+            }
+
+            fn find(&self, _: FileDigestScope, files: &[FileIdentity]) -> Vec<Option<CacheDigest>> {
+                vec![None; files.len()]
+            }
+
+            fn record(&self, _: FileDigestScope, entries: Vec<RecordedFileDigest>) {
+                self.recorded.lock().unwrap().extend(entries);
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.rlib");
+        let second = directory.path().join("second.rlib");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let paths = [first.as_path(), second.as_path()];
+        let cache = BatchCache {
+            resolves: 0.into(),
+            recorded: Mutex::new(Vec::new()),
+        };
+
+        let observations = FileObservation::capture_many(paths, &cache).unwrap();
+        assert_eq!(observations.len(), 2);
+        assert!(observations.iter().all(Option::is_some));
+        assert_eq!(cache.resolves.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(cache.recorded.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn a_failed_batch_records_no_partial_observations() {
+        struct DeletingCache {
+            delete: PathBuf,
+            recorded: Mutex<Vec<RecordedFileDigest>>,
+        }
+
+        impl FileDigestCache for DeletingCache {
+            fn resolve(
+                &self,
+                _: FileDigestScope,
+                files: &[FileIdentity],
+            ) -> Vec<FileDigestResolution> {
+                std::fs::remove_file(&self.delete).unwrap();
+                vec![FileDigestResolution::Unresolved; files.len()]
+            }
+
+            fn find(&self, _: FileDigestScope, files: &[FileIdentity]) -> Vec<Option<CacheDigest>> {
+                vec![None; files.len()]
+            }
+
+            fn record(&self, _: FileDigestScope, entries: Vec<RecordedFileDigest>) {
+                self.recorded.lock().unwrap().extend(entries);
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.rlib");
+        let second = directory.path().join("second.rlib");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let cache = DeletingCache {
+            delete: second.clone(),
+            recorded: Mutex::new(Vec::new()),
+        };
+
+        FileObservation::capture_many([first.as_path(), second.as_path()], &cache).unwrap_err();
+        assert!(cache.recorded.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn an_indeterminate_shared_observation_is_not_retried_locally() {
+        struct IndeterminateCache;
+
+        impl FileDigestCache for IndeterminateCache {
+            fn resolve(
+                &self,
+                _: FileDigestScope,
+                files: &[FileIdentity],
+            ) -> Vec<FileDigestResolution> {
+                vec![FileDigestResolution::Indeterminate; files.len()]
+            }
+
+            fn find(&self, _: FileDigestScope, _: &[FileIdentity]) -> Vec<Option<CacheDigest>> {
+                panic!("capture must use the explicit resolution outcome")
+            }
+
+            fn record(&self, _: FileDigestScope, _: Vec<RecordedFileDigest>) {
+                panic!("an indeterminate observation must not be recorded")
+            }
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.rlib");
+        std::fs::write(&path, b"stable bytes").unwrap();
+
+        let error = FileObservation::capture_with_cache(&path, &IndeterminateCache).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::WouldBlock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn handle_validation_rejects_a_path_replaced_after_open() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.rlib");
+        std::fs::write(&path, b"old bytes").unwrap();
+        let file = std::fs::File::open(&path).unwrap();
+        let before = file.metadata().unwrap();
+
+        let replacement = directory.path().join("replacement.rlib");
+        std::fs::write(&replacement, b"new bytes").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+
+        let mut bytes = Vec::new();
+        (&file).read_to_end(&mut bytes).unwrap();
+        let after = file.metadata().unwrap();
+        let current = current_file_identity(&path, false).unwrap().unwrap();
+        assert!(
+            !handle_observation_is_stable(
+                &path,
+                &before,
+                &after,
+                &current,
+                false,
+                bytes.len() as u64,
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn scoped_observation_preserves_timestamp_macro_bypass() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.h");
+        std::fs::write(&path, b"const char *build = __TIME__;\n").unwrap();
+
+        let result = FileObservation::capture_with_scope(
+            &path,
+            FileDigestScope::CcInput,
+            &NoFileDigestCache,
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            Some(FileObservationResolution::EmbeddedTimestampMacro)
+        );
+    }
+
+    #[test]
+    fn observation_comparison_distinguishes_changed_and_indeterminate_files() {
+        let identity = FileIdentity {
+            path: PathBuf::from("/tmp/input.rlib"),
+            len: 4,
+            modified: SystemTime::UNIX_EPOCH,
+            changed: Some((1, 0)),
+            object: None,
+        };
+        let observation = FileObservation {
+            identity: identity.clone(),
+            digest: CacheDigest::blake3(b"same"),
+        };
+        assert_eq!(
+            observation.compare(Some(&identity), &observation.digest),
+            FileObservationMatch::Reusable
+        );
+
+        let mut timestamp_changed = identity.clone();
+        timestamp_changed.modified += std::time::Duration::from_secs(1);
+        assert_eq!(
+            observation.compare(Some(&timestamp_changed), &observation.digest),
+            FileObservationMatch::Indeterminate
+        );
+        assert_eq!(
+            observation.compare(Some(&identity), &CacheDigest::blake3(b"diff")),
+            FileObservationMatch::Changed
+        );
+    }
+
     #[test]
     fn an_identity_describes_the_file_until_it_is_written_or_removed() {
         let directory = tempfile::tempdir().unwrap();
@@ -587,64 +1376,6 @@ mod tests {
     }
 
     #[test]
-    fn a_metadata_snapshot_detects_a_metadata_change() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("input.rs");
-        std::fs::write(&path, b"fn main() {}").unwrap();
-        let snapshot = capture_file_snapshot(
-            &path,
-            &NoFileDigestCache,
-            false,
-            std::fs::metadata(&path).unwrap(),
-        )
-        .unwrap()
-        .unwrap();
-
-        std::fs::File::options()
-            .write(true)
-            .open(&path)
-            .unwrap()
-            .set_times(std::fs::FileTimes::new().set_modified(SystemTime::UNIX_EPOCH))
-            .unwrap();
-        let identity = FileIdentity::describe(&path, &std::fs::metadata(&path).unwrap());
-        let digest = CacheDigest::blake3_file(&path).unwrap();
-
-        assert!(!snapshot.matches(identity.as_ref(), &digest));
-        assert_eq!(snapshot.proves_content_change(), cfg!(unix));
-    }
-
-    #[test]
-    fn a_content_snapshot_ignores_timestamp_churn_but_detects_changed_bytes() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("input.rs");
-        std::fs::write(&path, b"fn main() {}").unwrap();
-        let snapshot = capture_file_snapshot(
-            &path,
-            &NoFileDigestCache,
-            true,
-            std::fs::metadata(&path).unwrap(),
-        )
-        .unwrap()
-        .unwrap();
-
-        let mut identity = snapshot.identity.clone();
-        identity.changed = identity
-            .changed
-            .map(|(seconds, nanos)| (seconds + 1, nanos));
-        let digest = CacheDigest::blake3_file(&path).unwrap();
-        assert!(snapshot.matches(Some(&identity), &digest));
-        assert!(snapshot.proves_content_change());
-
-        identity.modified = SystemTime::UNIX_EPOCH;
-        assert!(snapshot.matches(Some(&identity), &digest));
-
-        std::fs::write(&path, b"fn main(){ }").unwrap();
-        let identity = FileIdentity::describe(&path, &std::fs::metadata(&path).unwrap());
-        let digest = CacheDigest::blake3_file(&path).unwrap();
-        assert!(!snapshot.matches(identity.as_ref(), &digest));
-    }
-
-    #[test]
     fn reliable_metadata_keeps_the_native_identity() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("input.rs");
@@ -657,55 +1388,7 @@ mod tests {
 
         assert_eq!(identity.path, path);
         assert_eq!(identity.len, 12);
-        assert!(identity.object.is_none());
-    }
-
-    #[test]
-    fn content_snapshot_ignores_nfs_timestamp_churn_but_not_content_or_identity_changes() {
-        let digest = CacheDigest::blake3(b"nfs bytes");
-        let identity = FileIdentity {
-            path: PathBuf::from("/nfs/input.rlib"),
-            len: digest.size,
-            modified: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(10),
-            changed: Some((10, 1)),
-            object: Some(FileObjectIdentity {
-                device_major: 0,
-                device_minor: 42,
-                mount_id: 7,
-                inode: 99,
-            }),
-        };
-        let snapshot = FileSnapshot {
-            identity: identity.clone(),
-            content: Some(digest.clone()),
-        };
-        // Client/server reconciliation can move either timestamp in either
-        // direction. None of these observations proves another write.
-        for seconds in [9, 11] {
-            let mut after = identity.clone();
-            after.changed = Some((seconds, 500));
-            after.modified = SystemTime::UNIX_EPOCH + std::time::Duration::new(seconds as u64, 500);
-            assert!(snapshot.matches(Some(&after), &digest));
-        }
-
-        // Timestamp tolerance does not admit changed bytes, even when their
-        // length and all metadata remain the same.
-        let changed = CacheDigest::blake3(b"NFS bytes");
-        assert_eq!(changed.size, digest.size);
-        assert!(!snapshot.matches(Some(&identity), &changed));
-        assert!(!snapshot.matches(None, &digest));
-
-        let mut after = identity.clone();
-        after.object.as_mut().unwrap().inode += 1;
-        assert!(!snapshot.matches(Some(&after), &digest));
-
-        let mut after = identity.clone();
-        after.len += 1;
-        assert!(!snapshot.matches(Some(&after), &digest));
-
-        let mut after = identity;
-        after.path.set_file_name("replacement.rlib");
-        assert!(!snapshot.matches(Some(&after), &digest));
+        assert_eq!(identity.object.is_some(), cfg!(unix));
     }
 
     #[cfg(target_os = "linux")]

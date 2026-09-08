@@ -9,8 +9,9 @@ use crate::{session, util::workspace_root};
 use eyre::{Context, Result, bail};
 use mbx_cache_core::{
     ActionDiagnostic, ActionPrediction, AgentRequest, AgentResponse, CacheDigest, CacheDirectory,
-    CacheFileNode, FileDigestResolution, FileDigestScope, FileIdentity, FileSnapshot, PinnedFile,
-    RecordedFileDigest, RemoteActionResult, RestoreStats, RustcMetadata, canonical_json,
+    CacheFileNode, FileDigestResolution, FileDigestScope, FileIdentity, FileObservation,
+    PinnedFile, RecordedFileDigest, RemoteActionResult, RestoreStats, RustcMetadata,
+    canonical_json,
 };
 use mbx_cache_rustc::{
     ActionContext, ActionInput, BypassReason, CompilerIdentity, DiscoveredInputs, LinkerIdentity,
@@ -448,8 +449,13 @@ pub(crate) fn compile(
     // capacity happened before rustc ran and belongs to the valid compilation
     // it is about to perform, not to the overlap this snapshot detects.
     let required_inputs = invocation.required_inputs_in(&working_dir);
-    let input_snapshots =
-        crate::util::snapshot_compiler_inputs(required_inputs.iter().map(PathBuf::as_path));
+    let input_observations = crate::util::observe_compiler_inputs(
+        required_inputs.iter().map(PathBuf::as_path),
+    )
+    .map_err(|error| BypassReason::InputRead {
+        path: required_inputs.first().cloned().unwrap_or_default(),
+        message: error.to_string(),
+    });
     let compilation_started = SystemTime::now();
     let compiler_timer = Instant::now();
     let mut command = compiler_command(rustc, wrapper_argument);
@@ -508,16 +514,10 @@ pub(crate) fn compile(
                 &working_dir,
                 &portable,
                 compilation_started,
-                &input_snapshots,
+                &input_observations,
             )
         {
-            if discard_modified_compiler_result(&outputs, &input_snapshots, &error) {
-                let _ = replay_bytes(&[], &output.stderr);
-                return Ok(ExitCode::FAILURE);
-            }
-            session::report_shim_warning(&format!(
-                "verification inputs were not validated: {error:#}"
-            ));
+            report_validation_failure("verification inputs were not validated", &error);
         }
         let divergence = verification_divergence(&cached, &output);
         record_verification(divergence.is_none(), cached.restore);
@@ -529,10 +529,8 @@ pub(crate) fn compile(
                 &divergence,
             ));
         }
-        let _ = replay_output(&output);
-        return Ok(exit_code(output.status));
+        return replay_compiler_output(&output);
     }
-    let mut compiler_input_invalid = false;
     if output.status.success() {
         // An incremental artifact is never published, and its inputs were
         // already fingerprinted while checking whether the manifest still
@@ -552,29 +550,29 @@ pub(crate) fn compile(
         let publication: Result<Option<ActionDiagnostic>> =
             if let Some(discovered) = current_manifest_inputs {
                 (|| {
-                    let input_snapshots = input_snapshots
+                    let input_observations = input_observations
                         .as_ref()
-                        .map_err(|error| eyre::eyre!(error.to_string()))?;
-                    discovered.verify_not_modified_since_with_snapshots(
+                        .map_err(|error| eyre::Report::new(error.clone()))?;
+                    discovered.verify_not_modified_since_with_observations(
                         compilation_started,
-                        input_snapshots,
+                        input_observations,
                     )?;
-                    discovered.verify()?;
+                    discovered.verify_with_cache(session::file_digest_cache())?;
                     learned.record_compiled();
                     Ok(None)
                 })()
             } else {
                 (|| {
-                    let input_snapshots = input_snapshots
+                    let input_observations = input_observations
                         .as_ref()
-                        .map_err(|error| eyre::eyre!(error.to_string()))?;
+                        .map_err(|error| eyre::Report::new(error.clone()))?;
                     let (candidates, discovered) =
                         action_from_dep_info(&compilation, &outputs.dep_info)?;
-                    discovered.verify_not_modified_since_with_snapshots(
+                    discovered.verify_not_modified_since_with_observations(
                         compilation_started,
-                        input_snapshots,
+                        input_observations,
                     )?;
-                    discovered.verify()?;
+                    discovered.verify_with_cache(session::file_digest_cache())?;
                     learned.record_compiled();
                     if learned_enabled
                         && learned.record.is_none()
@@ -618,12 +616,7 @@ pub(crate) fn compile(
             };
         match publication {
             Ok(diagnostic) => current_diagnostic = diagnostic,
-            Err(error) if discard_modified_compiler_result(&outputs, &input_snapshots, &error) => {
-                compiler_input_invalid = true;
-            }
-            Err(error) => {
-                session::report_shim_warning(&format!("result was not stored: {error:#}"));
-            }
+            Err(error) => report_publication_failure(&error),
         }
     }
     session::record_compiler_invocation_with_diagnostic(
@@ -632,58 +625,57 @@ pub(crate) fn compile(
         timing.duration_ns,
         current_diagnostic,
     );
-    if compiler_input_invalid {
-        // Keep rustc's diagnostics, but do not forward stdout notifications
-        // for an artifact that was just rejected. Cargo pipelines dependents
-        // as soon as it observes those notifications.
-        let _ = replay_bytes(&[], &output.stderr);
-        Ok(ExitCode::FAILURE)
+    // Input validation only decides whether the result is safe to publish. It
+    // never changes rustc's successful result: Cargo still needs the output
+    // files, compiler diagnostics, and success status even when publication
+    // was bypassed.
+    replay_compiler_output(&output)
+}
+
+/// A [`BypassReason`] is an expected cache outcome, including an input that
+/// changed while the compiler ran. Keep its optional detail behind the shim's
+/// debug filter. Errors without that classification remain visible because
+/// they usually describe a real storage or operational failure.
+fn report_validation_failure(context: &str, error: &eyre::Report) {
+    let message = format!("{context}: {error:#}");
+    if is_routine_cache_outcome(error) {
+        session::report_shim_debug(module_path!(), &message);
     } else {
-        // Publication validates the inputs and keeps invalid metadata out of
-        // Cargo's hands. Only advertise rustc's result after that completes.
-        let _ = replay_output(&output);
-        Ok(exit_code(output.status))
+        session::report_shim_warning(&message);
     }
 }
 
-/// Whether publication failed because the compiler's inputs moved underneath it.
-///
-/// Other publication failures only prevent caching: rustc's local result is
-/// still valid and Cargo can use it. A content change or an overlap proved by
-/// a pre-compilation file snapshot instead means the artifact cannot be
-/// trusted. A timestamp-only overlap remains a conservative cache bypass: it
-/// is not reliable enough across skewed filesystem clocks to fail the build.
-fn compiler_input_was_modified(
-    error: &eyre::Report,
-    input_snapshots: &std::io::Result<BTreeMap<PathBuf, FileSnapshot>>,
-) -> bool {
-    match error.downcast_ref::<BypassReason>() {
-        Some(BypassReason::InputChanged(_)) => true,
-        Some(BypassReason::InputModifiedDuringCompilation(path)) => input_snapshots
-            .as_ref()
-            .ok()
-            .and_then(|snapshots| snapshots.get(path))
-            .is_some_and(FileSnapshot::proves_content_change),
-        _ => false,
+/// Report a failed publication while preserving the compiler's local result.
+/// Adapter bypasses are routine and debug-only; unexpected store/I/O failures
+/// retain the existing warning behavior.
+fn report_publication_failure(error: &eyre::Report) {
+    if is_routine_cache_outcome(error) {
+        session::report_shim_debug(module_path!(), &format!("result was not stored: {error:#}"));
+    } else {
+        session::report_shim_warning(&format!("result was not stored: {error:#}"));
     }
 }
 
-/// Reject and remove a successful compiler result whose inputs changed while it ran.
-fn discard_modified_compiler_result(
-    outputs: &RustcOutputs,
-    input_snapshots: &std::io::Result<BTreeMap<PathBuf, FileSnapshot>>,
-    error: &eyre::Report,
-) -> bool {
-    if !compiler_input_was_modified(error, input_snapshots) {
-        return false;
-    }
-    if let Err(discard_error) = discard_compiler_outputs(outputs) {
-        session::report_shim_warning(&format!(
-            "some invalid compiler outputs could not be removed: {discard_error:#}"
-        ));
-    }
-    session::report_shim_error(&format!("compilation result was discarded: {error:#}"));
-    true
+fn is_routine_cache_outcome(error: &eyre::Report) -> bool {
+    error.downcast_ref::<BypassReason>().is_some()
+        || error
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock)
+}
+
+/// Replay the real compiler result after cache bookkeeping. Cache validation
+/// must not turn a successful compiler invocation into a failed one or hide
+/// either stream from Cargo.
+fn replay_compiler_output(output: &Output) -> Result<ExitCode> {
+    replay_compiler_output_with(output, replay_output)
+}
+
+fn replay_compiler_output_with(
+    output: &Output,
+    replay: impl FnOnce(&Output) -> Result<()>,
+) -> Result<ExitCode> {
+    let _ = replay(output);
+    Ok(exit_code(output.status))
 }
 
 fn validate_compiler_inputs(
@@ -692,11 +684,11 @@ fn validate_compiler_inputs(
     working_dir: &Path,
     portable: &Portable,
     compilation_started: SystemTime,
-    input_snapshots: &std::io::Result<BTreeMap<PathBuf, FileSnapshot>>,
+    input_observations: &Result<BTreeMap<PathBuf, FileObservation>, BypassReason>,
 ) -> Result<()> {
-    let input_snapshots = input_snapshots
+    let input_observations = input_observations
         .as_ref()
-        .map_err(|error| eyre::eyre!(error.to_string()))?;
+        .map_err(|error| eyre::Report::new(error.clone()))?;
     let dep_info = RustcDepInfo::read(&outputs.dep_info)?;
     let discovered = invocation.discover_inputs_with_mappings(
         &dep_info,
@@ -704,28 +696,9 @@ fn validate_compiler_inputs(
         &portable.mappings,
         session::file_digest_cache(),
     )?;
-    discovered.verify_not_modified_since_with_snapshots(compilation_started, input_snapshots)?;
-    discovered.verify()?;
-    Ok(())
-}
-
-/// Remove an invalid compiler result before Cargo can consume or fingerprint it.
-fn discard_compiler_outputs(outputs: &RustcOutputs) -> Result<()> {
-    let mut failures = Vec::new();
-    for path in outputs
-        .files
-        .iter()
-        .chain(std::iter::once(&outputs.dep_info))
-    {
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => failures.push(format!("{}: {error}", path.display())),
-        }
-    }
-    if !failures.is_empty() {
-        bail!("{}", failures.join("; "));
-    }
+    discovered
+        .verify_not_modified_since_with_observations(compilation_started, input_observations)?;
+    discovered.verify_with_cache(session::file_digest_cache())?;
     Ok(())
 }
 
@@ -743,8 +716,13 @@ fn compile_execution_only_build_script(
     let demand = crate::scheduler::Demand::new(invocation.crate_name(), true);
     let permit = crate::scheduler::pool().and_then(|pool| pool.admit(&demand));
     let required_inputs = invocation.required_inputs_in(working_dir);
-    let input_snapshots =
-        crate::util::snapshot_compiler_inputs(required_inputs.iter().map(PathBuf::as_path));
+    let input_observations = crate::util::observe_compiler_inputs(
+        required_inputs.iter().map(PathBuf::as_path),
+    )
+    .map_err(|error| BypassReason::InputRead {
+        path: required_inputs.first().cloned().unwrap_or_default(),
+        message: error.to_string(),
+    });
     let compilation_started = SystemTime::now();
     let started = Instant::now();
     let output = compiler_command(rustc, wrapper_argument)
@@ -759,6 +737,7 @@ fn compile_execution_only_build_script(
         Some(invocation.crate_name()),
         started.elapsed().as_nanos().try_into().unwrap_or(u64::MAX),
     );
+    let mut input_validation_failed = false;
     if output.status.success()
         && let Err(error) = validate_compiler_inputs(
             invocation,
@@ -766,18 +745,14 @@ fn compile_execution_only_build_script(
             working_dir,
             portable,
             compilation_started,
-            &input_snapshots,
+            &input_observations,
         )
     {
-        if discard_modified_compiler_result(outputs, &input_snapshots, &error) {
-            let _ = replay_bytes(&[], &output.stderr);
-            return Ok(ExitCode::FAILURE);
-        }
-        session::report_shim_warning(&format!(
-            "build-script inputs were not validated: {error:#}"
-        ));
+        input_validation_failed = true;
+        report_validation_failure("build-script inputs were not validated", &error);
     }
     if output.status.success()
+        && !input_validation_failed
         && let Some(executable) = outputs.build_script_executable(invocation.crate_name())
     {
         let installed = (|| -> Result<()> {
@@ -832,8 +807,7 @@ fn compile_execution_only_build_script(
             ));
         }
     }
-    let _ = replay_output(&output);
-    Ok(exit_code(output.status))
+    replay_compiler_output(&output)
 }
 
 fn compiler_command(rustc: &OsStr, wrapper_argument: Option<&OsStr>) -> Command {
@@ -2298,6 +2272,7 @@ pub(crate) fn output_already_in_place(
         match digests.resolve(FileDigestScope::Content, &[identity]).pop() {
             Some(FileDigestResolution::Digest(recorded)) => return recorded == node.digest,
             Some(FileDigestResolution::EmbeddedTimestampMacro) => return false,
+            Some(FileDigestResolution::Indeterminate) => return false,
             Some(FileDigestResolution::Unresolved) | None => {}
         }
     }
@@ -2893,28 +2868,36 @@ fn publish_result<'a>(
             // hash the artifact. Reading first and then calling `blake3_file`
             // made cold builds read every output twice merely to decide which
             // action key could safely name it.
-            let digest = if candidates.portable.is_some() {
-                let contents = std::fs::read(path)
-                    .wrap_err_with(|| format!("failed to read rustc output {}", path.display()))?;
+            let observation = if candidates.portable.is_some() {
+                let (observation, contents) = FileObservation::capture_with_contents(path)
+                    .wrap_err_with(|| format!("failed to observe rustc output {}", path.display()))?
+                    .ok_or_else(|| {
+                        eyre::eyre!(
+                            "filesystem supplied no observation for rustc output {}",
+                            path.display()
+                        )
+                    })?;
                 portable_outputs_are_clean &= portable.contents_are_clean(&contents);
-                CacheDigest::blake3(&contents)
+                observation
             } else {
-                CacheDigest::blake3_file(path)?
+                FileObservation::capture(path)?.ok_or_else(|| {
+                    eyre::eyre!(
+                        "filesystem supplied no observation for rustc output {}",
+                        path.display()
+                    )
+                })?
             };
+            let digest = observation.digest.clone();
             blobs.push((digest.clone(), path.clone()));
             // Freshly compiled artifacts enter the ledger too: on a cold
             // build these are exactly the rlibs every dependent is about to
             // key, and this hash is the read that ledger entries stand in
             // for. The dep-info stays out -- its stored digest describes the
             // placeholder form, not what is on disk.
-            if metadata.len() == digest.size
-                && let Ok(Some(file)) = FileIdentity::for_digest_cache(path, &metadata)
-            {
-                hashed_outputs.push(RecordedFileDigest {
-                    file,
-                    digest: digest.clone(),
-                });
-            }
+            hashed_outputs.push(RecordedFileDigest {
+                file: observation.identity,
+                digest: digest.clone(),
+            });
             digest
         };
         files.push(CacheFileNode {

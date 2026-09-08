@@ -5,8 +5,8 @@ use crate::{
     MAX_MANIFEST_ENTRIES, MAX_PREDICTED_INPUTS, normalize_components,
 };
 use mbx_cache_core::{
-    CacheDigest, FileDigestCache, FileDigestResolution, FileDigestScope, FileIdentity,
-    FileSnapshot, RecordedFileDigest, digest_file,
+    CacheDigest, FileDigestCache, FileDigestScope, FileIdentity, FileObservation,
+    FileObservationMatch, FileObservationResolution, FileSnapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Read;
@@ -21,6 +21,27 @@ pub const INCLUDE_MANIFEST_PREFIX: &str = "@include-manifest:";
 const ASSEMBLER_INPUT_DIRECTIVES: &[&[u8]] = &[b".include", b".incbin", b".sinclude"];
 
 const SCAN_CHUNK_BYTES: usize = 64 * 1024;
+
+fn observation_error(paths: &[PathBuf], error: std::io::Error) -> CcBypassReason {
+    // The shared batch API intentionally aborts the whole batch when one file
+    // cannot be stabilized, but currently exposes only WouldBlock rather than
+    // the offending path. Keep the path-bearing adapter error until the core
+    // API grows a structured capture error; callers still treat it as a
+    // routine cache bypass and continue with the compiler.
+    CcBypassReason::InputRead {
+        path: paths
+            .iter()
+            .find(|path| {
+                std::fs::metadata(path)
+                    .map(|metadata| !metadata.is_file())
+                    .unwrap_or(true)
+            })
+            .or_else(|| paths.first())
+            .cloned()
+            .unwrap_or_default(),
+        message: error.to_string(),
+    }
+}
 
 /// A parsed GNU-style dependency list.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -250,7 +271,7 @@ pub struct CcDiscoveredInputs {
     /// What each file input looked like on disk when its digest was
     /// established, index-aligned with `inputs`; `None` for manifests and
     /// where the filesystem gave nothing to compare against later.
-    identities: Vec<Option<FileIdentity>>,
+    observations: Vec<Option<FileObservation>>,
 }
 
 impl CcDiscoveredInputs {
@@ -276,23 +297,20 @@ impl CcDiscoveredInputs {
             return Err(CcBypassReason::TooManyInputs);
         }
         let working_dir = normalize_components(working_dir);
-        let mut inputs = Vec::with_capacity(files.len() + directories.len());
+        let file_paths = files.into_iter().collect::<Vec<_>>();
+        let mut inputs = Vec::with_capacity(file_paths.len() + directories.len());
         let mut total_bytes = 0_u64;
-        // Stat everything first so one batched ledger lookup can stand in for
-        // rereading headers the session already scanned and hashed. A ledger
-        // entry in the cc scope was recorded after the timestamp-macro scan
-        // passed, so a hit skips the scan for the same reason it skips the
-        // hash: the identity says the contents have not changed since both
-        // were established.
-        let mut identified = Vec::with_capacity(files.len());
-        for path in files {
-            let metadata = std::fs::metadata(&path).map_err(|error| CcBypassReason::InputRead {
+        // Preserve the adapter's byte budget before asking the observer to
+        // read anything. The observer repeats the metadata check because its
+        // identity must be current; this pass exists only to bound work.
+        for path in &file_paths {
+            let metadata = std::fs::metadata(path).map_err(|error| CcBypassReason::InputRead {
                 path: path.clone(),
                 message: error.to_string(),
             })?;
             if !metadata.is_file() {
                 return Err(CcBypassReason::InputRead {
-                    path,
+                    path: path.clone(),
                     message: "input is not a regular file".into(),
                 });
             }
@@ -300,66 +318,35 @@ impl CcDiscoveredInputs {
             if total_bytes > MAX_INPUT_BYTES {
                 return Err(CcBypassReason::TooManyInputs);
             }
-            let identity = FileIdentity::for_digest_cache(&path, &metadata).map_err(|error| {
-                CcBypassReason::InputRead {
-                    path: path.clone(),
-                    message: error.to_string(),
-                }
-            })?;
-            identified.push((path, identity));
         }
-        let queries = identified
-            .iter()
-            .filter_map(|(_, identity)| identity.clone())
-            .collect::<Vec<_>>();
-        let mut recorded = digests
-            .resolve(FileDigestScope::CcInput, &queries)
-            .into_iter();
-        let mut identities = Vec::with_capacity(inputs.capacity());
-        let mut fresh = Vec::new();
-        for (path, identity) in identified {
-            identities.push(identity.clone());
-            let resolution = identity
-                .as_ref()
-                .and_then(|_| recorded.next())
-                .unwrap_or(FileDigestResolution::Unresolved);
-            let digest = match resolution {
-                FileDigestResolution::Digest(digest)
-                    if identity
-                        .as_ref()
-                        .is_some_and(|identity| identity.len == digest.size) =>
-                {
-                    digest
-                }
-                FileDigestResolution::EmbeddedTimestampMacro => {
+        // The shared observer owns metadata qualification, regular-file
+        // checks, and the batched cache lookup. It performs one validated read
+        // for every miss, including the timestamp-macro scan.
+        let resolutions = FileObservation::capture_many_with_scope(
+            FileDigestScope::CcInput,
+            file_paths.iter().map(PathBuf::as_path),
+            digests,
+        )
+        .map_err(|error| observation_error(&file_paths, error))?;
+        let mut observations = Vec::with_capacity(inputs.capacity());
+        for (path, resolution) in file_paths.into_iter().zip(resolutions) {
+            let observation = match resolution {
+                Some(FileObservationResolution::Observation(observation)) => observation,
+                Some(FileObservationResolution::EmbeddedTimestampMacro) => {
                     return Err(CcBypassReason::EmbeddedTimestampMacro(path));
                 }
-                FileDigestResolution::Digest(_) | FileDigestResolution::Unresolved => {
-                    let resolution =
-                        digest_file(FileDigestScope::CcInput, &path).map_err(|error| {
-                            CcBypassReason::InputRead {
-                                path: path.clone(),
-                                message: error.to_string(),
-                            }
-                        })?;
-                    let FileDigestResolution::Digest(digest) = resolution else {
-                        return Err(CcBypassReason::EmbeddedTimestampMacro(path));
-                    };
-                    if let Some(identity) = identity
-                        && identity.len == digest.size
-                    {
-                        fresh.push(RecordedFileDigest {
-                            file: identity,
-                            digest: digest.clone(),
-                        });
-                    }
-                    digest
+                None => {
+                    return Err(CcBypassReason::InputRead {
+                        path,
+                        message: "could not establish a file observation".into(),
+                    });
                 }
             };
-            inputs.push(CcActionInput { path, digest });
-        }
-        if !fresh.is_empty() {
-            digests.record(FileDigestScope::CcInput, fresh);
+            inputs.push(CcActionInput {
+                path,
+                digest: observation.digest.clone(),
+            });
+            observations.push(Some(observation));
         }
         let mut manifest_entries = 0_usize;
         for directory in directories {
@@ -368,12 +355,12 @@ impl CcDiscoveredInputs {
                 path: PathBuf::from(format!("{INCLUDE_MANIFEST_PREFIX}{}", directory.display())),
                 digest,
             });
-            identities.push(None);
+            observations.push(None);
         }
         Ok(Self {
             working_dir,
             inputs,
-            identities,
+            observations,
         })
     }
 
@@ -386,50 +373,84 @@ impl CcDiscoveredInputs {
 
     /// Reject inputs whose modification time overlaps the compiler invocation.
     ///
-    /// Contents are hashed after the compiler reports the paths it read. This
-    /// timestamp barrier prevents a write that landed during the compile from
-    /// being mistaken for the contents that produced the object; `verify`
-    /// closes the remaining race after hashing.
+    /// Inputs known before the compiler ran are compared by their complete
+    /// content observations. Newly discovered headers retain the timestamp
+    /// barrier because no pre-compilation observation exists for them.
     pub fn verify_not_modified_since(&self, started_at: SystemTime) -> Result<(), CcBypassReason> {
-        self.verify_not_modified_since_with_snapshots(started_at, &BTreeMap::new())
+        self.verify_not_modified_since_with_observations(started_at, &BTreeMap::new())
     }
 
-    /// Reject inputs that changed from snapshots captured before the driver
+    /// Reject inputs that changed from observations captured before the driver
     /// ran, falling back to the wall-clock barrier for discovered headers.
+    pub fn verify_not_modified_since_with_observations(
+        &self,
+        started_at: SystemTime,
+        before: &BTreeMap<PathBuf, FileObservation>,
+    ) -> Result<(), CcBypassReason> {
+        for (index, input) in self.inputs.iter().enumerate() {
+            if is_manifest_input(&input.path) {
+                continue;
+            }
+            let Some(observation) = self.observations.get(index).and_then(Option::as_ref) else {
+                return Err(CcBypassReason::InputModifiedDuringCompilation(
+                    input.path.clone(),
+                ));
+            };
+            if let Some(previous) = before.get(&input.path) {
+                match previous.compare(Some(&observation.identity), &observation.digest) {
+                    FileObservationMatch::Reusable => continue,
+                    FileObservationMatch::Changed => {
+                        return Err(CcBypassReason::InputChanged(input.path.clone()));
+                    }
+                    FileObservationMatch::Indeterminate => {
+                        return Err(CcBypassReason::InputModifiedDuringCompilation(
+                            input.path.clone(),
+                        ));
+                    }
+                }
+            }
+            let modified = std::fs::metadata(&input.path)
+                .and_then(|metadata| metadata.modified())
+                .map_err(|error| CcBypassReason::InputRead {
+                    path: input.path.clone(),
+                    message: error.to_string(),
+                })?;
+            if modified >= started_at {
+                return Err(CcBypassReason::InputModifiedDuringCompilation(
+                    input.path.clone(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Compatibility form for callers using the earlier snapshot API.
     pub fn verify_not_modified_since_with_snapshots(
         &self,
         started_at: SystemTime,
         before: &BTreeMap<PathBuf, FileSnapshot>,
     ) -> Result<(), CcBypassReason> {
-        for input in self.files() {
+        for (index, input) in self.inputs.iter().enumerate() {
+            if is_manifest_input(&input.path) {
+                continue;
+            }
             if let Some(previous) = before.get(&input.path)
                 && previous.proves_content_change()
             {
-                let metadata =
-                    std::fs::metadata(&input.path).map_err(|error| CcBypassReason::InputRead {
-                        path: input.path.clone(),
-                        message: error.to_string(),
-                    })?;
-                let identity = FileIdentity::for_digest_cache(&input.path, &metadata)
-                    .map_err(|error| CcBypassReason::InputRead {
-                        path: input.path.clone(),
-                        message: error.to_string(),
-                    })?
-                    .or_else(|| FileIdentity::describe(&input.path, &metadata));
-                if previous.matches(identity.as_ref(), &input.digest) {
+                let Some(current) = self.observations.get(index).and_then(Option::as_ref) else {
+                    return Err(CcBypassReason::InputModifiedDuringCompilation(
+                        input.path.clone(),
+                    ));
+                };
+                if previous.matches(Some(&current.identity), &current.digest) {
                     continue;
                 }
                 return Err(CcBypassReason::InputModifiedDuringCompilation(
                     input.path.clone(),
                 ));
             }
-            let metadata =
-                std::fs::metadata(&input.path).map_err(|error| CcBypassReason::InputRead {
-                    path: input.path.clone(),
-                    message: error.to_string(),
-                })?;
-            let modified = metadata
-                .modified()
+            let modified = std::fs::metadata(&input.path)
+                .and_then(|metadata| metadata.modified())
                 .map_err(|error| CcBypassReason::InputRead {
                     path: input.path.clone(),
                     message: error.to_string(),
@@ -459,34 +480,90 @@ impl CcDiscoveredInputs {
     /// Confirm every discovered file before publication, degrading a changed
     /// input to a miss rather than storing an object under a stale key.
     ///
-    /// A file still wearing the identity `collect` recorded is confirmed by
-    /// that stat alone where the identity carries a change time, which cannot
-    /// be set from user space and so shows a rewrite that restored the old
-    /// modification time. One whose identity moved, that had none, or that a
-    /// platform without change times described, is read and hashed again.
+    /// A successful comparison means both observations have the same content
+    /// and a compatible file object. Timestamp churn alone is tolerated where
+    /// the filesystem exposes an object identity; replacement or an unknown
+    /// object is conservatively treated as indeterminate.
     pub fn verify(&self) -> Result<(), CcBypassReason> {
+        self.verify_with_cache(&mbx_cache_core::NoFileDigestCache)
+    }
+
+    /// Confirm every discovered file while reusing validated session digests.
+    pub fn verify_with_cache(&self, digests: &dyn FileDigestCache) -> Result<(), CcBypassReason> {
+        let mut current = vec![None; self.inputs.len()];
+        let mut pending = Vec::new();
         for (index, input) in self.inputs.iter().enumerate() {
             if is_manifest_input(&input.path) {
                 continue;
             }
-            let read_error = |error: std::io::Error| CcBypassReason::InputRead {
-                path: input.path.clone(),
-                message: error.to_string(),
+            let Some(previous) = self.observations.get(index).and_then(Option::as_ref) else {
+                return Err(CcBypassReason::InputModifiedDuringCompilation(
+                    input.path.clone(),
+                ));
             };
-            if let Some(Some(identity)) = self.identities.get(index)
-                && identity.can_skip_content_verification()
-                && identity.still_describes().map_err(read_error)?
-            {
+
+            if previous.identity.can_skip_content_verification() {
+                match previous.identity.still_describes() {
+                    Ok(true) => {
+                        current[index] = Some(previous.clone());
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Err(CcBypassReason::InputRead {
+                            path: input.path.clone(),
+                            message: error.to_string(),
+                        });
+                    }
+                }
+            }
+            pending.push((index, input.path.as_path()));
+        }
+
+        let pending_paths = pending
+            .iter()
+            .map(|(_, path)| (*path).to_path_buf())
+            .collect::<Vec<_>>();
+        let captured = FileObservation::capture_many_with_scope(
+            FileDigestScope::CcInput,
+            pending_paths.iter().map(PathBuf::as_path),
+            digests,
+        )
+        .map_err(|error| observation_error(&pending_paths, error))?;
+        for ((index, _), resolution) in pending.into_iter().zip(captured) {
+            current[index] = Some(match resolution {
+                Some(FileObservationResolution::Observation(observation)) => observation,
+                Some(FileObservationResolution::EmbeddedTimestampMacro) => {
+                    return Err(CcBypassReason::EmbeddedTimestampMacro(
+                        self.inputs[index].path.clone(),
+                    ));
+                }
+                None => {
+                    return Err(CcBypassReason::InputModifiedDuringCompilation(
+                        self.inputs[index].path.clone(),
+                    ));
+                }
+            });
+        }
+
+        for (index, (input, current)) in self.inputs.iter().zip(current).enumerate() {
+            if is_manifest_input(&input.path) {
                 continue;
             }
-            let matches = input.digest.matches_file(&input.path).map_err(|error| {
-                CcBypassReason::InputRead {
-                    path: input.path.clone(),
-                    message: error.to_string(),
+            let current = current.expect("file inputs have aligned observations");
+            let previous = self.observations[index]
+                .as_ref()
+                .expect("file inputs have aligned observations");
+            match previous.compare(Some(&current.identity), &current.digest) {
+                FileObservationMatch::Reusable => {}
+                FileObservationMatch::Changed => {
+                    return Err(CcBypassReason::InputChanged(input.path.clone()));
                 }
-            })?;
-            if !matches {
-                return Err(CcBypassReason::InputChanged(input.path.clone()));
+                FileObservationMatch::Indeterminate => {
+                    return Err(CcBypassReason::InputModifiedDuringCompilation(
+                        input.path.clone(),
+                    ));
+                }
             }
         }
         Ok(())

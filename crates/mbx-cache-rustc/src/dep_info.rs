@@ -3,10 +3,9 @@ use super::{
     MAX_PREDICTED_INPUTS, PathMapping, RustcInvocation, normalize_components,
 };
 #[cfg(test)]
-use mbx_cache_core::CacheDigest;
+use mbx_cache_core::{CacheDigest, FileDigestScope, RecordedFileDigest};
 use mbx_cache_core::{
-    FileDigestCache, FileDigestResolution, FileDigestScope, FileIdentity, FileSnapshot,
-    RecordedFileDigest, digest_file,
+    FileDigestCache, FileIdentity, FileObservation, FileObservationMatch, FileSnapshot,
 };
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsString;
@@ -140,10 +139,10 @@ pub struct DiscoveredInputs {
     /// Environment inputs captured from dep-info.
     pub environment: BTreeMap<String, Option<String>>,
     /// What each input looked like on disk when its digest was established,
-    /// index-aligned with `inputs`; `None` where the filesystem gave nothing to
-    /// compare against later. Lets `verify` confirm an input by stat instead of
-    /// by reading it again.
-    identities: Vec<Option<FileIdentity>>,
+    /// index-aligned with `inputs`. Observations are retained so validation can
+    /// compare the compiler's inputs without treating a digest as independent
+    /// of the file object that produced it.
+    observations: Vec<Option<FileObservation>>,
 }
 
 impl DiscoveredInputs {
@@ -159,91 +158,33 @@ impl DiscoveredInputs {
             ));
         }
         let working_dir = normalize_components(working_dir);
-        // Stat everything first: the identities drive one batched ledger
-        // lookup, so an upstream rlib the session already hashed -- once, when
-        // it was materialized or published -- is not read again by every crate
-        // that links it. A file the filesystem reports no modification time
-        // for gets no identity and is simply hashed.
-        let mut identified = Vec::with_capacity(paths.len());
-        for path in paths {
-            let metadata = std::fs::metadata(&path).map_err(|error| BypassReason::InputRead {
-                path: path.clone(),
-                message: error.to_string(),
-            })?;
-            if !metadata.is_file() {
+        let paths = paths.into_iter().collect::<Vec<_>>();
+
+        // The shared observation layer performs the batched ledger lookup,
+        // hashes misses through one open handle, and refuses to return a
+        // digest whose identity moved while it was being read.
+        let captured = FileObservation::capture_many(paths.iter().map(PathBuf::as_path), digests)
+            .map_err(|error| capture_error(&paths, error))?;
+        let mut inputs = Vec::with_capacity(paths.len());
+        let mut observations = Vec::with_capacity(paths.len());
+        for (path, observation) in paths.into_iter().zip(captured) {
+            let Some(observation) = observation else {
                 return Err(BypassReason::InputRead {
                     path,
-                    message: "input is not a regular file".into(),
+                    message: "could not establish a file content observation".into(),
                 });
-            }
-            let identity = FileIdentity::for_digest_cache(&path, &metadata).map_err(|error| {
-                BypassReason::InputRead {
-                    path: path.clone(),
-                    message: error.to_string(),
-                }
-            })?;
-            identified.push((path, identity));
-        }
-        let queries = identified
-            .iter()
-            .filter_map(|(_, identity)| identity.clone())
-            .collect::<Vec<_>>();
-        let mut recorded = digests
-            .resolve(FileDigestScope::Content, &queries)
-            .into_iter();
-        let mut inputs = Vec::with_capacity(identified.len());
-        let mut identities = Vec::with_capacity(identified.len());
-        let mut fresh = Vec::new();
-        for (path, identity) in identified {
-            identities.push(identity.clone());
-            let resolution = identity
-                .as_ref()
-                .and_then(|_| recorded.next())
-                .unwrap_or(FileDigestResolution::Unresolved);
-            let digest = match resolution {
-                FileDigestResolution::Digest(digest)
-                    if identity
-                        .as_ref()
-                        .is_some_and(|identity| identity.len == digest.size) =>
-                {
-                    digest
-                }
-                FileDigestResolution::Digest(_)
-                | FileDigestResolution::EmbeddedTimestampMacro
-                | FileDigestResolution::Unresolved => {
-                    let digest = digest_file(FileDigestScope::Content, &path)
-                        .and_then(|resolution| {
-                            resolution.into_digest().ok_or_else(|| {
-                                std::io::Error::other(
-                                    "content digest resolution returned no digest",
-                                )
-                            })
-                        })
-                        .map_err(|error| BypassReason::InputRead {
-                            path: path.clone(),
-                            message: error.to_string(),
-                        })?;
-                    if let Some(identity) = identity
-                        && identity.len == digest.size
-                    {
-                        fresh.push(RecordedFileDigest {
-                            file: identity,
-                            digest: digest.clone(),
-                        });
-                    }
-                    digest
-                }
             };
-            inputs.push(ActionInput { path, digest });
-        }
-        if !fresh.is_empty() {
-            digests.record(FileDigestScope::Content, fresh);
+            inputs.push(ActionInput {
+                path,
+                digest: observation.digest.clone(),
+            });
+            observations.push(Some(observation));
         }
         Ok(Self {
             working_dir,
             inputs,
             environment,
-            identities,
+            observations,
         })
     }
 
@@ -254,58 +195,69 @@ impl DiscoveredInputs {
     /// the contents that produced the artifact. `verify` closes the remaining
     /// race after hashing.
     pub fn verify_not_modified_since(&self, started_at: SystemTime) -> Result<(), BypassReason> {
-        self.verify_not_modified_since_with_snapshots(started_at, &BTreeMap::new())
+        self.verify_not_modified_since_with_observations(started_at, &BTreeMap::new())
     }
 
-    /// Reject inputs that changed from snapshots captured before rustc ran,
+    /// Reject inputs that changed from observations captured before rustc ran,
     /// falling back to the wall-clock barrier for inputs only dep-info named.
     ///
-    /// A snapshot may use metadata or content depending on what its filesystem
-    /// can compare reliably. Metadata snapshots need a change token: without
-    /// one a same-length rewrite can restore its mtime.
+    /// A changed digest means the compiler result was built from different
+    /// bytes and is reported as [`BypassReason::InputChanged`]. An equal digest
+    /// paired with a replaced or otherwise unidentifiable object is
+    /// indeterminate, so publication is refused without claiming the bytes
+    /// changed.
+    pub fn verify_not_modified_since_with_observations(
+        &self,
+        started_at: SystemTime,
+        before: &BTreeMap<PathBuf, FileObservation>,
+    ) -> Result<(), BypassReason> {
+        for (index, input) in self.inputs.iter().enumerate() {
+            if let Some(previous) = before.get(&input.path) {
+                let Some(current) = self.observations.get(index).and_then(Option::as_ref) else {
+                    return Err(BypassReason::InputModifiedDuringCompilation(
+                        input.path.clone(),
+                    ));
+                };
+                match previous.compare(Some(&current.identity), &current.digest) {
+                    FileObservationMatch::Reusable => continue,
+                    FileObservationMatch::Changed => {
+                        return Err(BypassReason::InputChanged(input.path.clone()));
+                    }
+                    FileObservationMatch::Indeterminate => {
+                        return Err(BypassReason::InputModifiedDuringCompilation(
+                            input.path.clone(),
+                        ));
+                    }
+                }
+            }
+            reject_if_modified_since(&input.path, started_at)?;
+        }
+        Ok(())
+    }
+
+    /// Compatibility form for callers using the earlier snapshot API.
     pub fn verify_not_modified_since_with_snapshots(
         &self,
         started_at: SystemTime,
         before: &BTreeMap<PathBuf, FileSnapshot>,
     ) -> Result<(), BypassReason> {
-        for input in &self.inputs {
+        for (index, input) in self.inputs.iter().enumerate() {
             if let Some(previous) = before.get(&input.path)
                 && previous.proves_content_change()
             {
-                let metadata =
-                    std::fs::metadata(&input.path).map_err(|error| BypassReason::InputRead {
-                        path: input.path.clone(),
-                        message: error.to_string(),
-                    })?;
-                let identity = FileIdentity::for_digest_cache(&input.path, &metadata)
-                    .map_err(|error| BypassReason::InputRead {
-                        path: input.path.clone(),
-                        message: error.to_string(),
-                    })?
-                    .or_else(|| FileIdentity::describe(&input.path, &metadata));
-                if previous.matches(identity.as_ref(), &input.digest) {
+                let Some(current) = self.observations.get(index).and_then(Option::as_ref) else {
+                    return Err(BypassReason::InputModifiedDuringCompilation(
+                        input.path.clone(),
+                    ));
+                };
+                if previous.matches(Some(&current.identity), &current.digest) {
                     continue;
                 }
                 return Err(BypassReason::InputModifiedDuringCompilation(
                     input.path.clone(),
                 ));
             }
-            let metadata =
-                std::fs::metadata(&input.path).map_err(|error| BypassReason::InputRead {
-                    path: input.path.clone(),
-                    message: error.to_string(),
-                })?;
-            let modified = metadata
-                .modified()
-                .map_err(|error| BypassReason::InputRead {
-                    path: input.path.clone(),
-                    message: error.to_string(),
-                })?;
-            if modified >= started_at {
-                return Err(BypassReason::InputModifiedDuringCompilation(
-                    input.path.clone(),
-                ));
-            }
+            reject_if_modified_since(&input.path, started_at)?;
         }
         Ok(())
     }
@@ -327,35 +279,74 @@ impl DiscoveredInputs {
     /// This closes the discovery/compile race by degrading changed inputs to a
     /// cache miss rather than storing outputs beneath a stale action key.
     pub fn verify(&self) -> Result<(), BypassReason> {
+        self.verify_with_cache(&mbx_cache_core::NoFileDigestCache)
+    }
+
+    /// Re-observe every discovered file before publication. A stable digest
+    /// normally comes from the session ledger, while a changed identity causes
+    /// the shared layer to hash the file once. Changed bytes and indeterminate
+    /// object replacement both refuse publication.
+    pub fn verify_with_cache(&self, digests: &dyn FileDigestCache) -> Result<(), BypassReason> {
+        let mut current = vec![None; self.inputs.len()];
+        let mut pending = Vec::new();
         for (index, input) in self.inputs.iter().enumerate() {
-            let read_error = |error: std::io::Error| BypassReason::InputRead {
-                path: input.path.clone(),
-                message: error.to_string(),
+            let Some(previous) = self.observations.get(index).and_then(Option::as_ref) else {
+                return Err(BypassReason::InputModifiedDuringCompilation(
+                    input.path.clone(),
+                ));
             };
-            // An input still wearing the identity discovery recorded -- length,
-            // modification time, and change time -- is confirmed by that stat
-            // alone. The change time is what makes this as good as reading: it
-            // cannot be set from user space, so a rewrite that puts the old
-            // modification time back still shows, where a platform that reports
-            // none would let a same-length rewrite inside one timestamp tick
-            // through. Such an identity is not trusted here, and neither is an
-            // input that had none. Reading everything again cost as much as
-            // keying the compilation did: a large binary's dependency rlibs, a
-            // gigabyte of them, read twice for every edit.
-            if let Some(Some(identity)) = self.identities.get(index)
-                && identity.can_skip_content_verification()
-                && identity.still_describes().map_err(read_error)?
-            {
-                continue;
-            }
-            let matches = input.digest.matches_file(&input.path).map_err(|error| {
-                BypassReason::InputRead {
-                    path: input.path.clone(),
-                    message: error.to_string(),
+            // A strong identity already proves that the bytes associated with
+            // the discovery observation are still the bytes at this path. The
+            // stat-only fast path also preserves the session's sentinel/ledger
+            // behavior; changed identities fall through to one shared capture.
+            if previous.identity.can_skip_content_verification() {
+                match previous.identity.still_describes() {
+                    Ok(true) => {
+                        current[index] = Some(previous.clone());
+                        continue;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        return Err(BypassReason::InputRead {
+                            path: input.path.clone(),
+                            message: error.to_string(),
+                        });
+                    }
                 }
-            })?;
-            if !matches {
-                return Err(BypassReason::InputChanged(input.path.clone()));
+            }
+            pending.push((index, input.path.as_path()));
+        }
+
+        let pending_paths = pending.iter().map(|(_, path)| *path).collect::<Vec<_>>();
+        let captured = FileObservation::capture_many(pending_paths.iter().copied(), digests)
+            .map_err(|error| capture_error(&pending_paths, error))?;
+        for ((index, _), observation) in pending.into_iter().zip(captured) {
+            current[index] = Some(observation.ok_or_else(|| BypassReason::InputRead {
+                path: self.inputs[index].path.clone(),
+                message: "could not establish a file content observation".into(),
+            })?);
+        }
+
+        for (index, (input, current)) in self.inputs.iter().zip(current).enumerate() {
+            let Some(current) = current else {
+                return Err(BypassReason::InputRead {
+                    path: input.path.clone(),
+                    message: "could not establish a file content observation".into(),
+                });
+            };
+            let previous = self.observations[index]
+                .as_ref()
+                .expect("aligned observation");
+            match previous.compare(Some(&current.identity), &current.digest) {
+                FileObservationMatch::Reusable => {}
+                FileObservationMatch::Changed => {
+                    return Err(BypassReason::InputChanged(input.path.clone()));
+                }
+                FileObservationMatch::Indeterminate => {
+                    return Err(BypassReason::InputModifiedDuringCompilation(
+                        input.path.clone(),
+                    ));
+                }
             }
         }
         Ok(())
@@ -380,6 +371,46 @@ impl DiscoveredInputs {
         context.inputs.extend(self.inputs);
         Ok(())
     }
+}
+
+/// Translate the shared observation layer's batch-level failure into the
+/// adapter's ordinary input-read bypass. The underlying message preserves
+/// whether capture was unstable; the first path supplies context until the
+/// core batch API exposes the failing member directly.
+fn capture_error<P: AsRef<Path>>(paths: &[P], error: std::io::Error) -> BypassReason {
+    let path = paths
+        .iter()
+        .find(|path| {
+            std::fs::metadata(path.as_ref())
+                .map(|metadata| !metadata.is_file())
+                .unwrap_or(true)
+        })
+        .or_else(|| paths.first())
+        .map(|path| path.as_ref().to_path_buf())
+        .unwrap_or_default();
+    BypassReason::InputRead {
+        path,
+        message: error.to_string(),
+    }
+}
+
+fn reject_if_modified_since(path: &Path, started_at: SystemTime) -> Result<(), BypassReason> {
+    let metadata = std::fs::metadata(path).map_err(|error| BypassReason::InputRead {
+        path: path.to_path_buf(),
+        message: error.to_string(),
+    })?;
+    let modified = metadata
+        .modified()
+        .map_err(|error| BypassReason::InputRead {
+            path: path.to_path_buf(),
+            message: error.to_string(),
+        })?;
+    if modified >= started_at {
+        return Err(BypassReason::InputModifiedDuringCompilation(
+            path.to_path_buf(),
+        ));
+    }
+    Ok(())
 }
 
 impl RustcInvocation {
@@ -791,12 +822,14 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
     #[test]
-    fn precompile_snapshot_does_not_depend_on_the_host_clock() {
+    fn precompile_observations_classify_changed_content() {
         let directory = tempfile::tempdir().unwrap();
         let source = directory.path().join("lib.rs");
         std::fs::write(&source, "pub fn library() {0}\n").unwrap();
+        let before = FileObservation::capture(&source).unwrap().unwrap();
+        std::fs::write(&source, "pub fn library() {1}\n").unwrap();
+
         let invocation = RustcInvocation::parse(&[
             "--crate-name=widget".into(),
             "--crate-type=lib".into(),
@@ -808,22 +841,42 @@ mod tests {
         let discovered = invocation
             .discover_inputs(&dep_info, directory.path())
             .unwrap();
-        let snapshot = FileSnapshot::capture(&source).unwrap().unwrap();
-        let before = BTreeMap::from([(source.clone(), snapshot)]);
+        let before = BTreeMap::from([(source.clone(), before)]);
 
-        // Every ordinary mtime is after the epoch. The unchanged identity is
-        // nevertheless enough proof when the filesystem clock is far ahead.
-        discovered
-            .verify_not_modified_since_with_snapshots(SystemTime::UNIX_EPOCH, &before)
-            .unwrap();
-
-        // Conversely, a filesystem clock far behind must not conceal a write.
-        std::fs::write(&source, "pub fn library() {1}\n").unwrap();
         assert_eq!(
-            discovered.verify_not_modified_since_with_snapshots(
-                SystemTime::now() + std::time::Duration::from_secs(60),
-                &before,
-            ),
+            discovered
+                .verify_not_modified_since_with_observations(SystemTime::UNIX_EPOCH, &before,),
+            Err(BypassReason::InputChanged(source))
+        );
+    }
+
+    #[test]
+    fn precompile_observations_treat_same_bytes_on_replaced_object_as_indeterminate() {
+        let directory = tempfile::tempdir().unwrap();
+        let source = directory.path().join("lib.rs");
+        std::fs::write(&source, "pub fn library() {}\n").unwrap();
+        let before = FileObservation::capture(&source).unwrap().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        let replacement = directory.path().join("replacement.rs");
+        std::fs::write(&replacement, "pub fn library() {}\n").unwrap();
+        std::fs::rename(&replacement, &source).unwrap();
+
+        let invocation = RustcInvocation::parse(&[
+            "--crate-name=widget".into(),
+            "--crate-type=lib".into(),
+            "--emit=dep-info,metadata".into(),
+            source.clone().into_os_string(),
+        ])
+        .unwrap();
+        let dep_info = RustcDepInfo::parse(&format!("output: {}\n", source.display())).unwrap();
+        let discovered = invocation
+            .discover_inputs(&dep_info, directory.path())
+            .unwrap();
+        let before = BTreeMap::from([(source.clone(), before)]);
+
+        assert_eq!(
+            discovered
+                .verify_not_modified_since_with_observations(SystemTime::UNIX_EPOCH, &before,),
             Err(BypassReason::InputModifiedDuringCompilation(source))
         );
     }

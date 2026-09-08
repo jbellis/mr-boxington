@@ -4948,6 +4948,27 @@ async fn abandoned_file_digest_owner_wakes_the_next_waiter() {
 }
 
 #[tokio::test]
+async fn a_file_that_moves_before_the_agent_reads_is_indeterminate() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("input.rlib");
+    std::fs::write(&path, b"dependency bytes").unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let identity = FileIdentity::for_digest_cache(&path, &metadata)
+        .unwrap()
+        .unwrap();
+    std::fs::remove_file(&path).unwrap();
+
+    let agent = CacheAgent::new(directory.path().join("cache"), "test-version");
+    assert_eq!(
+        agent
+            .resolve_file_digest(FileDigestScope::Content, identity)
+            .await,
+        FileDigestResolution::Indeterminate
+    );
+    assert_eq!(agent.file_digest_reads.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
 async fn file_digest_records_are_validated() {
     let directory = tempfile::tempdir().unwrap();
     let agent = CacheAgent::new(directory.path(), "test-version");

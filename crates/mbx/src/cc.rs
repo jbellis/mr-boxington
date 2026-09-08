@@ -25,7 +25,7 @@ use mbx_cache_cc::{
 };
 use mbx_cache_core::{
     ActionPrediction, AgentRequest, AgentResponse, CacheDigest, CacheDirectory, CacheFileNode,
-    CcMetadata, FileDigestScope, FileIdentity, FileSnapshot, PathMapping, RecordedFileDigest,
+    CcMetadata, FileDigestScope, FileIdentity, FileObservation, PathMapping, RecordedFileDigest,
     RemoteActionResult, RestoreStats, canonical_json, normalize_mapped_path,
 };
 use std::borrow::Cow;
@@ -295,8 +295,13 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
         .iter()
         .map(|path| absolute(path, &working_dir))
         .collect::<Vec<_>>();
-    let input_snapshots =
-        crate::util::snapshot_compiler_inputs(required_inputs.iter().map(PathBuf::as_path));
+    let input_observations = crate::util::observe_compiler_inputs(
+        required_inputs.iter().map(PathBuf::as_path),
+    )
+    .map_err(|error| CcBypassReason::InputRead {
+        path: required_inputs.first().cloned().unwrap_or_default(),
+        message: error.to_string(),
+    });
     let demand = crate::scheduler::Demand::new(&compilation_name(&invocation), false);
     let permit = crate::scheduler::pool().and_then(|pool| pool.admit(&demand));
     let started = Instant::now();
@@ -349,7 +354,7 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
             &depfile,
             &output,
             compilation_started,
-            &input_snapshots,
+            &input_observations,
             &task,
             &invocation_digest,
             duration_ns,
@@ -389,7 +394,7 @@ fn publish(
     depfile: &Path,
     output: &Output,
     compilation_started: SystemTime,
-    input_snapshots: &std::io::Result<BTreeMap<PathBuf, FileSnapshot>>,
+    input_observations: &Result<BTreeMap<PathBuf, FileObservation>, CcBypassReason>,
     task: &str,
     invocation_digest: &CacheDigest,
     duration_ns: u64,
@@ -400,13 +405,14 @@ fn publish(
     portable: &Portable,
 ) -> Result<()> {
     let _phase = crate::phase_timing::phase("store");
-    let input_snapshots = input_snapshots
+    let input_observations = input_observations
         .as_ref()
-        .map_err(|error| eyre::eyre!(error.to_string()))?;
+        .map_err(|error| eyre::Report::new(error.clone()))?;
     let discovered = discover(invocation, context, depfile)?;
-    discovered.verify_not_modified_since_with_snapshots(compilation_started, input_snapshots)?;
+    discovered
+        .verify_not_modified_since_with_observations(compilation_started, input_observations)?;
     verify_search_path_unchanged(searchable, before)?;
-    discovered.verify()?;
+    discovered.verify_with_cache(session::file_digest_cache())?;
     discovered.apply_to(context)?;
     // Debug remapping does not change runtime strings such as __FILE__. If
     // an object retains a path, bind its action to the literal paths instead
@@ -1243,7 +1249,7 @@ fn restore_result(
 
     // Re-check the inputs after staging: a header rewritten while the lookup
     // was in flight must not be answered from the key it no longer matches.
-    discovered.verify()?;
+    discovered.verify_with_cache(session::file_digest_cache())?;
     if restore_outputs {
         persist_outputs(staged)?;
         // The restored object is what a later native link hashes as an input,
@@ -1325,21 +1331,20 @@ fn publish_result(
     )?;
     blobs.extend([stdout.clone(), stderr.clone()]);
 
-    let digest = CacheDigest::blake3_file(object)?;
+    let observation = FileObservation::capture(object)?
+        .ok_or_else(|| eyre::eyre!("filesystem supplied no observation for cc output"))?;
+    let digest = observation.digest.clone();
     blobs.push((digest.clone(), object.to_path_buf()));
     // A freshly compiled object is a future native-link input; the hash just
-    // taken is the read a ledger entry stands in for.
-    if metadata.len() == digest.size
-        && let Ok(Some(file)) = FileIdentity::for_digest_cache(object, &metadata)
-    {
-        session::record_file_digests(
-            FileDigestScope::Content,
-            vec![RecordedFileDigest {
-                file,
-                digest: digest.clone(),
-            }],
-        );
-    }
+    // taken is the read a ledger entry stands in for. The observation binds
+    // that digest to the file identity recorded with it.
+    session::record_file_digests(
+        FileDigestScope::Content,
+        vec![RecordedFileDigest {
+            file: observation.identity,
+            digest: digest.clone(),
+        }],
+    );
     let files = vec![CacheFileNode {
         digest,
         // An object file is never executable, which is what makes the mode

@@ -1027,12 +1027,14 @@ pub fn run_rustdoc_shim() -> ExitCode {
     let arguments = std::env::args_os().skip(1).collect::<Vec<_>>();
     match crate::rustdoc::document(&rustdoc, &arguments) {
         Ok(code) => code,
-        Err(_error) => {
+        Err(error) => {
             let _ = request_agent(&[AgentRequest::RecordBypass {
                 kind: "rustdoc".into(),
             }]);
-            #[cfg(debug_assertions)]
-            eprintln!("mbx[warning]: rustdoc cache bypassed: {_error:#}");
+            report_shim_debug(
+                "mbx::rustdoc",
+                &format!("rustdoc cache bypassed: {error:#}"),
+            );
             run_transparent_rustdoc(rustdoc, arguments)
         }
     }
@@ -1800,7 +1802,17 @@ pub(crate) fn report_cc_publication_failure(unit: &str, error: &eyre::Report) {
         reason.and_then(mbx_cache_cc::CcBypassReason::remediation),
     );
     let diagnostic = bypass_diagnostic(
-        expected_cc_bypass(reason),
+        expected_cc_bypass(reason)
+            || matches!(
+                reason,
+                Some(
+                    mbx_cache_cc::CcBypassReason::InputChanged(_)
+                        | mbx_cache_cc::CcBypassReason::InputModifiedDuringCompilation(_)
+                )
+            )
+            || error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.kind() == std::io::ErrorKind::WouldBlock),
         &format!(
             "cc result was not published for {}: {error:#}",
             unit.escape_default()
@@ -1871,6 +1883,14 @@ fn expected_cc_bypass(reason: Option<&mbx_cache_cc::CcBypassReason>) -> bool {
                 | NonUtf8Path(_)
         )
     )
+}
+
+/// Forward routine diagnostics through the session without entering compiler output.
+pub(crate) fn report_shim_debug(target: &str, message: &str) {
+    let _ = request_agent(&[AgentRequest::RecordDebug {
+        target: target.into(),
+        message: diagnostics::diagnostic_message(message),
+    }]);
 }
 
 /// Known routine bypass reasons describe conservative decisions. Other
