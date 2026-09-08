@@ -30,20 +30,25 @@ pub(crate) fn reserve_stderr_for_compiler() {
 /// losing a diagnostic costs a little visibility, while poisoning a configure
 /// probe costs the build its cache keys.
 pub(crate) fn report_shim_warning(message: &str) {
-    report_shim_diagnostic("warning", message, false);
+    report_shim_diagnostic(Severity::Warning, message);
 }
 
 /// Report a fatal shim diagnostic without losing it when transport fails.
 ///
-/// The current wire protocol has one diagnostic request, so an active session
-/// surfaces this through the same agent warning channel. The local fallback
-/// keeps the fatal reason visible when that channel is unavailable, even if
-/// Cargo may then save it with the failed compiler's output.
+/// The session retains the error's severity when it displays and emits it.
+/// The local fallback keeps the fatal reason visible when delivery fails,
+/// including when an older agent does not understand the error request.
 pub(crate) fn report_shim_error(message: &str) {
-    report_shim_diagnostic("error", message, true);
+    report_shim_diagnostic(Severity::Error, message);
 }
 
-fn report_shim_diagnostic(label: &str, message: &str, always_fallback: bool) {
+#[derive(Clone, Copy)]
+enum Severity {
+    Warning,
+    Error,
+}
+
+fn report_shim_diagnostic(severity: Severity, message: &str) {
     let mut message = message.replace(['\n', '\r'], "; ");
     // Stay under the agent's acceptance limit rather than losing the whole
     // diagnostic to it; the start of an error chain names the failure.
@@ -52,15 +57,31 @@ fn report_shim_diagnostic(label: &str, message: &str, always_fallback: bool) {
         message.truncate(end.unwrap_or_default());
         message.push_str("...");
     }
+    let (label, request) = match severity {
+        Severity::Warning => (
+            "warning",
+            AgentRequest::RecordWarning {
+                message: message.clone(),
+            },
+        ),
+        Severity::Error => (
+            "error",
+            AgentRequest::RecordError {
+                message: message.clone(),
+            },
+        ),
+    };
+    let response = request_agent(&[request])
+        .ok()
+        .and_then(|responses| responses.into_iter().next());
     let delivered = matches!(
-        request_agent(&[AgentRequest::RecordWarning {
-            message: message.clone(),
-        }])
-        .map(|responses| responses.into_iter().next()),
-        Ok(Some(AgentResponse::WarningRecorded))
+        (severity, response),
+        (Severity::Warning, Some(AgentResponse::WarningRecorded))
+            | (Severity::Error, Some(AgentResponse::ErrorRecorded))
     );
     if !delivered
-        && (always_fallback || !STDERR_RESERVED.load(std::sync::atomic::Ordering::Relaxed))
+        && (matches!(severity, Severity::Error)
+            || !STDERR_RESERVED.load(std::sync::atomic::Ordering::Relaxed))
     {
         note(&format!("mbx[{label}]: {message}"));
     }

@@ -125,6 +125,30 @@ fn generate_lockfile(directory: &Path) {
 
 #[cfg(unix)]
 #[test]
+fn a_fatal_rustc_shim_error_survives_an_unavailable_agent() {
+    let directory = tempfile::tempdir().unwrap();
+    let shim = mbx::session::install_shim(
+        Path::new(env!("CARGO_BIN_EXE_mbx")),
+        directory.path(),
+        mbx::session::ShimLink::Tracking,
+    )
+    .unwrap();
+    let output = Command::new(shim)
+        .arg(directory.path().join("missing-rustc"))
+        .env("MBX_SOCKET", directory.path().join("missing-agent.sock"))
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!output.status.success(), "a missing compiler must fail");
+    assert!(
+        stderr.contains("mbx[error]: the rustc shim failed to execute rustc:"),
+        "the fatal reason must survive a failed delivery: {stderr}"
+    );
+    assert!(!stderr.contains("mbx[warning]"), "{stderr}");
+}
+
+#[cfg(unix)]
+#[test]
 fn transparent_rustc_replaces_the_shim_process() {
     let directory = tempfile::tempdir().unwrap();
     let shim = mbx::session::install_shim(
@@ -290,8 +314,13 @@ fn a_mid_compilation_input_edit_discards_the_result() {
         "the invalid compilation must fail"
     );
     assert!(
-        stderr.contains("compilation result was discarded: compiler input was modified"),
-        "the mutation should be diagnosed: {stderr}"
+        stderr
+            .contains("mbx[error]: compilation result was discarded: compiler input was modified"),
+        "the mutation should be diagnosed as an error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("mbx[warning]: compilation result was discarded"),
+        "a fatal rejection must retain its severity: {stderr}"
     );
     assert!(
         !stderr.contains("Checking above"),
