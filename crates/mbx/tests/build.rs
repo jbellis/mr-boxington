@@ -17,6 +17,35 @@ fn write_project(directory: &Path) {
     write_named_project(directory, "fixture");
 }
 
+/// Write a binary whose value comes from a compiler environment dependency.
+fn write_environment_project(directory: &Path) {
+    std::fs::create_dir_all(directory.join("src")).unwrap();
+    std::fs::write(
+        directory.join("Cargo.toml"),
+        "[package]\nname = \"environment-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.join("src/main.rs"),
+        "fn main() { println!(\"{}\", option_env!(\"MBX_TEST_BUILD_IDENTITY\").unwrap_or(\"unset\")); }\n",
+    )
+    .unwrap();
+    generate_lockfile(directory);
+}
+
+fn run_environment_project(directory: &Path) -> String {
+    let executable = format!("environment-fixture{}", std::env::consts::EXE_SUFFIX);
+    let output = Command::new(directory.join("target/debug").join(executable))
+        .output()
+        .expect("the environment fixture should run");
+    assert!(
+        output.status.success(),
+        "the environment fixture failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).trim().to_string()
+}
+
 /// Write the fixture under `name`.
 ///
 /// The name reaches the lockfile, and the lockfile is what the build identity
@@ -327,24 +356,8 @@ fn a_mid_compilation_input_edit_discards_the_result() {
         "Cargo must not compile a dependent against the stale metadata: {stderr}"
     );
 
-    let mut fingerprint_replays = Vec::new();
-    let fingerprint_root = project.path().join("target/debug/.fingerprint");
-    for unit in std::fs::read_dir(&fingerprint_root).unwrap().flatten() {
-        let Ok(files) = std::fs::read_dir(unit.path()) else {
-            continue;
-        };
-        for file in files.flatten() {
-            let path = file.path();
-            if path
-                .file_name()
-                .is_some_and(|name| name.to_string_lossy().starts_with("output-"))
-                && std::fs::read_to_string(&path)
-                    .is_ok_and(|output| output.contains("compilation result was discarded"))
-            {
-                fingerprint_replays.push(path);
-            }
-        }
-    }
+    let fingerprint_replays =
+        cargo_fingerprints_containing(project.path(), "compilation result was discarded");
     assert!(
         fingerprint_replays.is_empty(),
         "the rejected-result diagnostic must not enter Cargo fingerprints: {fingerprint_replays:?}"
@@ -564,7 +577,9 @@ fn cargo_with(
         .env_remove("MBX_SOCKET")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
-        .env_remove("CLIPPY_CONF_DIR");
+        .env_remove("CLIPPY_CONF_DIR")
+        .env_remove("MBX_LOG")
+        .env_remove("MBX_TEST_BUILD_IDENTITY");
     for (name, value) in settings {
         command.env(name, value);
     }
@@ -865,6 +880,106 @@ fn corrupt_action_results(store: &Path) -> usize {
         }
     }
     corrupted
+}
+
+fn cargo_fingerprints_containing(project: &Path, message: &str) -> Vec<std::path::PathBuf> {
+    let fingerprint_root = project.join("target/debug/.fingerprint");
+    let mut matches = Vec::new();
+    for unit in std::fs::read_dir(&fingerprint_root).expect("Cargo fingerprint root should exist") {
+        let unit = unit.expect("Cargo fingerprint entry should be readable");
+        if !unit
+            .file_type()
+            .expect("Cargo fingerprint type should be readable")
+            .is_dir()
+        {
+            continue;
+        }
+        for file in std::fs::read_dir(unit.path()).expect("Cargo fingerprint files should exist") {
+            let file = file.expect("Cargo fingerprint file should be readable");
+            let path = file.path();
+            if path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("output-"))
+                && std::fs::read_to_string(&path)
+                    .expect("Cargo fingerprint output should be readable")
+                    .contains(message)
+            {
+                matches.push(path);
+            }
+        }
+    }
+    matches
+}
+
+#[test]
+fn compiler_environment_invalidation_is_quiet_but_debuggable() {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_environment_project(project.path());
+    let warning = "incremental state was not reused: compiler environment input changed: MBX_TEST_BUILD_IDENTITY";
+
+    // Each changed value must reach the executable. The same-value runs check
+    // that Cargo has no shim diagnostic to replay without invoking rustc.
+    for (step, value, filter, warned, fresh) in [
+        ("cold", Some("first"), None, false, false),
+        ("default", Some("second"), None, false, false),
+        ("debug", Some("third"), Some("debug"), true, false),
+        ("fresh", Some("third"), Some("info"), false, true),
+        ("removed", None, Some("mbx::rustc=debug"), true, false),
+        ("added", Some("fourth"), Some("info"), false, false),
+        (
+            "module-off",
+            Some("fifth"),
+            Some("debug,mbx::rustc=info"),
+            false,
+            false,
+        ),
+        ("malformed", Some("sixth"), Some("debug/["), false, false),
+        (
+            "fresh-after-malformed",
+            Some("sixth"),
+            Some("info"),
+            false,
+            true,
+        ),
+    ] {
+        let mut settings = Vec::new();
+        if let Some(value) = value {
+            settings.push(("MBX_TEST_BUILD_IDENTITY", value));
+        }
+        if let Some(filter) = filter {
+            settings.push(("MBX_LOG", filter));
+        }
+        let (stats, stderr) = build_with(
+            project.path(),
+            store.path(),
+            &reports.path().join(format!("{step}.json")),
+            &settings,
+        );
+        assert_eq!(
+            run_environment_project(project.path()),
+            value.unwrap_or("unset")
+        );
+        assert_eq!(stderr.contains(warning), warned, "{step}: {stderr}");
+        if fresh {
+            assert!(
+                stats["compiler"].as_object().unwrap().is_empty(),
+                "{step}: {stats}"
+            );
+        }
+        if step == "malformed" {
+            // Only the parent logger may diagnose malformed filters. The shim
+            // must not put the parser's warning into Cargo's fingerprints.
+            assert!(stderr.contains("invalid regex filter"), "{stderr}");
+        } else {
+            assert!(!stderr.contains("invalid regex filter"), "{step}: {stderr}");
+        }
+        for diagnostic in [warning, "invalid regex filter"] {
+            let fingerprints = cargo_fingerprints_containing(project.path(), diagnostic);
+            assert!(fingerprints.is_empty(), "{step}: {fingerprints:?}");
+        }
+    }
 }
 
 #[test]

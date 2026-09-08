@@ -1048,7 +1048,15 @@ fn reuse_hot_workspace_plan(
             return Ok(LearnedPlan::default());
         };
         let dep_info = RustcDepInfo::read(&outputs.dep_info)?;
-        verify_environment(&dep_info.environment)?;
+        if let Some(name) = environment_mismatch(&dep_info.environment)? {
+            session::report_shim_warning_on_debug(
+                module_path!(),
+                &format!(
+                    "incremental state was not reused: compiler environment input changed: {name}"
+                ),
+            );
+            return Ok(LearnedPlan::default());
+        }
         let discovered = compilation.invocation.discover_inputs_with_mappings(
             &dep_info,
             compilation.working_dir,
@@ -2063,7 +2071,7 @@ fn prediction_task(invocation: &CacheDigest) -> String {
     })
 }
 
-fn verify_environment(environment: &BTreeMap<String, Option<String>>) -> Result<()> {
+fn environment_mismatch(environment: &BTreeMap<String, Option<String>>) -> Result<Option<&str>> {
     for (name, expected) in environment {
         let actual = std::env::var_os(name)
             .map(|value| {
@@ -2073,8 +2081,15 @@ fn verify_environment(environment: &BTreeMap<String, Option<String>>) -> Result<
             })
             .transpose()?;
         if &actual != expected {
-            bail!("compiler environment input changed: {name}");
+            return Ok(Some(name));
         }
+    }
+    Ok(None)
+}
+
+fn verify_environment(environment: &BTreeMap<String, Option<String>>) -> Result<()> {
+    if let Some(name) = environment_mismatch(environment)? {
+        bail!("compiler environment input changed: {name}");
     }
     Ok(())
 }

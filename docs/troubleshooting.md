@@ -108,9 +108,16 @@ would rather not publish before posting.
 `MBX_LOG` takes an [env_logger](https://docs.rs/env_logger) filter, so
 `debug`, `trace`, or a per-module filter such as `mbx=trace` all work; it
 defaults to `info`. It covers the `mbx` process that drives the build. The
-rustc shim runs without a logger, so per-compilation detail comes from
-`MBX_BYPASS_LOG` instead, or from `mbx explain` for a grouped summary. See
-[Cache results](/cache-results).
+rustc shim runs without a logger, but `MBX_LOG=debug` (or
+`MBX_LOG=mbx::rustc=debug`) also includes its warnings about routine compiler
+environment changes preventing incremental reuse. These are quiet by default:
+a changed value from `env!` or `option_env!` is an ordinary reason to rebuild.
+The warnings travel through the live session so Cargo does not save and replay
+them as compiler diagnostics. Unexpected failures still produce warnings at the
+default log level.
+
+Other per-compilation detail comes from `MBX_BYPASS_LOG`, or from `mbx explain`
+for a grouped summary. See [Cache results](/cache-results).
 
 Report a problem in
 [Q&A discussions](https://github.com/jdx/mr-boxington/discussions/categories/q-a),

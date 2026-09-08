@@ -1417,6 +1417,7 @@ dependencies = [
  "bytesize",
  "demand",
  "dirs",
+ "env_filter",
  "env_logger",
  "eyre",
  "filetime",

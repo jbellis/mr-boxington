@@ -1,5 +1,6 @@
 use super::request_agent;
 use mbx_cache_core::{AgentRequest, AgentResponse};
+use std::sync::OnceLock;
 
 /// Write to stderr without failing the build when the pipe is closed.
 pub(crate) fn note(message: &str) {
@@ -31,6 +32,44 @@ pub(crate) fn reserve_stderr_for_compiler() {
 /// probe costs the build its cache keys.
 pub(crate) fn report_shim_warning(message: &str) {
     report_shim_diagnostic(Severity::Warning, message);
+}
+
+/// Report a routine shim warning only when the caller's debug filter requests
+/// it. Rustc shims run before the process-wide logger is initialized, so this
+/// checks the same filter without installing a logger or writing to stderr.
+pub(crate) fn report_shim_warning_on_debug(target: &'static str, message: &str) {
+    let Some(filter) = debug_filter() else {
+        return;
+    };
+    let matches = filter.matches(
+        &log::Record::builder()
+            .args(format_args!("{message}"))
+            .level(log::Level::Debug)
+            .target(target)
+            .build(),
+    );
+    if matches {
+        report_shim_warning(message);
+    }
+}
+
+/// Parse the shim's debug filter once, silently disabling this optional
+/// diagnostic when the filter is malformed. The main mbx process can report a
+/// malformed filter on its own stderr; a rustc shim must never do so because
+/// Cargo treats compiler stderr as part of its fingerprint.
+fn debug_filter() -> Option<&'static env_filter::Filter> {
+    static FILTER: OnceLock<Option<env_filter::Filter>> = OnceLock::new();
+    FILTER
+        .get_or_init(|| {
+            let value = std::env::var("MBX_LOG").unwrap_or_else(|_| "info".to_string());
+            let mut builder = env_filter::Builder::new();
+            if builder.try_parse(&value).is_err() {
+                None
+            } else {
+                Some(builder.build())
+            }
+        })
+        .as_ref()
 }
 
 /// Report a fatal shim diagnostic without losing it when transport fails.
