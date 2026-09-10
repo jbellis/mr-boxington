@@ -137,18 +137,18 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
             }
         };
         if let Some(cached) = restored {
+            record_prediction(
+                &task,
+                &invocation_digest,
+                &action.digest,
+                &prediction,
+                None,
+                None,
+            );
             if !verify {
                 write_caller_depfile(
                     &invocation,
                     discovered.files().map(|input| input.path.as_path()),
-                );
-                record_prediction(
-                    &task,
-                    &invocation_digest,
-                    &action.digest,
-                    &prediction,
-                    None,
-                    None,
                 );
                 replay_bytes(&cached.stdout, &cached.stderr)?;
                 record_action_hit(
@@ -281,7 +281,7 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
     // computed afterwards, and comparing the two is what stops a header that
     // appeared mid-compile from being recorded as one the compiler had seen.
     let searchable = searchable_directories(&invocation, &working_dir);
-    let before = manifest_snapshot(&searchable).ok();
+    let before = crate::phase_timing::measure("include_scan", || manifest_snapshot(&searchable));
     // The machine-wide permit is taken after every chance to hit the cache,
     // and the timer starts afterwards: time spent waiting for the machine is
     // not time this compilation cost.
@@ -316,6 +316,7 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
         duration_ns,
     );
 
+    let verified = verification.is_some();
     if let Some(cached) = verification {
         let divergence = verification_divergence(&cached, &output);
         record_verification(divergence.is_none(), cached.restore);
@@ -333,27 +334,28 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
     if !output.status.success() {
         return Ok(exit_code(output.status));
     }
+    // Shadow verification audits an existing result; it must not try to
+    // replace it with the fresh result, especially when they differ.
     // A failure to publish must not fail a compilation that already succeeded.
-    if let Err(error) = publish(
-        &invocation,
-        &mut context,
-        &depfile,
-        &output,
-        compilation_started,
-        &input_snapshots,
-        &task,
-        &invocation_digest,
-        duration_ns,
-        &searchable,
-        before,
-        flight.as_ref(),
-        remote_claim.as_deref(),
-        &portable,
-    ) {
-        #[cfg(debug_assertions)]
-        session::report_shim_warning(&format!("cc result was not published: {error:#}"));
-        #[cfg(not(debug_assertions))]
-        let _ = error;
+    if !verified
+        && let Err(error) = publish(
+            &invocation,
+            &mut context,
+            &depfile,
+            &output,
+            compilation_started,
+            &input_snapshots,
+            &task,
+            &invocation_digest,
+            duration_ns,
+            &searchable,
+            before,
+            flight.as_ref(),
+            remote_claim.as_deref(),
+            &portable,
+        )
+    {
+        session::report_cc_publication_failure(&compilation_name(&invocation), &error);
     }
     // Owed whether or not the object was published: the build that asked for
     // the list reads it next. Written after publication, because the list
@@ -387,11 +389,12 @@ fn publish(
     invocation_digest: &CacheDigest,
     duration_ns: u64,
     searchable: &BTreeSet<PathBuf>,
-    before: Option<BTreeMap<PathBuf, CacheDigest>>,
+    before: Result<BTreeMap<PathBuf, CacheDigest>, CcBypassReason>,
     flight: Option<&crate::scheduler::Flight>,
     remote_claim: Option<&str>,
     portable: &Portable,
 ) -> Result<()> {
+    let _phase = crate::phase_timing::phase("store");
     let input_snapshots = input_snapshots
         .as_ref()
         .map_err(|error| eyre::eyre!(error.to_string()))?;
@@ -703,14 +706,12 @@ fn searchable_directories(invocation: &CcInvocation, working_dir: &Path) -> BTre
 /// Reject a compilation whose include search path shifted underneath it.
 fn verify_search_path_unchanged(
     searchable: &BTreeSet<PathBuf>,
-    before: Option<BTreeMap<PathBuf, CacheDigest>>,
+    before: Result<BTreeMap<PathBuf, CacheDigest>, CcBypassReason>,
 ) -> Result<()> {
-    // A snapshot that could not be taken is not evidence of a change; the
-    // directory walk failing is already reported when discovery repeats it.
-    let Some(before) = before else {
-        return Ok(());
-    };
-    let after = manifest_snapshot(searchable)?;
+    // A later successful walk cannot establish what the compiler saw when
+    // the pre-compilation snapshot failed. Compile normally, but do not cache.
+    let before = before?;
+    let after = crate::phase_timing::measure("include_scan", || manifest_snapshot(searchable))?;
     for (directory, digest) in &before {
         if after.get(directory) != Some(digest) {
             return Err(
