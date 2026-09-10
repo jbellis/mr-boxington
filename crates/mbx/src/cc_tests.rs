@@ -221,16 +221,16 @@ fn a_portable_compilation_remaps_its_paths_and_refuses_an_output_that_kept_one()
 
     let clean = directory.path().join("clean.o");
     std::fs::write(&clean, b"nothing here names a checkout").unwrap();
-    assert!(portable.outputs_are_clean(&clean));
+    assert!(portable.outputs_are_clean(&clean, &[]));
 
     // A path the source kept as a string survives the remap, and an object
     // carrying one must not be published under a key that normalized it.
     let dirty = directory.path().join("dirty.o");
     std::fs::write(&dirty, format!("built in {out_dir} and says so").as_bytes()).unwrap();
-    assert!(!portable.outputs_are_clean(&dirty));
+    assert!(!portable.outputs_are_clean(&dirty, &[]));
 
     // An unreadable output is not evidence of cleanliness.
-    assert!(!portable.outputs_are_clean(&directory.path().join("absent.o")));
+    assert!(!portable.outputs_are_clean(&directory.path().join("absent.o"), &[]));
 
     // With nothing remapped there is nothing to promise, and every output
     // passes -- which is what a build with OUT_DIR sharing off looks like.
@@ -238,7 +238,7 @@ fn a_portable_compilation_remaps_its_paths_and_refuses_an_output_that_kept_one()
         arguments: Vec::new(),
         values: Vec::new(),
     };
-    assert!(inert.outputs_are_clean(&dirty));
+    assert!(inert.outputs_are_clean(&dirty, &[]));
     assert!(matches!(inert.applied_to(&arguments), Cow::Borrowed(_)));
 }
 
@@ -295,4 +295,74 @@ fn successful_before_snapshots_still_detect_new_headers() {
         error.downcast_ref::<CcBypassReason>(),
         Some(CcBypassReason::SearchPathModifiedDuringCompilation(_))
     ));
+}
+
+/// Extended wire payloads must never replace a legacy prediction or flight.
+#[test]
+fn path_prediction_identity_is_separate_from_legacy() {
+    let legacy = CacheDigest::blake3(b"invocation");
+    let current = prediction_invocation(&legacy);
+    assert_ne!(legacy, current);
+    assert_eq!(current, prediction_invocation(&legacy));
+    assert_ne!(ADAPTER, PREDICTION_ADAPTER);
+}
+
+/// Generated sources can retain a target root without any injected prefix map.
+#[test]
+fn output_scan_covers_roots_without_debug_remaps() {
+    let directory = tempfile::tempdir().unwrap();
+    let target = directory.path().join("target");
+    std::fs::create_dir(&target).unwrap();
+    let object = directory.path().join("object.o");
+    std::fs::write(&object, target.join("generated.c").to_str().unwrap()).unwrap();
+    let portable = Portable {
+        arguments: Vec::new(),
+        values: Vec::new(),
+    };
+    assert!(portable.outputs_are_clean(&object, &[]));
+    assert!(!portable.outputs_are_clean(&object, &[PathMapping::new(&target, "target")]));
+}
+
+/// Canonical Windows roots must match the non-verbatim strings compilers emit.
+#[test]
+fn output_scan_matches_plain_windows_drive_and_unc_paths() {
+    let directory = tempfile::tempdir().unwrap();
+    let object = directory.path().join("object.o");
+    for (root, ordinary) in [
+        (r"\\?\C:\resolved\source", r"C:\resolved\source"),
+        (r"\\?\UNC\server\share\source", r"\\server\share\source"),
+    ] {
+        let portable = Portable {
+            arguments: Vec::new(),
+            values: vec![root.into()],
+        };
+        for spelling in [ordinary.to_owned(), ordinary.replace('\\', "/")] {
+            std::fs::write(&object, format!("{spelling}/generated.c")).unwrap();
+            assert!(
+                !portable.outputs_are_clean(&object, &[]),
+                "{root}: {spelling}"
+            );
+        }
+        std::fs::write(&object, b"no retained path").unwrap();
+        assert!(portable.outputs_are_clean(&object, &[]));
+    }
+}
+
+/// Non-working-directory mappings can use macOS aliases omitted by canonicalization.
+#[cfg(target_os = "macos")]
+#[test]
+fn output_scan_matches_logical_macos_mapping_roots() {
+    for parent in ["/private/tmp", "/private/var/tmp"] {
+        let directory = tempfile::tempdir_in(parent).unwrap();
+        let physical = std::fs::canonicalize(directory.path()).unwrap();
+        let logical = Path::new("/").join(physical.strip_prefix("/private").unwrap());
+        assert_eq!(std::fs::canonicalize(&logical).unwrap(), physical);
+        let object = directory.path().join("object.o");
+        std::fs::write(&object, logical.join("generated.c").to_str().unwrap()).unwrap();
+        let portable = Portable {
+            arguments: Vec::new(),
+            values: Vec::new(),
+        };
+        assert!(!portable.outputs_are_clean(&object, &[PathMapping::new(&physical, "target")]));
+    }
 }
