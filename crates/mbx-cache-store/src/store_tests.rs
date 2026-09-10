@@ -650,6 +650,97 @@ fn grouped_export_unions_parallel_build_receipts() {
 }
 
 #[test]
+fn grouped_export_keeps_each_commands_predictions_and_newest_conflicts() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let identity = "e".repeat(64);
+    let prediction = |invocation: &str, action: &str| ActionPrediction {
+        invocation: CacheDigest::blake3(invocation.as_bytes()),
+        action: store_result(source.path(), action, &[]),
+        adapter: "rustc".into(),
+        payload: "{}".into(),
+    };
+    let clippy = prediction("clippy", "clippy result");
+    let test = prediction("test", "test result");
+    let old_shared = prediction("shared", "old shared result");
+    let new_shared = prediction("shared", "new shared result");
+    let receipt = |completed_nanos, predictions| BuildReceipt {
+        version: 1,
+        workspace_root: source.path().join("workspace"),
+        identity: identity.clone(),
+        completed_nanos,
+        group: Some("job".into()),
+        predictions,
+    };
+    let archive = source.path().join("job.tar");
+    // Deliberately supply reverse completion order.
+    let exported = export_receipts(
+        source.path(),
+        vec![
+            receipt(2, vec![test.clone(), new_shared.clone()]),
+            receipt(1, vec![clippy.clone(), old_shared.clone()]),
+        ],
+        &archive,
+        ExportAdditions::default(),
+    )
+    .unwrap();
+    import_archive(destination.path(), &archive).unwrap();
+    let manifest: TaskActionManifest = serde_json::from_slice(
+        &std::fs::read(task_manifest_path(destination.path(), &identity)).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(manifest.predictions.len(), 3);
+    for expected in [clippy, test, new_shared] {
+        let actual = manifest
+            .predictions
+            .iter()
+            .find(|p| p.invocation == expected.invocation)
+            .unwrap();
+        assert_eq!(actual.action, expected.action);
+    }
+    assert_eq!(exported.actions, 4);
+    assert!(
+        LocalActionCache::new(destination.path())
+            .find(&old_shared.action)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
+fn equal_timestamp_exports_ignore_receipt_enumeration_order() {
+    let source = tempfile::tempdir().unwrap();
+    let identity = "e".repeat(64);
+    let receipts = ["first", "second"].map(|name| BuildReceipt {
+        version: 1,
+        workspace_root: source.path().to_path_buf(),
+        identity: identity.clone(),
+        completed_nanos: 1,
+        group: Some("job".into()),
+        predictions: vec![ActionPrediction {
+            invocation: CacheDigest::blake3(b"shared invocation"),
+            action: store_result(source.path(), name, &[]),
+            adapter: "rustc".into(),
+            payload: "{}".into(),
+        }],
+    });
+    let mut predictions = Vec::new();
+    for order in [receipts.to_vec(), receipts.into_iter().rev().collect()] {
+        let destination = tempfile::tempdir().unwrap();
+        let archive = destination.path().join("job.tar");
+        export_receipts(source.path(), order, &archive, ExportAdditions::default()).unwrap();
+        import_archive(destination.path(), &archive).unwrap();
+        let manifest: TaskActionManifest = serde_json::from_slice(
+            &std::fs::read(task_manifest_path(destination.path(), &identity)).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(manifest.predictions.len(), 1);
+        predictions.push(manifest.predictions);
+    }
+    assert_eq!(predictions[0], predictions[1]);
+}
+
+#[test]
 fn collection_preserves_grouped_receipts_replaced_in_the_task_manifest() {
     let source = tempfile::tempdir().unwrap();
     let destination = tempfile::tempdir().unwrap();
