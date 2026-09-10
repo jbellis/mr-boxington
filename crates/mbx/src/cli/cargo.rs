@@ -90,15 +90,14 @@ fn cargo_with_settings_bypass_log_and_roots(
     {
         log::warn!("caching native links is not supported on this platform");
     }
+    if cargo_help_requested(arguments) {
+        return run_cargo(&cargo, arguments, BTreeMap::new());
+    }
+    crate::storage::check_cache(config)?;
     let working_dir = std::env::current_dir()?;
     let roots = roots.unwrap_or_else(|| resolve_roots(&cargo, arguments, &working_dir));
     let mut config = config.clone();
     config.apply_workspace_policy(&roots.workspace_root)?;
-    let managed_linker = if cargo_help_requested(arguments) {
-        None
-    } else {
-        crate::managed_linker::resolve(&config.linker, &config.cache_dir, &config.http, arguments)?
-    };
     let incremental = policy::incremental_allowed(config.incremental);
     if config.incremental && !incremental {
         log::warn!(
@@ -124,6 +123,31 @@ fn cargo_with_settings_bypass_log_and_roots(
     let config = &config;
 
     let migrate_existing = prompt_to_manage_existing_target(config, &roots, arguments)?;
+    let default_target = roots.workspace_root.join("target");
+    let placing_editor = roots.target_dir_requested
+        && roots.target_dir == roots.workspace_root.join(super::RUST_ANALYZER_TARGET_DIR);
+    let placement_candidate = if placing_editor {
+        target::placement_candidate(config, &roots.workspace_root, &default_target, false)
+    } else {
+        target::placement_candidate(
+            config,
+            &roots.workspace_root,
+            &roots.target_dir,
+            roots.target_dir_requested,
+        )
+    };
+    if migrate_existing || placement_candidate {
+        crate::storage::require_local(
+            &config.target.root,
+            "managed target directory",
+            "MBX_TARGET_ROOT",
+        )?;
+        crate::storage::require_local(
+            &target::view_dir(&config.target.root, &roots.workspace_root),
+            "managed target directory",
+            "MBX_TARGET_ROOT",
+        )?;
+    }
     // Placed before the session starts, because the target directory is what
     // the shim maps out of its cache keys and it has to be the one cargo will
     // actually write to.
@@ -144,6 +168,22 @@ fn cargo_with_settings_bypass_log_and_roots(
     } else {
         (place_target_view(config, &roots), None)
     };
+    crate::storage::require_local(
+        &roots.target_dir,
+        "Cargo target directory",
+        "CARGO_TARGET_DIR or build.target-dir",
+    )?;
+    if let Some(build_dir) = &roots.build_dir
+        && build_dir != &roots.target_dir
+    {
+        crate::storage::require_local(
+            build_dir,
+            "Cargo intermediate build directory",
+            "CARGO_BUILD_BUILD_DIR or build.build-dir",
+        )?;
+    }
+    let managed_linker =
+        crate::managed_linker::resolve(&config.linker, &config.cache_dir, &config.http, arguments)?;
     if let Some(bytes) = removed_target_bytes {
         crate::session::note(&format!(
             "mbx[gc]: removed the existing target/ directory ({} logical)",
@@ -578,6 +618,7 @@ pub(super) fn exit_code(status: std::process::ExitStatus) -> ExitCode {
 pub(super) struct Roots {
     pub(super) workspace_root: PathBuf,
     pub(super) target_dir: PathBuf,
+    pub(super) build_dir: Option<PathBuf>,
     /// Whether a flag, environment variable, or Cargo configuration named the
     /// target directory outright.
     ///
@@ -655,6 +696,7 @@ pub(super) fn resolve_roots_with(
     Roots {
         workspace_root: resolved.workspace_root,
         target_dir: resolved.target_dir,
+        build_dir: resolved.build_dir,
         target_dir_requested: resolved.target_dir_requested,
     }
 }
@@ -720,6 +762,7 @@ pub(super) fn cargo_roots(
     Some(Roots {
         workspace_root: resolved.workspace_root,
         target_dir: resolved.target_dir,
+        build_dir: resolved.build_dir,
         target_dir_requested: resolved.target_dir_requested,
     })
 }
@@ -730,6 +773,10 @@ pub(super) fn parse_cargo_roots(metadata: &[u8]) -> Option<Roots> {
     Some(Roots {
         workspace_root: PathBuf::from(metadata.get("workspace_root")?.as_str()?),
         target_dir: PathBuf::from(metadata.get("target_directory")?.as_str()?),
+        build_dir: metadata
+            .get("build_directory")
+            .and_then(|value| value.as_str())
+            .map(PathBuf::from),
         // What cargo reports has folded configuration in already, so it cannot
         // say whether anyone asked. The caller's flags, environment, and Cargo
         // configuration answer that, and `resolve_roots_with` reads them itself.
