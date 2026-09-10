@@ -969,6 +969,17 @@ fn a_root_written_with_a_trailing_separator_still_rewrites() {
 #[cfg(target_os = "macos")]
 #[test]
 fn the_shim_appends_an_oso_prefix_for_cached_links() {
+    // Test the standalone fallback in a subprocess without racing other tests' environment.
+    if std::env::var_os("MBX_TEST_OSO_FALLBACK").is_none() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("the_shim_appends_an_oso_prefix_for_cached_links")
+            .env("MBX_TEST_OSO_FALLBACK", "1")
+            .env_remove(session::TARGET_DIR_ENV)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        return;
+    }
     let arguments = |values: &[&str]| values.iter().map(OsString::from).collect::<Vec<_>>();
     let base = arguments(&[
         "--crate-name=app",
@@ -981,8 +992,15 @@ fn the_shim_appends_an_oso_prefix_for_cached_links() {
     let extended = with_oso_prefix(&base, true);
     assert_eq!(
         extended.last().unwrap(),
-        &OsString::from("-Clink-arg=-Wl,-oso_prefix,/work/target/debug/deps/"),
+        &OsString::from("-Clink-arg=-Wl,-oso_prefix,/work/target/"),
     );
+    let example = arguments(&["--out-dir=/work/target/debug/examples", "examples/app.rs"]);
+    assert_eq!(with_oso_prefix(&example, true).last(), extended.last());
+    let build_script = arguments(&[
+        "--out-dir=/work/target/debug/build/package-hash",
+        "build.rs",
+    ]);
+    assert_eq!(with_oso_prefix(&build_script, true).last(), extended.last());
     // Off when links are not cached, when the caller chose a prefix, and when
     // there is no output directory to cover.
     assert_eq!(with_oso_prefix(&base, false).len(), base.len());
@@ -1017,7 +1035,7 @@ fn the_shim_appends_an_oso_prefix_for_cached_links() {
     let split = arguments(&["--out-dir=/work/target/debug/deps", "src/main.rs"]);
     assert_eq!(
         with_oso_prefix(&split, true).last().unwrap(),
-        &OsString::from("-Clink-arg=-Wl,-oso_prefix,/work/target/debug/deps/"),
+        &OsString::from("-Clink-arg=-Wl,-oso_prefix,/work/target/"),
     );
 }
 
