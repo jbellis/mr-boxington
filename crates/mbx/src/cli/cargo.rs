@@ -188,10 +188,13 @@ fn cargo_with_settings_bypass_log_and_roots(
                 // compiler wrappers cannot inherit an enclosing session that
                 // this build did not start. An empty socket is deliberately
                 // equivalent to an absent one to every mbx shim.
-                let environment = BTreeMap::from([
+                let mut environment = BTreeMap::from([
                     ("MBX_DISABLE".into(), "1".into()),
                     (session::SOCKET_ENV.into(), String::new()),
                 ]);
+                if settings.plain_output {
+                    environment.insert("CARGO_TERM_PROGRESS_WHEN".into(), "never".into());
+                }
                 return Ok((run_cargo(&cargo, arguments, environment), None));
             }
             Err(error) => return Err(error),
@@ -261,13 +264,22 @@ fn cargo_with_settings_bypass_log_and_roots(
         if let Some(launch) = &launch {
             launch.environment(&mut environment)?;
         }
+        if settings.plain_output {
+            environment.insert("CARGO_TERM_PROGRESS_WHEN".into(), "never".into());
+        }
         super::launch::record_overlay(&mut environment)?;
-        let status = if super::pretty::enabled(arguments) {
+        let status = if !settings.plain_output && super::pretty::enabled(arguments) {
             match super::pretty::run(&cargo, arguments, &environment, settings.pretty_inspect, || session.progress_stats()) {
                 Ok(Some(status)) => Ok(status),
                 Ok(None) => run_cargo(&cargo, arguments, environment),
                 Err(error) => Err(error),
             }
+        } else if super::plain_progress::eligible(arguments, std::env::var("CARGO_TERM_PROGRESS_WHEN").ok().as_deref())
+            && !matches!(settings.summary, SummaryStyle::Off)
+            && log::max_level() < log::LevelFilter::Debug
+            && (settings.plain_output || !std::io::stderr().is_terminal())
+        {
+            super::plain_progress::run(&cargo, arguments, environment, || session.progress_stats())
         } else {
             run_cargo(&cargo, arguments, environment)
         };
