@@ -191,6 +191,7 @@ struct AtomicAgentStats {
     bypasses: Mutex<BTreeMap<String, u64>>,
     avoided_compiler_duration_ns: AtomicU64,
     compiler: Mutex<BTreeMap<String, CompilerStats>>,
+    unit_outcomes: Mutex<BTreeMap<String, BTreeSet<String>>>,
     slow_compilations: Mutex<BTreeMap<String, u64>>,
     restored_output_files: AtomicU64,
     restored_output_bytes: AtomicU64,
@@ -1345,6 +1346,7 @@ impl CacheAgent {
             wrapper_phases_ns: self.stats.wrapper_phases_ns.lock().unwrap().clone(),
             compiler: self.stats.compiler.lock().unwrap().clone(),
             slow_compilations: self.stats.slow_compilations.lock().unwrap().clone(),
+            unit_outcomes: self.stats.unit_outcomes.lock().unwrap().clone(),
             remote_failures: self.stats.remote_failures.load(Ordering::Relaxed),
             remote_manifest_lookups: self.stats.remote_manifest_lookups.load(Ordering::Relaxed),
             remote_manifest_lookup_duration_ns: self
@@ -1512,7 +1514,32 @@ impl CacheAgent {
                 {
                     bail!("invalid shim debug record");
                 }
-                debug!(target: &target, "{message}");
+                if target == "mbx::unit-outcome" {
+                    let (unit, outcome): (String, String) = serde_json::from_str(&message)?;
+                    if unit.len() > 256
+                        || !unit.contains(':')
+                        || !matches!(
+                            outcome.as_str(),
+                            "hit"
+                                | "miss"
+                                | "bypass"
+                                | "unconsulted"
+                                | "incremental"
+                                | "verification"
+                        )
+                    {
+                        bail!("invalid unit outcome");
+                    }
+                    self.stats
+                        .unit_outcomes
+                        .lock()
+                        .unwrap()
+                        .entry(unit)
+                        .or_default()
+                        .insert(outcome);
+                } else {
+                    debug!(target: &target, "{message}");
+                }
                 Ok(AgentResponse::DebugRecorded)
             })(),
             AgentRequest::RecordError { message } => {

@@ -262,7 +262,15 @@ fn cargo_with_settings_bypass_log_and_roots(
             launch.environment(&mut environment)?;
         }
         super::launch::record_overlay(&mut environment)?;
-        let status = run_cargo(&cargo, arguments, environment);
+        let status = if super::pretty::enabled(arguments) {
+            match super::pretty::run(&cargo, arguments, &environment, settings.pretty_inspect, || session.progress_stats()) {
+                Ok(Some(status)) => Ok(status),
+                Ok(None) => run_cargo(&cargo, arguments, environment),
+                Err(error) => Err(error),
+            }
+        } else {
+            run_cargo(&cargo, arguments, environment)
+        };
         // The shim records a prediction only after a compilation has either
         // been restored or published successfully. Preserve that completed
         // portion even when a later compilation makes cargo fail: it is still

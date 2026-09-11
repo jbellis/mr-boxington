@@ -47,6 +47,23 @@ cargo test --workspace --all-features
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
+Interactive builds use [cargo-pretty](https://github.com/romancitodev/cargo-pretty)'s
+display by romancitodev, extended with mbx cache information. Follow live and
+completed crates, browse warnings and test failures, and see cache hits, misses,
+bypasses, and estimated compiler time saved. The build bar doubles as a cache
+breakdown: green hits, amber misses, and neutral bypasses.
+
+Cargo remains in charge of `run`, tests, doctests, and configured runners. CI,
+redirected output, and explicit output formats keep Cargo's normal output.
+Set `CARGO_TERM_PROGRESS_WHEN=never` to disable the display.
+
+<picture>
+  <source media="(prefers-reduced-motion: reduce)" srcset="docs/public/screenshots/cargo-pretty.png">
+  <img src="docs/public/screenshots/cargo-pretty.gif" alt="A real mixed-cache rebuild after a shared-source edit, with per-crate outcomes">
+</picture>
+
+[View the still image](docs/public/screenshots/cargo-pretty.png).
+
 To try mbx without automatic wrapping, install it and run `mbx build` directly.
 For coding agents and other non-interactive tools, use `mise exec -- cargo build`
 or put mise's shims on their `PATH`. The

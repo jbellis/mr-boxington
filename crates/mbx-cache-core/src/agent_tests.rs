@@ -5158,3 +5158,31 @@ async fn malformed_debug_records_are_rejected() {
         ));
     }
 }
+
+#[tokio::test]
+async fn unit_outcomes_do_not_merge_equal_crate_names() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = CacheAgent::new(directory.path().join("cache"), "test-version");
+    for (unit, outcome) in [
+        ("serde:1111111111111111", "hit"),
+        ("serde:2222222222222222", "miss"),
+    ] {
+        assert!(matches!(
+            agent
+                .respond(AgentRequest::RecordDebug {
+                    target: "mbx::unit-outcome".into(),
+                    message: serde_json::to_string(&(unit, outcome)).unwrap(),
+                })
+                .await,
+            AgentResponse::DebugRecorded
+        ));
+    }
+    assert_eq!(
+        agent.stats().unit_outcomes["serde:1111111111111111"],
+        ["hit".into()].into()
+    );
+    assert_eq!(
+        agent.stats().unit_outcomes["serde:2222222222222222"],
+        ["miss".into()].into()
+    );
+}
