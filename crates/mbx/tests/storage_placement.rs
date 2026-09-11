@@ -251,6 +251,47 @@ fn rejects_separate_intermediates_and_invalidates_cached_probe() {
 }
 
 #[test]
+fn rejects_separate_intermediates_before_placing_the_target() {
+    let fixture = Fixture::new();
+    let intermediate = fixture.nfs.join("intermediate");
+    rejected(
+        fixture
+            .command()
+            .env("CARGO_BUILD_BUILD_DIR", &intermediate)
+            .args(["build", "--offline"])
+            .output()
+            .unwrap(),
+        &intermediate,
+        "CARGO_BUILD_BUILD_DIR",
+    );
+    assert!(std::fs::symlink_metadata(fixture.project.join("target")).is_err());
+
+    // An intermediate directory nested in the target follows it to the
+    // managed destination, even from an NFS checkout.
+    let project = fixture.nfs.join("source");
+    write_project(&project);
+    let nested = project.join("target/intermediate");
+    let output = fixture
+        .command()
+        .current_dir(&project)
+        .env("CARGO_BUILD_BUILD_DIR", &nested)
+        .args(["build", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        nested
+            .canonicalize()
+            .unwrap()
+            .starts_with(fixture.root.join("targets"))
+    );
+}
+
+#[test]
 fn allows_nfs_sources_with_local_outputs_and_ignores_unused_managed_root() {
     let fixture = Fixture::new();
     let project = fixture.nfs.join("source");

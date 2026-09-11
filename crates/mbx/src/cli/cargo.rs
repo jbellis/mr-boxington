@@ -122,6 +122,28 @@ fn cargo_with_settings_bypass_log_and_roots(
         && !config.verify;
     let config = &config;
 
+    // Cargo's intermediate directory usually lies outside the target, where
+    // placement cannot change it, so reject it before prompting for, migrating,
+    // or placing the target. One nested in the target follows the target to
+    // its placed destination, so it is checked with the target after placement.
+    let require_local_build_dir = |build_dir: &Path| {
+        crate::storage::require_local(
+            build_dir,
+            "Cargo intermediate build directory",
+            "CARGO_BUILD_BUILD_DIR or build.build-dir",
+        )
+    };
+    let separate_build_dir = roots
+        .build_dir
+        .as_deref()
+        .filter(|build_dir| **build_dir != *roots.target_dir);
+    let nested_build_dir =
+        separate_build_dir.filter(|build_dir| build_dir.starts_with(&roots.target_dir));
+    if nested_build_dir.is_none()
+        && let Some(build_dir) = separate_build_dir
+    {
+        require_local_build_dir(build_dir)?;
+    }
     let migrate_existing = prompt_to_manage_existing_target(config, &roots, arguments)?;
     let default_target = roots.workspace_root.join("target");
     let placing_editor = roots.target_dir_requested
@@ -173,14 +195,8 @@ fn cargo_with_settings_bypass_log_and_roots(
         "Cargo target directory",
         "CARGO_TARGET_DIR or build.target-dir",
     )?;
-    if let Some(build_dir) = &roots.build_dir
-        && build_dir != &roots.target_dir
-    {
-        crate::storage::require_local(
-            build_dir,
-            "Cargo intermediate build directory",
-            "CARGO_BUILD_BUILD_DIR or build.build-dir",
-        )?;
+    if let Some(build_dir) = nested_build_dir {
+        require_local_build_dir(build_dir)?;
     }
     let managed_linker =
         crate::managed_linker::resolve(&config.linker, &config.cache_dir, &config.http, arguments)?;
