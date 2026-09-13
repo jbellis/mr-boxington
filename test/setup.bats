@@ -332,6 +332,12 @@ EOF
 if [ -n "${MBX_TEST_CARGO_LOG:-}" ]; then
   printf '%s\n' "$*" >>"$MBX_TEST_CARGO_LOG"
 fi
+if [ "$1" = "--list" ]; then
+  # Describe cache as a non-build Cargo alias: a failed metadata probe must
+  # not authorize an arbitrary external command that could compile code.
+  printf 'Installed Commands:\n    cache    alias: version\n'
+  exit 0
+fi
 printf '%s\n' "$*"
 EOF
   chmod +x "$real_bin/cargo"

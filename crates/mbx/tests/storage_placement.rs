@@ -178,42 +178,44 @@ fn failed_metadata_never_launches_a_build() {
     use std::os::unix::fs::PermissionsExt;
     for shim in [false, true] {
         for configured in [false, true] {
-            let fixture = Fixture::new();
-            let bin = fixture.root.join("bin");
-            std::fs::create_dir(&bin).unwrap();
-            let cargo = bin.join("cargo");
-            std::fs::write(&cargo, "#!/bin/sh\ncase \" $* \" in *' metadata '*) exit 1;; esac\ntouch \"$TEST_BUILD_MARKER\"\n").unwrap();
-            std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
-            let marker = fixture.root.join("build-ran");
-            let mut command = fixture.command();
-            command.arg("build");
-            let inherited_path = std::env::var_os("PATH").unwrap();
-            let paths = std::iter::once(bin).chain(std::env::split_paths(&inherited_path));
-            command
-                .env("PATH", std::env::join_paths(paths).unwrap())
-                .env("CARGO", &cargo)
-                .env("TEST_BUILD_MARKER", &marker);
-            if shim {
-                command.env("MBX_CARGO_SHIM_MODE", "1");
+            for subcommand in ["build", "build-alias"] {
+                let fixture = Fixture::new();
+                let bin = fixture.root.join("bin");
+                std::fs::create_dir(&bin).unwrap();
+                let cargo = bin.join("cargo");
+                std::fs::write(&cargo, "#!/bin/sh\ncase \" $* \" in *' metadata '*) exit 1;; *' --list '*) printf 'Installed Commands:\\n    build\\n    build-alias    alias: build\\n'; exit 0;; esac\ntouch \"$TEST_BUILD_MARKER\"\n").unwrap();
+                std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+                let marker = fixture.root.join("build-ran");
+                let mut command = fixture.command();
+                command.arg(subcommand);
+                let inherited_path = std::env::var_os("PATH").unwrap();
+                let paths = std::iter::once(bin).chain(std::env::split_paths(&inherited_path));
+                command
+                    .env("PATH", std::env::join_paths(paths).unwrap())
+                    .env("CARGO", &cargo)
+                    .env("TEST_BUILD_MARKER", &marker);
+                if shim {
+                    command.env("MBX_CARGO_SHIM_MODE", "1");
+                }
+                if configured {
+                    command.args([
+                        "--config",
+                        &format!("build.build-dir={:?}", fixture.nfs.join("intermediates")),
+                    ]);
+                } else {
+                    command.env("CARGO_BUILD_BUILD_DIR", fixture.nfs.join("intermediates"));
+                }
+                let output = command.output().unwrap();
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(!output.status.success(), "{stderr}");
+                assert!(
+                    stderr.contains("could not verify Cargo build storage"),
+                    "{stderr}"
+                );
+                assert!(!marker.exists());
+                assert!(!fixture.project.join("target").exists());
+                assert!(!fixture.root.join("cache/tools").exists());
             }
-            if configured {
-                command.args([
-                    "--config",
-                    &format!("build.build-dir={:?}", fixture.nfs.join("intermediates")),
-                ]);
-            } else {
-                command.env("CARGO_BUILD_BUILD_DIR", fixture.nfs.join("intermediates"));
-            }
-            let output = command.output().unwrap();
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            assert!(!output.status.success(), "{stderr}");
-            assert!(
-                stderr.contains("could not verify Cargo build storage"),
-                "{stderr}"
-            );
-            assert!(!marker.exists());
-            assert!(!fixture.project.join("target").exists());
-            assert!(!fixture.root.join("cache/tools").exists());
         }
     }
 }

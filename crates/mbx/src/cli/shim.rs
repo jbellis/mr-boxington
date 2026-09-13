@@ -1,6 +1,7 @@
 use super::cargo::{CARGO_TARGET_DIR_ENV, cargo_roots, exit_code};
 use crate::config::Config;
 use eyre::{Context, Result};
+use std::collections::BTreeMap;
 use std::ffi::{OsStr, OsString};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
@@ -97,6 +98,9 @@ pub fn run_cargo_shim() -> Result<ExitCode> {
         &string_arguments,
         std::env::var_os(CARGO_TARGET_DIR_ENV).as_deref(),
     ) else {
+        if metadata_failure_passthrough(&real_cargo, &arguments) {
+            return run_real_cargo(&real_cargo, &arguments);
+        }
         eyre::bail!(
             "could not verify Cargo build storage: metadata probing failed; run cargo metadata --no-deps --format-version 1 with the same manifest and configuration options to diagnose it"
         );
@@ -227,6 +231,80 @@ pub(super) fn cargo_proxy_passthrough(arguments: &[OsString]) -> bool {
                     | "git-checkout"
             )
         )
+}
+
+/// Preserve non-build aliases and unknown-command diagnostics without allowing
+/// failed metadata to launch a build alias or an external Cargo command.
+pub(super) fn metadata_failure_passthrough(cargo: &OsStr, arguments: &[OsString]) -> bool {
+    if arguments.iter().any(|arg| {
+        let arg = arg.to_string_lossy();
+        arg.starts_with('+')
+            || arg.starts_with("--config")
+            || arg.starts_with("-C")
+            || arg.starts_with("--directory")
+            || arg.starts_with("-Z")
+    }) {
+        return false;
+    }
+    let Some(command) = super::launch::cargo_subcommand(arguments) else {
+        return false;
+    };
+    if matches!(
+        command,
+        "build"
+            | "b"
+            | "check"
+            | "c"
+            | "test"
+            | "t"
+            | "run"
+            | "r"
+            | "bench"
+            | "doc"
+            | "d"
+            | "rustc"
+            | "rustdoc"
+            | "clippy"
+            | "fix"
+    ) {
+        return false;
+    }
+    let Ok(output) = Command::new(cargo).arg("--list").output() else {
+        return false;
+    };
+    if !output.status.success() {
+        return false;
+    }
+    let listing = String::from_utf8_lossy(&output.stdout);
+    if !listing.starts_with("Installed Commands:") {
+        return false;
+    }
+    let entries = listing
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let line = line.trim();
+            let end = line.find(char::is_whitespace).unwrap_or(line.len());
+            (!line.is_empty()).then_some((&line[..end], line[end..].trim()))
+        })
+        .collect::<BTreeMap<_, _>>();
+    let mut current = command;
+    for _ in 0..32 {
+        let Some(description) = entries.get(current) else {
+            return current == command;
+        };
+        let Some(alias) = description.strip_prefix("alias: ") else {
+            return false;
+        };
+        let Some(next) = alias.split_whitespace().next() else {
+            return false;
+        };
+        if cargo_proxy_passthrough(&[OsString::from(next)]) {
+            return true;
+        }
+        current = next;
+    }
+    false
 }
 
 fn same_path(left: &Path, right: &Path) -> bool {

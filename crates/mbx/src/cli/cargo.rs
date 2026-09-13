@@ -104,12 +104,19 @@ fn cargo_with_settings_bypass_log_and_roots(
     let working_dir = std::env::current_dir()?;
     let roots = match roots {
         Some(roots) => roots,
-        None => cargo_roots(
+        None => match cargo_roots(
             &cargo,
             arguments,
             std::env::var_os(CARGO_TARGET_DIR_ENV).as_deref(),
-        )
-        .ok_or_else(|| eyre::eyre!("could not verify Cargo build storage: metadata probing failed; run cargo metadata --no-deps --format-version 1 with the same manifest and configuration options to diagnose it"))?,
+        ) {
+            Some(roots) => roots,
+            None if super::shim::metadata_failure_passthrough(&cargo, &os_arguments) => {
+                return run_cargo(&cargo, arguments, BTreeMap::new());
+            }
+            None => eyre::bail!(
+                "could not verify Cargo build storage: metadata probing failed; run cargo metadata --no-deps --format-version 1 with the same manifest and configuration options to diagnose it"
+            ),
+        },
     };
     let mut config = config.clone();
     config.apply_workspace_policy(&roots.workspace_root)?;
