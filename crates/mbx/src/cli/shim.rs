@@ -97,12 +97,8 @@ pub fn run_cargo_shim() -> Result<ExitCode> {
         &string_arguments,
         std::env::var_os(CARGO_TARGET_DIR_ENV).as_deref(),
     ) else {
-        return run_real_cargo(
-            &real_cargo,
-            &string_arguments
-                .into_iter()
-                .map(OsString::from)
-                .collect::<Vec<_>>(),
+        eyre::bail!(
+            "could not verify Cargo build storage: metadata probing failed; run cargo metadata --no-deps --format-version 1 with the same manifest and configuration options to diagnose it"
         );
     };
     // Every probe and the final child must name Cargo directly.

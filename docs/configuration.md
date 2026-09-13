@@ -3,6 +3,13 @@ description: Find configuration files, understand precedence, and look up every 
 ---
 # Configuration
 
+Managed Cargo builds require a successful metadata probe so mbx can verify build
+storage before launching compilation. If probing fails, mbx reports an error
+instead of guessing output paths or silently launching through the Cargo shim.
+Run `cargo metadata --no-deps --format-version 1` with the same manifest and
+configuration options to diagnose the failure. Help, cleanup, and explicitly
+disabled shim invocations retain their passthrough behavior.
+
 Defaults work without a configuration file. Add only the values you want to
 change. mbx reads configuration from three places; the first value found wins:
 

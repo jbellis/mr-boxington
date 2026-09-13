@@ -14,6 +14,7 @@ pub(crate) fn check_cache(config: &Config) -> Result<()> {
         config.cache_dir.join("incremental"),
         config.cache_dir.join("scheduler"),
         config.cache_dir.join("cargo-roots"),
+        config.cache_dir.join("tools"),
     ] {
         require_local(&path, "mbx cache directory", "MBX_CACHE_DIR")?;
     }

@@ -112,6 +112,112 @@ fn write_project(project: &Path) {
     .unwrap();
 }
 
+#[test]
+fn rejects_tools_symlink_before_initializing_storage() {
+    let fixture = Fixture::new();
+    let cache = fixture.root.join("cache");
+    std::fs::create_dir(&cache).unwrap();
+    std::os::unix::fs::symlink(&fixture.nfs, cache.join("tools")).unwrap();
+    rejected(
+        fixture
+            .command()
+            .args(["build", "--offline"])
+            .output()
+            .unwrap(),
+        &cache.join("tools"),
+        "MBX_CACHE_DIR",
+    );
+    assert!(!cache.join("actions").exists());
+}
+
+#[test]
+fn rejects_existing_nfs_target_without_mutating_it() {
+    let fixture = Fixture::new();
+    let project = fixture.nfs.join("source");
+    write_project(&project);
+    let target = project.join("target");
+    std::fs::create_dir(&target).unwrap();
+    std::fs::write(target.join("keep"), "existing outputs").unwrap();
+    rejected(
+        fixture
+            .command()
+            .current_dir(&project)
+            .args(["build", "--offline"])
+            .output()
+            .unwrap(),
+        &target,
+        "CARGO_TARGET_DIR",
+    );
+    assert_eq!(
+        std::fs::read_to_string(target.join("keep")).unwrap(),
+        "existing outputs"
+    );
+    assert!(!fixture.root.join("targets").exists());
+}
+
+#[test]
+fn rejects_nested_managed_linker_storage() {
+    for (selector, child) in [("mold@2.42.0", "mold"), ("rust-lld", "rust-lld")] {
+        let fixture = Fixture::new();
+        let tools = fixture.root.join("cache/tools");
+        std::fs::create_dir_all(&tools).unwrap();
+        std::os::unix::fs::symlink(&fixture.nfs, tools.join(child)).unwrap();
+        let output = fixture
+            .command()
+            .env("MBX_LINKER", selector)
+            .args(["build", "--offline"])
+            .output()
+            .unwrap();
+        rejected(output, &tools.join(child), "MBX_CACHE_DIR");
+        assert_eq!(std::fs::read_dir(&fixture.nfs).unwrap().count(), 0);
+    }
+}
+
+#[test]
+fn failed_metadata_never_launches_a_build() {
+    use std::os::unix::fs::PermissionsExt;
+    for shim in [false, true] {
+        for configured in [false, true] {
+            let fixture = Fixture::new();
+            let bin = fixture.root.join("bin");
+            std::fs::create_dir(&bin).unwrap();
+            let cargo = bin.join("cargo");
+            std::fs::write(&cargo, "#!/bin/sh\ncase \" $* \" in *' metadata '*) exit 1;; esac\ntouch \"$TEST_BUILD_MARKER\"\n").unwrap();
+            std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let marker = fixture.root.join("build-ran");
+            let mut command = fixture.command();
+            command.arg("build");
+            let inherited_path = std::env::var_os("PATH").unwrap();
+            let paths = std::iter::once(bin).chain(std::env::split_paths(&inherited_path));
+            command
+                .env("PATH", std::env::join_paths(paths).unwrap())
+                .env("CARGO", &cargo)
+                .env("TEST_BUILD_MARKER", &marker);
+            if shim {
+                command.env("MBX_CARGO_SHIM_MODE", "1");
+            }
+            if configured {
+                command.args([
+                    "--config",
+                    &format!("build.build-dir={:?}", fixture.nfs.join("intermediates")),
+                ]);
+            } else {
+                command.env("CARGO_BUILD_BUILD_DIR", fixture.nfs.join("intermediates"));
+            }
+            let output = command.output().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(!output.status.success(), "{stderr}");
+            assert!(
+                stderr.contains("could not verify Cargo build storage"),
+                "{stderr}"
+            );
+            assert!(!marker.exists());
+            assert!(!fixture.project.join("target").exists());
+            assert!(!fixture.root.join("cache/tools").exists());
+        }
+    }
+}
+
 fn rejected(output: Output, path: &Path, setting: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");

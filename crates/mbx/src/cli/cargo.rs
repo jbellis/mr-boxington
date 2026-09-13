@@ -95,7 +95,15 @@ fn cargo_with_settings_bypass_log_and_roots(
     }
     crate::storage::check_cache(config)?;
     let working_dir = std::env::current_dir()?;
-    let roots = roots.unwrap_or_else(|| resolve_roots(&cargo, arguments, &working_dir));
+    let roots = match roots {
+        Some(roots) => roots,
+        None => cargo_roots(
+            &cargo,
+            arguments,
+            std::env::var_os(CARGO_TARGET_DIR_ENV).as_deref(),
+        )
+        .ok_or_else(|| eyre::eyre!("could not verify Cargo build storage: metadata probing failed; run cargo metadata --no-deps --format-version 1 with the same manifest and configuration options to diagnose it"))?,
+    };
     let mut config = config.clone();
     config.apply_workspace_policy(&roots.workspace_root)?;
     let incremental = policy::incremental_allowed(config.incremental);
@@ -143,6 +151,13 @@ fn cargo_with_settings_bypass_log_and_roots(
         && let Some(build_dir) = separate_build_dir
     {
         require_local_build_dir(build_dir)?;
+    }
+    if std::fs::symlink_metadata(&roots.target_dir).is_ok_and(|metadata| metadata.is_dir()) {
+        crate::storage::require_local(
+            &roots.target_dir,
+            "Cargo target directory",
+            "CARGO_TARGET_DIR or build.target-dir",
+        )?;
     }
     let migrate_existing = prompt_to_manage_existing_target(config, &roots, arguments)?;
     let default_target = roots.workspace_root.join("target");
