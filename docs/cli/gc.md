@@ -3,7 +3,7 @@
 
 - **Usage:** `mbx gc [FLAGS]`
 
-Collect stale managed targets and evict cached objects until the store fits a size budget.
+Prune incremental state, targets, and cached objects to fit budgets.
 
 A missing cached object is rebuilt when it is needed again.
 

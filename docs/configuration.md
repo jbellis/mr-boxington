@@ -34,15 +34,17 @@ can set `$env:NAME` before the command and remove it afterward.
 
 ## Disk-scaled defaults
 
-The two size budgets default to a share of the disk holding the cache: 5% for
-the action store (`gc.max_size`) and 10% for managed target directories
-(`target.max_size`), each bounded at both ends. Managed targets are also
-collected after 30 days unused. The table in
+Three size budgets default to a share of the disk holding their data: 5% for
+the action store (`gc.max_size`), 10% for managed target directories
+(`target.max_size`), and 5% for learned incremental state
+(`gc.incremental_max_size`), each bounded at both ends. Managed targets and
+learned incremental state are also collected after 30 days unused. The table in
 [managed target directories](/managed-targets#budgets-scale-with-the-disk)
 lists the bounds and what collection removes.
 
 Setting any of them outright overrides the scaling; `"none"` disables
-`target.max_size`, `target.max_age`, and `gc.max_total_size`.
+`target.max_size`, `target.max_age`, `gc.incremental_max_size`,
+`gc.incremental_max_age`, and `gc.max_total_size`.
 
 ## Example
 
@@ -78,7 +80,9 @@ default = "system"
 [gc]
 auto = true
 max_size = "20GiB"       # default: 5% of the cache disk
-max_total_size = "50GiB" # optional combined budget
+incremental_max_size = "20GiB" # default: 5% of the cache disk
+incremental_max_age = "30d"    # default
+max_total_size = "50GiB" # optional action + target + incremental budget
 interval = "1h"
 
 [target]
