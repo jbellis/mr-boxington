@@ -81,6 +81,13 @@ fn cargo_with_settings_bypass_log_and_roots(
     if super::launch::needs_plain_launch(arguments) {
         return super::launch::plain_launch(&cargo, arguments);
     }
+    let os_arguments = arguments
+        .iter()
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+    if super::shim::cargo_proxy_passthrough(&os_arguments) {
+        return run_cargo(&cargo, arguments, BTreeMap::new());
+    }
     // Only where mbx can identify the linker precisely enough to key what it
     // produced. Said out loud only to somebody who asked for it: this is on
     // by default now, and a platform that cannot do it would otherwise warn

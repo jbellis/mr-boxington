@@ -165,7 +165,7 @@ fn enclosing_session(session_socket: Option<&OsStr>) -> bool {
     session_socket.is_some_and(|socket| !socket.is_empty())
 }
 
-fn cargo_proxy_passthrough(arguments: &[OsString]) -> bool {
+pub(super) fn cargo_proxy_passthrough(arguments: &[OsString]) -> bool {
     let cargo_arguments = arguments
         .iter()
         .take_while(|argument| argument.as_os_str() != OsStr::new("--"))
