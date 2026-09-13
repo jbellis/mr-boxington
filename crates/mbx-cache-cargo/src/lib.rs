@@ -1276,6 +1276,37 @@ mod tests {
     }
 
     #[test]
+    fn reported_intermediates_survive_resolution_and_cached_records() {
+        let directory = cargo_fixture();
+        let root = directory.path();
+        let cache = tempfile::tempdir().unwrap();
+        let arguments = ["build".to_owned()];
+        let roots = (
+            root.to_path_buf(),
+            root.join("target"),
+            Some(root.join("intermediates")),
+        );
+        let resolved = resolve_with_reported(&arguments, root, None, Some(roots.clone()));
+        assert_eq!(resolved.build_dir, roots.2);
+        let describe = || {
+            ProbeRecord::describe(
+                cache.path(),
+                None,
+                OsStr::new("cargo"),
+                &arguments,
+                root,
+                None,
+            )
+            .unwrap()
+        };
+        describe().remember(&roots);
+        assert_eq!(describe().recall(), Some(roots.clone()));
+        let old_cargo =
+            resolve_with_reported(&arguments, root, None, Some((roots.0, roots.1, None)));
+        assert_eq!(old_cargo.build_dir, None);
+    }
+
+    #[test]
     #[cfg(unix)]
     fn a_probe_is_remembered_while_what_cargo_read_stands() {
         let directory = cargo_fixture();
