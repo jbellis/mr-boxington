@@ -2,7 +2,7 @@
 import { ref } from "vue";
 
 const command =
-  'mise use --global --postinstall "mbx setup --yes" mr-boxington';
+  "mise use --global --tool-option mr_boxington=true rust mr-boxington";
 const status = ref("");
 
 async function copyCommand() {
