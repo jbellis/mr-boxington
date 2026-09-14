@@ -141,7 +141,12 @@ fn resolve_with_reported(
     reported: Option<(PathBuf, PathBuf)>,
 ) -> CargoInvocation {
     let cargo_args = cargo_arguments(arguments);
-    let invocation_dir = invocation_dir(cargo_args, working_dir);
+    let install_source = path_install_dir(cargo_args, working_dir);
+    let invocation_dir = if install_source.is_some() {
+        path_install_invocation_dir(cargo_args, working_dir)
+    } else {
+        invocation_dir(cargo_args, working_dir)
+    };
     let workspace_root = reported
         .as_ref()
         .map(|roots| roots.0.clone())
@@ -151,7 +156,10 @@ fn resolve_with_reported(
         || target_dir_env
             .as_ref()
             .is_some_and(|value| !value.is_empty())
-        || cargo_config_may_set_target_dir(cargo_args, &invocation_dir);
+        || cargo_config_may_set_target_dir(
+            cargo_args,
+            install_source.as_deref().unwrap_or(&invocation_dir),
+        );
     let target_dir = flagged
         .map(|value| absolute(&invocation_dir, value))
         .or_else(|| reported.map(|roots| roots.1))
@@ -361,6 +369,76 @@ fn invocation_dir(arguments: &[String], working_dir: &Path) -> PathBuf {
         .unwrap_or_else(|| working_dir.to_path_buf())
 }
 
+// Path installs change the probe's cwd, so resolve all directory-option
+// spellings before constructing their source-directory probe.
+fn path_install_invocation_dir(arguments: &[String], working_dir: &Path) -> PathBuf {
+    flag_value(arguments, "-C")
+        .or_else(|| flag_value(arguments, "--directory"))
+        .or_else(|| {
+            arguments
+                .iter()
+                .find_map(|arg| arg.strip_prefix("-C").filter(|value| !value.is_empty()))
+        })
+        .map(|value| absolute(working_dir, value))
+        .unwrap_or_else(|| working_dir.to_path_buf())
+}
+
+// Only a real install subcommand gives --path this meaning; option values
+// and arguments after -- must not make an unrelated command look like one.
+fn path_install_dir(arguments: &[String], working_dir: &Path) -> Option<PathBuf> {
+    let arguments = cargo_arguments(arguments);
+    let mut remaining = arguments.iter();
+    while let Some(argument) = remaining.next() {
+        match argument.as_str() {
+            "--color" | "--config" | "-Z" | "-C" | "--directory" => {
+                remaining.next()?;
+            }
+            value if !value.starts_with('-') && !value.starts_with('+') => {
+                return (value == "install")
+                    .then(|| {
+                        flag_value(arguments, "--path").map(|path| {
+                            absolute(&path_install_invocation_dir(arguments, working_dir), path)
+                        })
+                    })
+                    .flatten();
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+// Inline includes use cwd, unlike includes inside a config file. Rewrite the
+// override itself: appending another include would concatenate array entries.
+fn rebase_cli_include(value: &str, caller: &Path) -> String {
+    fn rebase(value: &mut toml::Value, caller: &Path) {
+        match value {
+            toml::Value::String(path) => {
+                *path = absolute(caller, path).to_string_lossy().into_owned();
+            }
+            toml::Value::Array(entries) => {
+                for entry in entries {
+                    rebase(entry, caller);
+                }
+            }
+            toml::Value::Table(entry) => {
+                if let Some(toml::Value::String(path)) = entry.get_mut("path") {
+                    *path = absolute(caller, path).to_string_lossy().into_owned();
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Ok(mut config) = toml::from_str::<toml::Value>(value)
+        && config.as_table().is_some_and(|table| table.len() == 1)
+        && let Some(include) = config.get_mut("include")
+    {
+        rebase(include, caller);
+        return format!("include = {include}");
+    }
+    value.to_owned()
+}
+
 /// The roots a `cargo metadata` probe reports, remembered under `cache`.
 ///
 /// The probe is a Cargo process per build, and it costs more than the shim
@@ -379,6 +457,75 @@ fn recalled_cargo_roots(
     working_dir: &Path,
     target_dir_env: Option<&OsStr>,
 ) -> Option<(PathBuf, PathBuf)> {
+    if let Some(source) = path_install_dir(arguments, working_dir) {
+        // `install --path` reads configuration from the source directory,
+        // whereas metadata normally reads it from the caller's directory.
+        // Probe there, retaining caller-relative CLI paths and target overrides.
+        let caller = path_install_invocation_dir(arguments, working_dir);
+        let mut probe_args = Vec::new();
+        if let Some(target) =
+            std::env::var_os("CARGO_BUILD_TARGET_DIR").filter(|value| !value.is_empty())
+        {
+            // This environment setting outranks files but is itself overridden
+            // by --config; insert it before the caller's explicit overrides.
+            probe_args.extend([
+                "--config".into(),
+                format!(
+                    "build.target-dir = {}",
+                    toml::Value::String(
+                        absolute(&caller, &target.to_string_lossy())
+                            .to_string_lossy()
+                            .into_owned()
+                    )
+                ),
+            ]);
+        }
+        for value in config_arguments(arguments) {
+            let value = if value.contains('=') {
+                rebase_cli_include(value, &caller)
+            } else {
+                absolute(&caller, value).to_string_lossy().into_owned()
+            };
+            probe_args.extend(["--config".into(), value.clone()]);
+            // Inline target paths also stay relative to the caller. Preserve
+            // any other settings in this override and the order of overrides.
+            if let Ok(config) = toml::from_str::<toml::Value>(&value)
+                && let Some(target) = config
+                    .get("build")
+                    .and_then(|build| build.get("target-dir"))
+                    .and_then(toml::Value::as_str)
+            {
+                probe_args.extend([
+                    "--config".into(),
+                    format!(
+                        "build.target-dir = {}",
+                        toml::Value::String(
+                            absolute(&caller, target).to_string_lossy().into_owned()
+                        )
+                    ),
+                ]);
+            }
+        }
+        probe_args.extend(forwarded_flags(arguments, &["-Z"]));
+        probe_args.push("build".into());
+        probe_args.extend(
+            arguments
+                .iter()
+                .filter(|arg| PROBE_MANIFEST_TOGGLES.contains(&arg.as_str()))
+                .cloned(),
+        );
+        let target = target_dir_env
+            .filter(|value| !value.is_empty())
+            .map(|value| absolute(&caller, &value.to_string_lossy()).into_os_string());
+        return recalled_cargo_roots(
+            cache,
+            cargo_home,
+            cargo,
+            &probe_args,
+            &source,
+            target.as_deref(),
+        );
+    }
     let probe = cache.and_then(|cache| {
         ProbeRecord::describe(
             cache,
@@ -392,7 +539,7 @@ fn recalled_cargo_roots(
     if let Some(recalled) = probe.as_ref().and_then(ProbeRecord::recall) {
         return Some(recalled);
     }
-    let roots = cargo_roots(cargo, arguments, target_dir_env)?;
+    let roots = cargo_roots(cargo, arguments, working_dir, target_dir_env)?;
     if let Some(probe) = probe {
         probe.remember(&roots);
     }
@@ -653,6 +800,7 @@ fn resolve_program(program: &OsStr) -> Option<PathBuf> {
 fn cargo_roots(
     cargo: &OsStr,
     arguments: &[String],
+    working_dir: &Path,
     target_dir_env: Option<&OsStr>,
 ) -> Option<(PathBuf, PathBuf)> {
     let mut command = Command::new(cargo);
@@ -660,7 +808,9 @@ fn cargo_roots(
         Some(value) => command.env(CARGO_TARGET_DIR_ENV, value),
         None => command.env_remove(CARGO_TARGET_DIR_ENV),
     };
-    command.args(probe_arguments(arguments));
+    command
+        .current_dir(working_dir)
+        .args(probe_arguments(arguments));
     let output = command.output().ok()?;
     if !output.status.success() {
         return None;
@@ -766,6 +916,15 @@ mod tests {
         std::fs::create_dir_all(directory.path().join("src")).unwrap();
         std::fs::write(directory.path().join("src/lib.rs"), "").unwrap();
         directory
+    }
+
+    fn fixture_root(path: &Path) -> PathBuf {
+        // Cargo omits Windows verbatim prefixes; Unix may have aliases (/var).
+        if cfg!(windows) {
+            path.to_path_buf()
+        } else {
+            path.canonicalize().unwrap()
+        }
     }
 
     #[test]
@@ -905,6 +1064,166 @@ mod tests {
 
         assert_eq!(resolved.target_dir, configured);
         assert!(resolved.target_dir_requested);
+    }
+
+    #[test]
+    fn path_install_probes_source_config_and_preserves_caller_relative_targets() {
+        let source = cargo_fixture();
+        let caller = cargo_fixture();
+        let source_root = fixture_root(source.path());
+        let caller_root = fixture_root(caller.path());
+        for (root, target) in [
+            (source_root.as_path(), "source-target"),
+            (caller_root.as_path(), "caller-target"),
+        ] {
+            std::fs::create_dir_all(root.join(".cargo")).unwrap();
+            std::fs::write(
+                root.join(".cargo/config.toml"),
+                format!("[build]\ntarget-dir = '{target}'\n"),
+            )
+            .unwrap();
+        }
+        let arguments = vec![
+            "install".into(),
+            format!("--path={}", source_root.as_path().display()),
+            "--offline".into(),
+        ];
+        let cache = tempfile::tempdir().unwrap();
+        let resolve = |args: &[String], target| {
+            resolve_reported_in(
+                Some(cache.path()),
+                OsStr::new("cargo"),
+                args,
+                caller_root.as_path(),
+                target,
+            )
+            .unwrap()
+        };
+        let roots = resolve(&arguments, None);
+        assert_eq!(roots.workspace_root, source_root.as_path());
+        assert_eq!(
+            roots.target_dir,
+            source_root.as_path().join("source-target")
+        );
+        assert!(roots.target_dir_requested);
+
+        let mut flagged = arguments.clone();
+        flagged.extend(["--target-dir".into(), "flag-target".into()]);
+        assert_eq!(
+            resolve(&flagged, None).target_dir,
+            caller_root.as_path().join("flag-target")
+        );
+        assert_eq!(
+            resolve(&arguments, Some("env-target".into())).target_dir,
+            caller_root.as_path().join("env-target")
+        );
+        let mut configured = arguments.clone();
+        configured.extend(["--config".into(), "build.target-dir='cli-target'".into()]);
+        assert_eq!(
+            resolve(&configured, None).target_dir,
+            caller_root.as_path().join("cli-target")
+        );
+
+        // A warm metadata cache must watch the installed source's config.
+        std::fs::write(
+            source_root.as_path().join(".cargo/config.toml"),
+            "[build]\ntarget-dir = 'changed-source-target'\n",
+        )
+        .unwrap();
+        assert_eq!(
+            resolve(&arguments, None).target_dir,
+            source_root.as_path().join("changed-source-target")
+        );
+    }
+
+    #[test]
+    fn path_install_directory_flags_rebase_the_source_and_target() {
+        let source = cargo_fixture();
+        let source_root = fixture_root(source.path());
+        let caller = source_root.parent().unwrap();
+        let directory = source_root.file_name().unwrap().to_str().unwrap();
+        for flags in [
+            vec!["--directory".into(), directory.into()],
+            vec![format!("--directory={directory}")],
+            vec!["-C".into(), directory.into()],
+            vec![format!("-C{directory}")],
+        ] {
+            let mut arguments = flags;
+            arguments.extend(
+                [
+                    "install",
+                    "--path",
+                    ".",
+                    "--target-dir",
+                    "shared",
+                    "--offline",
+                ]
+                .map(str::to_owned),
+            );
+            let roots =
+                resolve_reported_in(None, OsStr::new("cargo"), &arguments, caller, None).unwrap();
+            assert_eq!(roots.workspace_root, source_root);
+            assert_eq!(roots.target_dir, source_root.join("shared"));
+            assert!(roots.target_dir_requested);
+        }
+    }
+
+    #[test]
+    fn path_install_cli_includes_keep_caller_paths_and_override_order() {
+        let source = cargo_fixture();
+        let caller = cargo_fixture();
+        let source_root = fixture_root(source.path());
+        let caller_root = fixture_root(caller.path());
+        for (root, target) in [
+            (&caller_root, "caller-target"),
+            (&source_root, "wrong-target"),
+        ] {
+            std::fs::create_dir_all(root.join(".config")).unwrap();
+            std::fs::write(
+                root.join(".config/extra.toml"),
+                format!("[build]\ntarget-dir = '{target}'\n"),
+            )
+            .unwrap();
+        }
+        let resolve = |overrides: &[&str]| {
+            let mut args = vec![
+                "install".into(),
+                "--path".into(),
+                source_root.display().to_string(),
+                "--offline".into(),
+            ];
+            for value in overrides {
+                args.extend(["--config".into(), (*value).into()]);
+            }
+            resolve_reported_in(None, OsStr::new("cargo"), &args, &caller_root, None)
+        };
+        for include in [
+            "include=['.config/extra.toml']",
+            "include=[{path='.config/extra.toml'}, {path='.config/missing.toml', optional=true}]",
+        ] {
+            assert_eq!(
+                resolve(&[include]).unwrap().target_dir,
+                caller_root.join("caller-target")
+            );
+            assert_eq!(
+                resolve(&[include, "build.target-dir='override'"])
+                    .unwrap()
+                    .target_dir,
+                caller_root.join("override")
+            );
+        }
+        let absolute_include = format!(
+            "include=[{}]",
+            toml::Value::String(caller_root.join(".config/extra.toml").display().to_string())
+        );
+        assert_eq!(
+            resolve(&[&absolute_include]).unwrap().target_dir,
+            caller_root.join("caller-target")
+        );
+        assert!(resolve(&["include=['.config/missing.toml']"]).is_none());
+
+        // Keep unsupported Cargo values invalid instead of repairing them.
+        assert!(resolve(&["include=42"]).is_none());
     }
 
     /// A stand-in Cargo that answers `metadata` and logs every call.
