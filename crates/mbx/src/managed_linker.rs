@@ -261,6 +261,7 @@ fn install(
         .join(version)
         .join(host_install_name());
     let executable = install_dir.join(executable_filename(provider.name()));
+    crate::storage::require_local(&install_dir, "managed linker directory", "MBX_CACHE_DIR")?;
     if executable.is_file() {
         return Ok(executable);
     }
@@ -413,6 +414,7 @@ fn rust_lld(target: Option<&str>, cache_dir: &Path, cargo_arguments: &[String]) 
         .join("tools/rust-lld")
         .join(host)
         .join(sysroot_key);
+    crate::storage::require_local(&shim_dir, "managed linker shim directory", "MBX_CACHE_DIR")?;
     fs::create_dir_all(&shim_dir)?;
     let shim = shim_dir.join(flavor);
     #[cfg(unix)]
