@@ -1266,6 +1266,26 @@ mod tests {
         script
     }
 
+    /// A stand-in Cargo whose reported directories follow what it is given,
+    /// so a record recalled for the wrong inputs is visibly wrong rather than
+    /// accidentally right.
+    #[cfg(unix)]
+    fn build_dir_cargo(directory: &Path, project: &Path, log: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt as _;
+        let script = directory.join("cargo");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$*\" >> {log}\ncase \" $* \" in *' metadata '*) target=\"${{CARGO_TARGET_DIR:-{root}/target}}\"; build=\"${{CARGO_BUILD_BUILD_DIR:-$target/build-dir}}\"; printf '{{\"workspace_root\":\"{root}\",\"target_directory\":\"%s\",\"build_directory\":\"%s\",\"packages\":[]}}' \"$target\" \"$build\";; esac\n",
+                log = log.display(),
+                root = project.display(),
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
     #[cfg(unix)]
     fn probes(log: &Path) -> usize {
         std::fs::read_to_string(log)
@@ -1304,6 +1324,96 @@ mod tests {
         let old_cargo =
             resolve_with_reported(&arguments, root, None, Some((roots.0, roots.1, None)));
         assert_eq!(old_cargo.build_dir, None);
+    }
+
+    /// The environment variable that names the child run of the test below.
+    #[cfg(unix)]
+    const BUILD_DIR_PROBE_CHILD: &str = "MBX_CARGO_BUILD_DIR_PROBE_CHILD";
+
+    /// Take a reported build directory through the whole probe path: Cargo
+    /// reports it, resolution carries it, and the record answers for it. The
+    /// sibling test above hands the roots in by hand, so it cannot tell
+    /// whether `cargo metadata` output is read at all, nor whether the
+    /// inputs that select a build directory select a record. Here the
+    /// stand-in Cargo derives what it reports from `CARGO_BUILD_BUILD_DIR`
+    /// and `CARGO_TARGET_DIR`, so a record recalled for the wrong inputs
+    /// reports the wrong directory instead of the right one by chance. The
+    /// body runs in a child copy of the test binary because it sets process
+    /// environment, which is not safe beside tests reading it in parallel.
+    #[test]
+    #[cfg(unix)]
+    fn a_probed_build_directory_is_parsed_recalled_and_rekeyed() {
+        if std::env::var_os(BUILD_DIR_PROBE_CHILD).is_none() {
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "--nocapture",
+                    "--test-threads=1",
+                    "tests::a_probed_build_directory_is_parsed_recalled_and_rekeyed",
+                ])
+                .env(BUILD_DIR_PROBE_CHILD, "1")
+                .env_remove("CARGO_BUILD_BUILD_DIR")
+                .env_remove("CARGO_TARGET_DIR")
+                .env_remove("CARGO_BUILD_TARGET_DIR")
+                .status()
+                .unwrap();
+            assert!(status.success(), "the child run of this test failed");
+            return;
+        }
+
+        let directory = cargo_fixture();
+        let root = directory.path();
+        let cache = tempfile::tempdir().unwrap();
+        let log = root.join("cargo.log");
+        let cargo = build_dir_cargo(root, root, &log);
+        let home = root.join("cargo-home");
+        let resolve = |arguments: &[String]| {
+            resolve_reported_from_home(
+                Some(cache.path()),
+                Some(&home),
+                cargo.as_os_str(),
+                arguments,
+                root,
+                None,
+            )
+            .unwrap()
+        };
+        let build = ["build".to_string()];
+
+        // What Cargo reported is what resolution carries.
+        let first = resolve(&build);
+        assert_eq!(first.build_dir, Some(root.join("target/build-dir")));
+        assert_eq!(probes(&log), 1);
+
+        // The same question again is answered from the record, not Cargo.
+        assert_eq!(resolve(&build).build_dir, first.build_dir);
+        assert_eq!(probes(&log), 1);
+
+        // The environment that selects a build directory is part of the key.
+        let elsewhere = root.join("elsewhere");
+        // SAFETY: this child process runs this test and no other.
+        unsafe { std::env::set_var("CARGO_BUILD_BUILD_DIR", &elsewhere) };
+        assert_eq!(resolve(&build).build_dir, Some(elsewhere));
+        assert_eq!(probes(&log), 2);
+        // SAFETY: as above.
+        unsafe { std::env::remove_var("CARGO_BUILD_BUILD_DIR") };
+        assert_eq!(resolve(&build).build_dir, first.build_dir);
+        assert_eq!(probes(&log), 2);
+
+        // So is a target directory named on the command line, which the
+        // probe never sees among its own arguments.
+        let other_target = root.join("other-target");
+        let targeted = [
+            "build".to_string(),
+            "--target-dir".to_string(),
+            other_target.display().to_string(),
+        ];
+        let with_target = resolve(&targeted);
+        assert_eq!(with_target.build_dir, Some(other_target.join("build-dir")));
+        assert_eq!(probes(&log), 3);
+        assert_eq!(resolve(&targeted).build_dir, with_target.build_dir);
+        assert_eq!(resolve(&build).build_dir, first.build_dir);
+        assert_eq!(probes(&log), 3);
     }
 
     #[test]
