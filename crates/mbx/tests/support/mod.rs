@@ -2,15 +2,16 @@
 
 use std::process::Command;
 
-/// Give the child an isolated home and XDG directories, as
-/// `test/test_helper/common_setup.bash` does for the Bats suites, so a global
-/// mbx `config.toml` on the developer's machine cannot change what a test
-/// sees. Cargo and rustup keep their real homes so the toolchain still
-/// resolves.
+/// Hide the developer's own mbx setup from the child: the settings it reads
+/// from the environment, and on Unix the directories it reads a global
+/// `config.toml` from. `test/test_helper/common_setup.bash` does the same for
+/// the Bats suites. Cargo and rustup keep their real homes so the toolchain
+/// still resolves.
 ///
-/// Windows finds these directories through known-folder APIs rather than the
-/// environment, so there is nothing to redirect there.
+/// Every test names the settings it needs after this, so a scrubbed variable
+/// that a test cares about comes back with the test's own value.
 pub fn isolate_host(command: &mut Command) -> &mut Command {
+    scrub_settings(command);
     #[cfg(unix)]
     {
         let real_home = std::env::var_os("HOME").map(std::path::PathBuf::from);
@@ -30,6 +31,30 @@ pub fn isolate_host(command: &mut Command) -> &mut Command {
             .env("XDG_DATA_HOME", home.join(".local/share"));
     }
     command
+}
+
+/// A setting in the environment outranks the same setting in a configuration
+/// file, so hiding the file is not enough on its own: an exported
+/// `MBX_TARGET_ROOT` moves managed targets out of a test's store exactly as
+/// `[target] root` does. Drop the whole namespace rather than name the
+/// settings that bite today, since the next one to bite would arrive silently.
+///
+/// `MBX_LOG` stays. It only raises mbx's own diagnostics, and running one of
+/// these tests under it is how a developer sees what mbx did. The extra stderr
+/// it produces can fail a test that asserts on stderr, which is a deliberate
+/// act rather than something the machine decides.
+///
+/// This applies on every platform. Windows resolves the configuration
+/// directory through known-folder APIs rather than the environment, so a
+/// global `config.toml` on a Windows developer's machine is still visible
+/// here; isolating it needs a way to point mbx at a different file.
+fn scrub_settings(command: &mut Command) {
+    for (name, _) in std::env::vars_os() {
+        let key = name.to_string_lossy().to_ascii_uppercase();
+        if key.starts_with("MBX_") && key != "MBX_LOG" {
+            command.env_remove(&name);
+        }
+    }
 }
 
 /// Shared by every test in the run, as the real home was. No test writes mbx
