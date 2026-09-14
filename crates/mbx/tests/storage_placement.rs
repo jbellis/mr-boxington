@@ -220,6 +220,62 @@ fn failed_metadata_never_launches_a_build() {
     }
 }
 
+/// A colored `cargo --list` must not cost an alias its passthrough. Cargo
+/// colors the listing whenever `CARGO_TERM_COLOR` or `term.color` says
+/// `always`, and the parser reads the listing as plain text, so both the
+/// header check and the alias table fail and a harmless `fmt` alias is
+/// rejected as unverified build storage. This stub colors on the same
+/// condition the real Cargo does, and honors the `--color=never` that
+/// overrides it.
+#[test]
+fn a_colored_listing_still_preserves_a_non_build_alias() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = Fixture::new();
+    let bin = fixture.root.join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let cargo = bin.join("cargo");
+    std::fs::write(&cargo, CARGO_ALIAS_STUB).unwrap();
+    std::fs::set_permissions(&cargo, std::fs::Permissions::from_mode(0o755)).unwrap();
+    for shim in [false, true] {
+        let marker = fixture.root.join(format!("fmt-ran-{shim}"));
+        let mut command = fixture.command();
+        let inherited_path = std::env::var_os("PATH").unwrap();
+        let paths = std::iter::once(bin.clone()).chain(std::env::split_paths(&inherited_path));
+        command
+            .arg("fmt-alias")
+            .env("PATH", std::env::join_paths(paths).unwrap())
+            .env("CARGO", &cargo)
+            .env("CARGO_TERM_COLOR", "always")
+            .env("TEST_ALIAS_MARKER", &marker);
+        if shim {
+            command.env("MBX_CARGO_SHIM_MODE", "1");
+        }
+        let output = command.output().unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert!(
+            !stderr.contains("could not verify Cargo build storage"),
+            "{stderr}"
+        );
+        assert!(marker.exists(), "the alias should reach Cargo: {stderr}");
+    }
+}
+
+const CARGO_ALIAS_STUB: &str = r#"#!/bin/sh
+plain='Installed Commands:\n    fmt\n    fmt-alias    alias: fmt\n'
+color='\033[92m\033[1mInstalled Commands:\033[0m\n    \033[1mfmt\033[0m\n    \033[1mfmt-alias\033[0m    alias: fmt\n'
+case " $* " in
+  *' metadata '*) exit 1 ;;
+  *' --list '*)
+    case " $* " in
+      *' --color=never '*) printf "$plain" ;;
+      *) if [ "$CARGO_TERM_COLOR" = always ]; then printf "$color"; else printf "$plain"; fi ;;
+    esac
+    exit 0 ;;
+esac
+touch "$TEST_ALIAS_MARKER"
+"#;
+
 fn rejected(output: Output, path: &Path, setting: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(!output.status.success(), "{stderr}");

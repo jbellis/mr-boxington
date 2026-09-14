@@ -269,7 +269,13 @@ pub(super) fn metadata_failure_passthrough(cargo: &OsStr, arguments: &[OsString]
     ) {
         return false;
     }
-    let Ok(output) = Command::new(cargo).arg("--list").output() else {
+    // `--color=never` overrides `CARGO_TERM_COLOR` and `term.color`, which
+    // otherwise wrap both the header and every command name in ANSI escapes
+    // and defeat the plain-text parsing below.
+    let Ok(output) = Command::new(cargo)
+        .args(["--color=never", "--list"])
+        .output()
+    else {
         return false;
     };
     if !output.status.success() {
