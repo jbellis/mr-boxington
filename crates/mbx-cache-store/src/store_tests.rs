@@ -620,6 +620,215 @@ fn export_outputs(source: &Path, outputs: &[CacheDigest]) -> PathBuf {
 }
 
 #[test]
+fn exports_and_imports_a_directory_bundle() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let workspace = source.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let output = store_object(source.path(), b"compiled artifact");
+    let action = store_result(
+        source.path(),
+        "compile action",
+        std::slice::from_ref(&output),
+    );
+    let identity = "d".repeat(64);
+    record_build(
+        source.path(),
+        &identity,
+        &workspace,
+        std::slice::from_ref(&action),
+    );
+    let bundle = source.path().join("bundle");
+
+    let exported = export_checkout_as(
+        source.path(),
+        &workspace,
+        &bundle,
+        ExportAdditions::default(),
+        ExportForm::Directory,
+    )
+    .unwrap();
+    assert!(bundle.join(EXPORT_MANIFEST).is_file());
+    let imported = import_archive(destination.path(), &bundle).unwrap();
+
+    assert_eq!(exported.objects, 3);
+    assert_eq!(imported.objects, 3);
+    assert!(
+        LocalCas::new(destination.path())
+            .find(&output)
+            .unwrap()
+            .is_some()
+    );
+    assert_eq!(
+        task_manifest_actions(destination.path(), &identity).unwrap(),
+        vec![action]
+    );
+    // The bundle is consumed: its objects were moved, not copied.
+    assert!(!bundle.exists(), "a directory bundle is removed on success");
+}
+
+#[test]
+fn a_directory_export_replaces_whatever_the_destination_held() {
+    let source = tempfile::tempdir().unwrap();
+    let workspace = source.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let output = store_object(source.path(), b"compiled artifact");
+    let action = store_result(
+        source.path(),
+        "compile action",
+        std::slice::from_ref(&output),
+    );
+    record_build(
+        source.path(),
+        &"e".repeat(64),
+        &workspace,
+        std::slice::from_ref(&action),
+    );
+    let bundle = source.path().join("bundle");
+    std::fs::create_dir_all(bundle.join("stale")).unwrap();
+    std::fs::write(bundle.join("stale").join("leftover"), b"old run").unwrap();
+
+    export_checkout_as(
+        source.path(),
+        &workspace,
+        &bundle,
+        ExportAdditions::default(),
+        ExportForm::Directory,
+    )
+    .unwrap();
+
+    assert!(!bundle.join("stale").exists());
+    assert!(bundle.join(EXPORT_MANIFEST).is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn import_refuses_a_directory_bundle_holding_a_symlink() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let workspace = source.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let output = store_object(source.path(), b"compiled artifact");
+    let action = store_result(
+        source.path(),
+        "compile action",
+        std::slice::from_ref(&output),
+    );
+    record_build(
+        source.path(),
+        &"f".repeat(64),
+        &workspace,
+        std::slice::from_ref(&action),
+    );
+    let bundle = source.path().join("bundle");
+    export_checkout_as(
+        source.path(),
+        &workspace,
+        &bundle,
+        ExportAdditions::default(),
+        ExportForm::Directory,
+    )
+    .unwrap();
+    let secret = source.path().join("outside-the-bundle");
+    std::fs::write(&secret, b"not part of any export").unwrap();
+    std::os::unix::fs::symlink(&secret, bundle.join(CAS_DIR).join("blake3").join("link")).unwrap();
+
+    let error = import_archive(destination.path(), &bundle).unwrap_err();
+
+    assert!(error.to_string().contains("non-file entry"), "{error:?}");
+    assert!(bundle.exists(), "a refused bundle is left alone");
+}
+
+#[cfg(unix)]
+#[test]
+fn import_refuses_a_directory_bundle_holding_a_hard_link() {
+    let source = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let workspace = source.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let output = store_object(source.path(), b"compiled artifact");
+    let action = store_result(
+        source.path(),
+        "compile action",
+        std::slice::from_ref(&output),
+    );
+    record_build(
+        source.path(),
+        &"0".repeat(64),
+        &workspace,
+        std::slice::from_ref(&action),
+    );
+    let bundle = source.path().join("bundle");
+    export_checkout_as(
+        source.path(),
+        &workspace,
+        &bundle,
+        ExportAdditions::default(),
+        ExportForm::Directory,
+    )
+    .unwrap();
+    let staged = bundle
+        .join(CAS_DIR)
+        .join(&output.algorithm)
+        .join(&output.hash[..2])
+        .join(format!("{}-{}", output.hash, output.size));
+    let alias = source.path().join("alias");
+    std::fs::hard_link(&staged, &alias).unwrap();
+
+    let error = import_archive(destination.path(), &bundle).unwrap_err();
+
+    assert!(error.to_string().contains("hard link"), "{error:?}");
+}
+
+#[test]
+fn a_failed_directory_export_keeps_the_previous_bundle() {
+    let source = tempfile::tempdir().unwrap();
+    let workspace = source.path().join("workspace");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let output = store_object(source.path(), b"compiled artifact");
+    let action = store_result(
+        source.path(),
+        "compile action",
+        std::slice::from_ref(&output),
+    );
+    record_build(
+        source.path(),
+        &"1".repeat(64),
+        &workspace,
+        std::slice::from_ref(&action),
+    );
+    let bundle = source.path().join("bundle");
+    export_checkout_as(
+        source.path(),
+        &workspace,
+        &bundle,
+        ExportAdditions::default(),
+        ExportForm::Directory,
+    )
+    .unwrap();
+    // Break the closure so the next export fails before it publishes.
+    std::fs::remove_file(LocalCas::new(source.path()).path_for(&output).unwrap()).unwrap();
+
+    let error = export_checkout_as(
+        source.path(),
+        &workspace,
+        &bundle,
+        ExportAdditions::default(),
+        ExportForm::Directory,
+    )
+    .unwrap_err();
+
+    assert!(
+        error.to_string().contains("cache object is missing"),
+        "{error:?}"
+    );
+    assert!(
+        bundle.join(EXPORT_MANIFEST).is_file(),
+        "a failed export must leave the previous bundle in place"
+    );
+}
+
+#[test]
 fn import_rejects_an_object_whose_contents_were_tampered_with() {
     let source = tempfile::tempdir().unwrap();
     let destination = tempfile::tempdir().unwrap();
@@ -800,6 +1009,27 @@ fn export_refuses_a_corrupted_object_of_the_right_length() {
         "{error:?}"
     );
     assert!(!archive.exists(), "a corrupt closure must publish nothing");
+}
+
+#[test]
+fn archive_paths_are_checked_by_component_not_by_spelling() {
+    // A directory bundle is walked with the platform's separator, so on
+    // Windows these carry backslashes where a tar entry would carry slashes.
+    // Both have to pass, and this is the assertion that says so on that CI.
+    validate_archive_path(&Path::new(CAS_DIR).join("blake3").join("ab").join("cd-1")).unwrap();
+    validate_archive_path(
+        &Path::new(ACTION_RESULTS_DIR)
+            .join("blake3")
+            .join("ab")
+            .join("cd-1.json"),
+    )
+    .unwrap();
+    validate_archive_path(Path::new(EXPORT_MANIFEST)).unwrap();
+
+    let _ = validate_archive_path(&Path::new("elsewhere").join("file")).unwrap_err();
+    let _ = validate_archive_path(&Path::new("cas").join("v2").join("blob")).unwrap_err();
+    // The tree roots themselves are not members.
+    let _ = validate_archive_path(Path::new(CAS_DIR)).unwrap_err();
 }
 
 #[test]
@@ -1007,6 +1237,7 @@ fn grouped_export_keeps_each_commands_predictions_and_newest_conflicts() {
         ],
         &archive,
         ExportAdditions::default(),
+        ExportForm::Tar,
     )
     .unwrap();
     import_archive(destination.path(), &archive).unwrap();
@@ -1188,7 +1419,14 @@ fn equal_timestamp_exports_ignore_receipt_enumeration_order() {
     for order in [receipts.to_vec(), receipts.into_iter().rev().collect()] {
         let destination = tempfile::tempdir().unwrap();
         let archive = destination.path().join("job.tar");
-        export_receipts(source.path(), order, &archive, ExportAdditions::default()).unwrap();
+        export_receipts(
+            source.path(),
+            order,
+            &archive,
+            ExportAdditions::default(),
+            ExportForm::Tar,
+        )
+        .unwrap();
         import_archive(destination.path(), &archive).unwrap();
         let manifest: TaskActionManifest = serde_json::from_slice(
             &std::fs::read(task_manifest_path(destination.path(), &identity)).unwrap(),
