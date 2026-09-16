@@ -126,6 +126,12 @@ fi
 EOF
   chmod +x "$fake_bin/mise"
 
+  local project_ra_config="$(dirname "$project_config")/rust-analyzer.toml"
+  cat >"$project_ra_config" <<EOF
+[check]
+overrideCommand = ["$MBX_SHIM_DIR/cargo", "check", "--workspace", "--all-targets", "--target-dir", "target/rust-analyzer", "--message-format=json"]
+EOF
+
   run env PATH="$fake_bin:$PATH" MBX_TEST_MISE_LOG="$mise_log" \
     MBX_TEST_SHIM_DIR="$MBX_SHIM_DIR" MISE_CONFIG_FILE="$project_config" \
     "$MBX_BIN" setup --yes
@@ -137,7 +143,9 @@ EOF
   assert_file_contains "$project_config" 'command = "mbx"'
   assert_file_contains "$project_config" 'MBX_CARGO_SHIM_MODE = "1"'
   assert_file_contains "$mise_log" "reshim"
-  assert_file_contains "$(dirname "$project_config")/rust-analyzer.toml" "$MBX_SHIM_DIR/cargo"
+  assert_file_contains "$MBX_RA_CONFIG" "$MBX_SHIM_DIR/cargo"
+  assert_output --partial "removed the inactive rust-analyzer check command"
+  [ ! -e "$project_ra_config" ]
 
   run env -u MISE_CONFIG_FILE PATH="$fake_bin:$PATH" MISE_SHELL=zsh \
     MISE_GLOBAL_CONFIG_FILE="$BATS_TEST_TMPDIR/global.toml" \
@@ -148,6 +156,21 @@ EOF
   assert_file_contains "$BATS_TEST_TMPDIR/global.toml" 'command = "mbx"'
   assert_file_contains "$BATS_TEST_TMPDIR/global.toml" 'MBX_CARGO_SHIM_MODE = "1"'
   assert_file_contains "$MBX_RA_CONFIG" "$MBX_SHIM_DIR/cargo"
+
+  local global_project="$BATS_TEST_TMPDIR/global-project"
+  mkdir -p "$global_project"
+  printf '[workspace]\n' >"$global_project/Cargo.toml"
+  cat >"$global_project/rust-analyzer.toml" <<EOF
+[check]
+overrideCommand = ["$MBX_SHIM_DIR/cargo", "check", "--workspace", "--all-targets", "--target-dir", "target/rust-analyzer", "--message-format=json"]
+EOF
+  run env PATH="$fake_bin:$PATH" MISE_SHELL=zsh \
+    MISE_CONFIG_FILE="$BATS_TEST_TMPDIR/global.toml" \
+    MISE_GLOBAL_CONFIG_FILE="$BATS_TEST_TMPDIR/global.toml" \
+    MBX_TEST_MISE_LOG="$mise_log" MBX_TEST_SHIM_DIR="$MBX_SHIM_DIR" \
+    bash -c "cd '$global_project' && '$MBX_BIN' setup --yes"
+  assert_success
+  [ ! -e "$global_project/rust-analyzer.toml" ]
 
   run env -u MISE_CONFIG_FILE PATH="$fake_bin:$PATH" MISE_SHELL=zsh \
     MBX_TEST_MISE_CONFIGS="[{\"path\":\"$project_config\",\"tools\":[\"mr-boxington\"]}]" \
@@ -176,13 +199,22 @@ EOF
   assert_success
   assert_file_contains "$project_config" 'command = "mbx"'
 
+  run env PATH="$fake_bin:$PATH" MBX_TEST_MISE_LOG="$mise_log" \
+    MBX_TEST_SHIM_DIR="$MBX_SHIM_DIR" "$MBX_BIN" setup --local --uninstall
+  assert_success
+  assert_output --partial "the rust-analyzer check command in"
+  assert_file_contains "$MBX_RA_CONFIG" "$MBX_SHIM_DIR/cargo"
+
   run env PATH="$fake_bin:$PATH" MISE_SHELL=zsh \
+    MISE_CONFIG_FILE="$BATS_TEST_TMPDIR/global.toml" \
     MISE_GLOBAL_CONFIG_FILE="$BATS_TEST_TMPDIR/global.toml" \
     MBX_TEST_MISE_CONFIGS="[{\"path\":\"$BATS_TEST_TMPDIR/global.toml\",\"tools\":[\"mr-boxington\"]}]" \
     MBX_TEST_MISE_LOG="$mise_log" MBX_TEST_SHIM_DIR="$MBX_SHIM_DIR" \
     "$MBX_BIN" setup --uninstall
   assert_success
   run grep -F 'MBX_CARGO_SHIM_MODE' "$BATS_TEST_TMPDIR/global.toml"
+  assert_failure
+  run grep -F 'overrideCommand' "$MBX_RA_CONFIG"
   assert_failure
 }
 
