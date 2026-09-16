@@ -166,7 +166,10 @@ pub(crate) struct RawConfig {
         default = "16MiB"
     )]
     events_max_size: String,
-    /// Share eligible compilations that read `OUT_DIR`.
+    /// Remap `OUT_DIR` so rustc does not record it in the artifact, which can
+    /// leave a rebuilt dependency byte-identical between checkouts so its
+    /// dependents share. The compilation that read it stays checkout-specific
+    /// either way, as does any artifact still carrying a checkout path.
     #[usage(env = "MBX_SHARE_OUT_DIR", default = true)]
     share_out_dir: bool,
     /// Cache executions of build scripts using Cargo's freshness inputs. This may
@@ -380,11 +383,18 @@ pub struct Config {
     /// Let cargo compile workspace members incrementally, rather than forcing
     /// `CARGO_INCREMENTAL=0` for the whole build.
     pub incremental: bool,
-    /// Let a compilation that reads `OUT_DIR` be shared between checkouts.
+    /// Remap `OUT_DIR` so rustc does not record it in the artifact.
     ///
-    /// On by default: the compilation remaps generated sources to a stable
-    /// placeholder, and mbx reads the outputs before publishing to fall back
-    /// to a checkout-specific key when a crate embeds the literal path.
+    /// On by default. The compilation itself is keyed to the checkout it ran
+    /// in either way: nothing available can prove its artifact ignores the
+    /// path. What remapping buys is that a dependency recompiled in a second
+    /// checkout can come out byte-identical, so the crates above it still
+    /// share.
+    ///
+    /// It does not guarantee that. A workspace member records its own
+    /// directory whatever `OUT_DIR` was remapped to, and a crate that keeps
+    /// the value it read through `env!` embeds it; both produce a different
+    /// artifact in a second checkout, and their dependents recompile too.
     pub share_out_dir: bool,
     /// Cache build-script execution when the script declares rerun inputs.
     pub build_script_execution: bool,
