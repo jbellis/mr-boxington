@@ -13,7 +13,8 @@ fn write_line(path: &Path, line: &str) {
 #[test]
 fn a_stream_records_a_build_from_start_to_totals() {
     let store = tempfile::tempdir().unwrap();
-    let writer = EventWriter::new(store.path());
+    let writer =
+        EventWriter::with_limit(store.path(), Some(crate::config::DEFAULT_EVENTS_MAX_SIZE));
     writer.started(Path::new("/workspace"), &["build".into()], None);
     writer.action(
         ActionOutcome::Hit,
@@ -65,7 +66,8 @@ fn a_stream_records_a_build_from_start_to_totals() {
 #[test]
 fn a_command_that_records_nothing_leaves_no_stream() {
     let store = tempfile::tempdir().unwrap();
-    let writer = EventWriter::new(store.path());
+    let writer =
+        EventWriter::with_limit(store.path(), Some(crate::config::DEFAULT_EVENTS_MAX_SIZE));
     let paths = session_paths(store.path(), writer.id());
     drop(writer);
 
@@ -76,7 +78,8 @@ fn a_command_that_records_nothing_leaves_no_stream() {
 #[test]
 fn a_tail_reads_only_what_was_appended() {
     let store = tempfile::tempdir().unwrap();
-    let writer = EventWriter::new(store.path());
+    let writer =
+        EventWriter::with_limit(store.path(), Some(crate::config::DEFAULT_EVENTS_MAX_SIZE));
     writer.started(Path::new("/workspace"), &["build".into()], None);
     let id = writer.id().to_string();
 
@@ -154,7 +157,8 @@ fn an_event_keeps_its_meaning_when_a_newer_field_is_added() {
 fn a_live_stream_is_told_apart_from_a_finished_and_an_abandoned_one() {
     let store = tempfile::tempdir().unwrap();
 
-    let writer = EventWriter::new(store.path());
+    let writer =
+        EventWriter::with_limit(store.path(), Some(crate::config::DEFAULT_EVENTS_MAX_SIZE));
     writer.started(Path::new("/workspace"), &["build".into()], None);
     let mut live = SessionTail::new(store.path(), writer.id().to_string());
     live.read();
@@ -168,7 +172,8 @@ fn a_live_stream_is_told_apart_from_a_finished_and_an_abandoned_one() {
 
     // The build dies: the lock goes with the process, and no totals were ever
     // written.
-    let abandoned = EventWriter::new(store.path());
+    let abandoned =
+        EventWriter::with_limit(store.path(), Some(crate::config::DEFAULT_EVENTS_MAX_SIZE));
     abandoned.started(Path::new("/workspace"), &["build".into()], None);
     let id = abandoned.id().to_string();
     drop(abandoned);
@@ -226,4 +231,77 @@ fn tails_open_newest_first_and_no_more_than_asked() {
     let tails = open_tails(store.path(), 2);
     let ids: Vec<&str> = tails.iter().map(SessionTail::id).collect();
     assert_eq!(ids, ["300-1-cccc", "200-1-bbbb"]);
+}
+
+/// A cap smaller than the first row still leaves a readable stream.
+///
+/// The event that names the build is what makes the file worth anything:
+/// without it `mbx explain` skips the stream entirely and explains an older
+/// build instead, which is worse than saying the history was truncated.
+#[test]
+fn a_stream_records_what_it_is_before_any_cap_applies() {
+    let store = tempfile::tempdir().unwrap();
+    let writer = EventWriter::with_limit(store.path(), Some(0));
+    writer.started(Path::new("/workspace"), &["build".into()], None);
+    writer.action(
+        ActionOutcome::Miss,
+        Some("serde".into()),
+        1,
+        ActionDetail::default(),
+    );
+    writer.finished(serde_json::json!({ "hits": 0 }));
+
+    let paths = session_paths(store.path(), writer.id());
+    let events = parse_events(&std::fs::read_to_string(&paths.events).unwrap());
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::SessionStarted { .. })),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::Truncated { .. })),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::SessionFinished { .. })),
+        "{events:?}"
+    );
+}
+
+/// No limit records the whole build, for anyone diagnosing a miss on a
+/// workspace large enough to reach the default cap partway through.
+#[test]
+fn an_unlimited_stream_records_past_the_default_cap() {
+    let store = tempfile::tempdir().unwrap();
+    let writer = EventWriter::with_limit(store.path(), None);
+    writer.started(Path::new("/workspace"), &["build".into()], None);
+    for _ in 0..50 {
+        writer.action(
+            ActionOutcome::Hit,
+            Some("serde".into()),
+            1,
+            ActionDetail::default(),
+        );
+    }
+
+    let paths = session_paths(store.path(), writer.id());
+    let events = parse_events(&std::fs::read_to_string(&paths.events).unwrap());
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, SessionEvent::Truncated { .. })),
+        "an unlimited stream should not truncate"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, SessionEvent::Action { .. }))
+            .count(),
+        50
+    );
 }

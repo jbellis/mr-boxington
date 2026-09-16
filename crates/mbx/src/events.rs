@@ -32,14 +32,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 pub(crate) const SESSIONS_DIR: &str = "sessions/v1";
 const EVENT_VERSION: u8 = 1;
 
-/// The most one session may append.
-///
-/// A build compiling tens of thousands of crates would otherwise write a file
-/// the TUI has to read in full to show the last screen of it. Past this the
-/// counters carry on in memory and the summary is unaffected; only the row-level
-/// history stops.
-const MAX_EVENT_FILE_BYTES: u64 = 16 * 1024 * 1024;
-
 /// One line of a session's event stream.
 ///
 /// `serde(default)`-friendly and never `deny_unknown_fields`: a stream written
@@ -230,8 +222,13 @@ impl EventWriter {
     ///
     /// The file itself is not created until the first event, so a command that
     /// compiles nothing leaves nothing behind.
-    pub(crate) fn new(store: &Path) -> Self {
-        Self::with_cap(store, MAX_EVENT_FILE_BYTES)
+    /// A stream that stops recording rows after `cap` bytes.
+    ///
+    /// `None` records the whole build. The counters a build reports are kept in
+    /// memory and are complete either way; this bounds only the row-level
+    /// history that `mbx tui` and `mbx explain` read back.
+    pub(crate) fn with_limit(store: &Path, cap: Option<u64>) -> Self {
+        Self::with_cap(store, cap.unwrap_or(u64::MAX))
     }
 
     /// A stream that truncates after `cap` bytes of rows, for tests that need
@@ -284,10 +281,17 @@ impl EventWriter {
             Some(open) => open,
             None => state.insert(self.open()?),
         };
-        // The cap bounds rows, not the terminator: a finished stream has to be
-        // able to say so, or the TUI reads every long build as having died.
-        let terminal = matches!(event, SessionEvent::SessionFinished { .. });
-        if open.written >= self.cap && !terminal {
+        // The cap bounds rows, not the two events that make a stream readable:
+        // the one that says which build this is, and the one that says it
+        // finished. Without the first, a reader skips the stream and explains
+        // an older build; without the second, the TUI reads every long build as
+        // having died. A cap below the size of either would otherwise leave a
+        // file that says nothing except that something was dropped.
+        let structural = matches!(
+            event,
+            SessionEvent::SessionStarted { .. } | SessionEvent::SessionFinished { .. }
+        );
+        if open.written >= self.cap && !structural {
             if open.truncated {
                 return Ok(());
             }
