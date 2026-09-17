@@ -71,6 +71,30 @@ cargo metadata --no-deps --format-version 1
 Resolve the reported Cargo error, then retry the build. Help, cleanup, and
 explicitly disabled shim invocations still pass through without this probe.
 
+Outside a project, commands such as `cargo binstall` pass through to Cargo.
+`cargo build` in a directory with no manifest reports Cargo's own missing-manifest
+error. An alias that names a local package still requires verified build storage:
+
+```toml
+[alias]
+i = ["install", "--path", "/path/to/project with spaces"]
+```
+
+mbx reads alias arguments from Cargo configuration, preserving array elements,
+and retries workspace discovery for the package they name. It supports aliases
+from the configuration hierarchy, `CARGO_HOME`, and `CARGO_ALIAS_*` variables,
+including recursive aliases and Cargo's built-in shorthand commands.
+
+When metadata fails, alias recovery does not support configuration `include`
+files, aliases with `--config` overrides, directory-changing options, or unstable
+Cargo options. An alias mbx cannot read in full is refused rather than guessed
+when its storage cannot be verified; spell out the build command with its
+manifest or path instead of the alias to diagnose it. Commands that are not
+aliases keep passing through, so an `include` in your configuration does not
+stop `cargo binstall` working outside a project. mbx never reconstructs alias
+arguments from `cargo --list`, which loses the boundaries of arguments
+containing whitespace.
+
 ## Inspect a build
 
 ```sh
