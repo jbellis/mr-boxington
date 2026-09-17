@@ -551,6 +551,7 @@ fn cargo_with(
         // Same reason: a test asserting the default cross-checkout behaviour
         // must not read an answer out of the developer's environment.
         .env_remove("MBX_SHARE_OUT_DIR")
+        .env_remove("MBX_SHARE_WORKSPACE_ROOT")
         .env_remove("MBX_BUILD_SCRIPT_EXECUTION")
         .env_remove("MBX_LEARNED_INCREMENTAL")
         .env_remove("MBX_VERIFY")
@@ -2294,6 +2295,77 @@ fn a_workspace_member_reading_out_dir_costs_its_dependents_too() {
     assert!(!two_checkouts_share(Generated::Dependent, &[]));
 }
 
+/// Mapping the workspace root stops that cost at the crate that read the value.
+///
+/// The working directory is the only reason the rebuilt artifact differed, so
+/// removing it from what rustc records leaves the two checkouts producing the
+/// same bytes, and the crate above goes back to sharing. What the crate that
+/// read `OUT_DIR` does is unchanged: it is keyed to its checkout, and the pair
+/// below says so rather than reporting the dependent's hit as though the
+/// compilation had been shared.
+#[test]
+fn mapping_the_workspace_root_shares_the_dependents_of_a_checkout_specific_crate() {
+    let mapped = [("MBX_SHARE_WORKSPACE_ROOT", "1")];
+    assert!(
+        !two_checkouts_share(Generated::Include, &mapped),
+        "a compilation that reads OUT_DIR was shared between checkouts"
+    );
+    // By crate rather than by the session total: the fixture also compiles a
+    // build script, whose own compilation reads nothing remapped and shares
+    // between these checkouts either way, so a total would report this as
+    // fixed while the dependent went on recompiling.
+    let (store, _) = two_checkouts(Generated::Dependent, &mapped);
+    let outcomes = second_build_outcomes(store.path());
+    assert_eq!(
+        outcomes.get("outer").map(String::as_str),
+        Some("hit"),
+        "the dependent of a checkout-specific crate still recompiled: {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes.get("inner").map(String::as_str),
+        Some("miss"),
+        "the crate that read OUT_DIR was shared between checkouts: {outcomes:?}"
+    );
+}
+
+/// What the second checkout's build recorded for each crate it compiled.
+///
+/// A stream is named for the millisecond its build started, so sorting the
+/// names orders the two builds the way `events::session_ids` does. Modification
+/// times would not: a filesystem that records them coarsely can give both
+/// streams the same one, and the later build would be chosen by directory
+/// order.
+fn second_build_outcomes(store: &Path) -> std::collections::BTreeMap<String, String> {
+    let directory = store.join("actions/sessions/v1");
+    let mut streams: Vec<std::path::PathBuf> = std::fs::read_dir(&directory)
+        .expect("a session directory should exist")
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
+        .collect();
+    streams.sort();
+    assert_eq!(
+        streams.len(),
+        2,
+        "two builds should record one stream each, found {streams:?}"
+    );
+    std::fs::read_to_string(streams.pop().unwrap())
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|event| event["type"] == "action")
+        .filter_map(|event| {
+            Some((
+                event["crate_name"].as_str()?.to_string(),
+                event["outcome"]["kind"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
+}
+
 /// Build the same fixture in two checkouts, reporting whether the second one
 /// reused anything from the first.
 /// Whether the *crate* shares, which is what every caller here is asking.
@@ -2303,6 +2375,16 @@ fn a_workspace_member_reading_out_dir_costs_its_dependents_too() {
 /// compiles -- so it shares between these checkouts whatever the crate does,
 /// and counting it would answer a question nobody asked.
 fn two_checkouts_share(generated: Generated, settings: &[(&str, &str)]) -> bool {
+    let (_store, stats) = two_checkouts(generated, settings);
+    count(&stats, "hits") > 0
+}
+
+/// Build the same fixture in two checkouts of it, handing back the store so a
+/// caller can read what the second build recorded rather than only its totals.
+fn two_checkouts(
+    generated: Generated,
+    settings: &[(&str, &str)],
+) -> (tempfile::TempDir, serde_json::Value) {
     let store = tempfile::tempdir().unwrap();
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
@@ -2329,7 +2411,7 @@ fn two_checkouts_share(generated: Generated, settings: &[(&str, &str)]) -> bool 
         &reports.path().join("second.json"),
         &settings,
     );
-    count(&stats, "hits") > 0
+    (store, stats)
 }
 
 #[test]
