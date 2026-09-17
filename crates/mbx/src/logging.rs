@@ -22,13 +22,31 @@ impl Write for Stderr {
     }
 }
 
-/// Initialize the command logger while retaining its existing filter settings.
-pub fn init() {
-    env_logger::Builder::from_env(env_logger::Env::default().filter_or("MBX_LOG", "info"))
+/// portable-pty reports a pty it could not open or spawn into at error level
+/// before returning that failure to its caller, and mbx is the caller that
+/// decides what the failure means: an inline view that cannot start is not a
+/// build problem, because the build continues under plain Cargo. Keep the
+/// library quiet by default so its copy of the message does not reach a user
+/// whose build then succeeds. `MBX_LOG` replaces this filter outright, so
+/// `MBX_LOG=debug` still shows the reason the view stood down.
+pub(crate) const DEFAULT_FILTER: &str = "info,portable_pty=off";
+
+/// The logger `init` installs, built but not registered, so a test can ask
+/// what a run actually filters rather than what the default filter says.
+fn builder() -> env_logger::Builder {
+    let mut builder = env_logger::Builder::from_env(
+        env_logger::Env::default().filter_or("MBX_LOG", DEFAULT_FILTER),
+    );
+    builder
         .format_target(false)
         .format_timestamp(None)
-        .target(env_logger::Target::Pipe(Box::new(Stderr)))
-        .init();
+        .target(env_logger::Target::Pipe(Box::new(Stderr)));
+    builder
+}
+
+/// Initialize the command logger while retaining its existing filter settings.
+pub fn init() {
+    builder().init();
 }
 
 pub(crate) fn note(message: &str) {
@@ -67,6 +85,30 @@ impl Drop for Capture {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use log::Log;
+
+    fn enabled(logger: &env_logger::Logger, target: &str, level: log::Level) -> bool {
+        logger.enabled(&log::Metadata::builder().target(target).level(level).build())
+    }
+
+    #[test]
+    fn a_pty_failure_mbx_recovers_from_is_not_announced_to_the_user() {
+        // The assertion is about what a run without `MBX_LOG` filters, so a
+        // developer who exports one is testing their own filter instead.
+        if std::env::var_os("MBX_LOG").is_some() {
+            return;
+        }
+        let logger = builder().build();
+        assert!(!enabled(&logger, "portable_pty", log::Level::Error));
+        assert!(enabled(&logger, "mbx::cli::cargo", log::Level::Info));
+        assert!(!enabled(&logger, "mbx::cli::cargo", log::Level::Debug));
+    }
+
+    #[test]
+    fn an_explicit_filter_can_ask_for_the_pty_report() {
+        let logger = env_logger::Builder::new().parse_filters("debug").build();
+        assert!(enabled(&logger, "portable_pty", log::Level::Error));
+    }
 
     #[test]
     fn background_notes_and_logger_writes_share_the_screen_queue() {
