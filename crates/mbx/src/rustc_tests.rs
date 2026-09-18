@@ -1290,3 +1290,80 @@ fn incremental_state_is_discarded_only_past_its_budget() {
     );
     assert!(fresh.is_dir());
 }
+
+/// A bare `--target` is a custom specification when rustc would find a file
+/// for it: in the sysroot given by `--sysroot`, in the one implied by the
+/// compiler's location, but not for a name with no such file. A path target
+/// is the parser's case and never reported here.
+#[test]
+fn custom_target_resolution_follows_the_sysroot() {
+    let directory = tempfile::tempdir().unwrap();
+    let sysroot = directory.path().join("toolchain");
+    std::fs::create_dir_all(sysroot.join("bin")).unwrap();
+    std::fs::create_dir_all(sysroot.join("lib/rustlib/my-custom-target")).unwrap();
+    std::fs::write(
+        sysroot.join("lib/rustlib/my-custom-target/target.json"),
+        "{}",
+    )
+    .unwrap();
+    let rustc: OsString = sysroot.join("bin/rustc").into();
+    let args = |list: &[&str]| -> Vec<OsString> { list.iter().map(OsString::from).collect() };
+
+    assert!(custom_target_may_resolve(
+        &rustc,
+        &args(&["--target=my-custom-target", "src.rs"])
+    ));
+    assert!(custom_target_may_resolve(
+        &rustc,
+        &args(&["--target", "my-custom-target", "src.rs"])
+    ));
+    assert!(!custom_target_may_resolve(
+        &rustc,
+        &args(&["--target=x86_64-unknown-linux-gnu", "src.rs"])
+    ));
+    assert!(!custom_target_may_resolve(&rustc, &args(&["src.rs"])));
+    assert!(!custom_target_may_resolve(
+        &rustc,
+        &args(&["--target=/somewhere/custom.json", "src.rs"])
+    ));
+
+    // A non-UTF-8 argument earlier in the line does not hide the target.
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStringExt as _;
+        let odd = OsString::from_vec(vec![b'-', b'-', b'c', b'f', b'g', b'=', 0xff]);
+        assert!(custom_target_may_resolve(
+            &rustc,
+            &[odd, "--target=my-custom-target".into(), "src.rs".into()]
+        ));
+    }
+
+    // The target may arrive through a response file; the shim scans the
+    // expanded line, as the parser does.
+    let argfile = directory.path().join("rustc.args");
+    std::fs::write(&argfile, "--target=my-custom-target\n").unwrap();
+    let expanded =
+        RustcInvocation::expand_arguments(&args(&[&format!("@{}", argfile.display()), "src.rs"]))
+            .unwrap();
+    assert!(custom_target_may_resolve(&rustc, &expanded));
+
+    // A compiler outside a toolchain directory, such as a rustup proxy, does
+    // not imply a sysroot, and this one cannot be asked either. With nowhere
+    // to look, the name is not proven built in.
+    let elsewhere: OsString = directory.path().join("other/bin/rustc").into();
+    assert!(custom_target_may_resolve(
+        &elsewhere,
+        &args(&["--target=my-custom-target", "src.rs"])
+    ));
+    // A built-in name with no spec file under an explicit sysroot is built in.
+    let empty_sysroot = format!("--sysroot={}", directory.path().join("other").display());
+    assert!(!custom_target_may_resolve(
+        &elsewhere,
+        &args(&["--target=my-custom-target", &empty_sysroot, "src.rs"])
+    ));
+    let sysroot_flag = format!("--sysroot={}", sysroot.display());
+    assert!(custom_target_may_resolve(
+        &elsewhere,
+        &args(&["--target=my-custom-target", &sysroot_flag, "src.rs"])
+    ));
+}

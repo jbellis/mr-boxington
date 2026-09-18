@@ -515,8 +515,17 @@ fn guidance(kind: &str) -> &'static str {
         "unportable-native-link" => {
             "This link would embed a path, a timestamp, or a file mbx does not store, so another checkout could not use its result."
         }
-        "unsupported-search-path" | "native-library" => {
-            "A native dependency or search path is not a precise compiler input, so mbx cannot safely reuse this action."
+        "unsupported-search-path" => {
+            "A native search path kind is not a precise compiler input, so mbx cannot safely reuse this action."
+        }
+        "native-library" => {
+            "This linked program or proc macro hands a native library to its linker, whose search mbx does not model. A library compile that names one is cached: a bundled `-l static` archive it resolves is hashed into the key, and dylib, framework, link-arg, plain, and unbundled static flags are keyed as text."
+        }
+        "missing-native-library" => {
+            "A `-l static` library was not found in any `-L` search directory, so there is no archive for mbx to hash. Check the build script's `cargo:rustc-link-search` directive."
+        }
+        "custom-target-native-library" => {
+            "A custom target specification chooses its own static-library file names, so mbx cannot tell which archive a `-l static` flag makes rustc read."
         }
         "unknown-flag" | "unknown-codegen-option" => {
             "The toolchain passed an option this mbx adapter does not model. Check for a newer mbx release before reporting it."
@@ -605,6 +614,8 @@ mod tests {
             "unsupported-crate-type",
             "unsupported-search-path",
             "native-library",
+            "missing-native-library",
+            "custom-target-native-library",
             "unportable-native-link",
             "ambiguous-output-name",
             "unknown-flag",

@@ -168,8 +168,16 @@ pub(crate) fn compile(
     // A platform without native-link action caching still needs to observe a
     // build-script executable so execution caching can key it by its exact
     // bytes. Parsing it is safe: the linked output itself is not published.
+    // Scanned after response-file expansion, so a `--target` inside an
+    // `@argfile` is seen; an expansion the parser would refuse is left as is,
+    // since parsing fails on it below anyway.
+    let expanded = RustcInvocation::expand_arguments(arguments);
     let options =
-        ParseOptions::caching_native_links(cache_native_links || execution_only_build_script);
+        ParseOptions::caching_native_links(cache_native_links || execution_only_build_script)
+            .with_custom_target_search(custom_target_may_resolve(
+                rustc,
+                expanded.as_deref().unwrap_or(arguments),
+            ));
     // Appended before anything parses: the debug-map rule inside the parser is
     // exactly what this flag satisfies, so an invocation that would bypass
     // without it has to carry it going in.
@@ -961,6 +969,94 @@ fn compile_execution_only_build_script(
         let _ = replay_output(&output);
     }
     Ok(exit_code(output.status))
+}
+
+/// Whether rustc could load this invocation's bare `--target` name from a
+/// custom target specification instead of a built-in target.
+///
+/// rustc tries its built-in targets first, then `<dir>/<NAME>.json` under each
+/// `RUST_TARGET_PATH` directory, then `lib/rustlib/<NAME>/target.json` in the
+/// sysroot. A specification found in either place chooses its own
+/// static-library file names, so the parser is told not to guess them. A
+/// `--target` that is already a path is the parser's own case.
+///
+/// The sysroot is `--sysroot` when given. Otherwise it is the directory above
+/// the compiler's `bin` when that holds a `lib/rustlib`, which is what a
+/// toolchain's own rustc sits in; a compiler laid out any other way, such as
+/// a rustup proxy at `~/.cargo/bin/rustc`, is asked for its sysroot.
+fn custom_target_may_resolve(rustc: &OsStr, arguments: &[OsString]) -> bool {
+    let Some(target) = flag_value(arguments, "--target") else {
+        return false;
+    };
+    if target.ends_with(".json") || target.contains(['/', '\\']) {
+        return false;
+    }
+    let under_target_path = std::env::var_os("RUST_TARGET_PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths)
+            .any(|directory| directory.join(format!("{target}.json")).is_file())
+    });
+    if under_target_path {
+        return true;
+    }
+    // With no sysroot to look in, the name cannot be proven built in, so it
+    // is reported as possibly custom and `-l static` bypasses: the only job
+    // of this check is to never guess a file name rustc would not use.
+    let Some(sysroot) = flag_value(arguments, "--sysroot")
+        .map(PathBuf::from)
+        .or_else(|| compiler_sysroot(rustc))
+    else {
+        return true;
+    };
+    sysroot
+        .join("lib/rustlib")
+        .join(&target)
+        .join("target.json")
+        .is_file()
+}
+
+/// The sysroot of the compiler the shim was handed. See
+/// [`custom_target_may_resolve`] for the order.
+///
+/// A compiler whose layout does not show its sysroot is asked for it. That
+/// is a rustup proxy at `~/.cargo/bin/rustc`, or any compiler installed
+/// apart from its libraries; rustup's own `cargo` puts the toolchain's real
+/// `rustc` first on `PATH`, so the usual build never gets here.
+fn compiler_sysroot(rustc: &OsStr) -> Option<PathBuf> {
+    if let Ok(executable) = resolve_executable(rustc)
+        && let Some(root) = executable.parent().and_then(Path::parent)
+        && root.join("lib/rustlib").is_dir()
+    {
+        return Some(root.to_path_buf());
+    }
+    let output = Command::new(rustc)
+        .args(["--print", "sysroot"])
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| PathBuf::from(String::from_utf8_lossy(&output.stdout).trim()))
+}
+
+/// The value of `--flag=VALUE` or `--flag VALUE`, whichever comes first.
+fn flag_value(arguments: &[OsString], flag: &str) -> Option<String> {
+    let mut arguments = arguments.iter();
+    while let Some(argument) = arguments.next() {
+        if argument == flag {
+            return arguments.next()?.to_str().map(str::to_string);
+        }
+        // A non-UTF-8 argument is skipped, not the end of the scan: the
+        // parser refuses the invocation for it later, and the target must
+        // still be found so that refusal is the only reason it bypasses.
+        if let Some(value) = argument
+            .to_str()
+            .and_then(|argument| argument.strip_prefix(flag))
+            .and_then(|value| value.strip_prefix('='))
+        {
+            return Some(value.to_string());
+        }
+    }
+    None
 }
 
 fn compiler_command(rustc: &OsStr, wrapper_argument: Option<&OsStr>) -> Command {
