@@ -436,6 +436,9 @@ struct VerifiedBlob {
     path: PathBuf,
     len: u64,
     modified: SystemTime,
+    /// The file object on Unix, so a blob replaced by another file of the
+    /// same length and modification time is noticed.
+    object: Option<(u64, u64)>,
 }
 
 impl VerifiedBlob {
@@ -447,6 +450,7 @@ impl VerifiedBlob {
             path: path.to_path_buf(),
             len: metadata.len(),
             modified: metadata.modified().ok()?,
+            object: file_object(&metadata),
         })
     }
 
@@ -455,8 +459,22 @@ impl VerifiedBlob {
         let Ok(metadata) = std::fs::metadata(&self.path) else {
             return false;
         };
-        metadata.len() == self.len && metadata.modified().is_ok_and(|now| now == self.modified)
+        metadata.len() == self.len
+            && metadata.modified().is_ok_and(|now| now == self.modified)
+            && file_object(&metadata) == self.object
     }
+}
+
+/// The device and inode of a file, where the platform reports them.
+#[cfg(unix)]
+fn file_object(metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt as _;
+    Some((metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_object(_metadata: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
 }
 
 #[derive(Debug, Clone, Default)]
@@ -2151,7 +2169,9 @@ impl CacheAgent {
             if let Some(path) = self.find_verified_blob(digest)? {
                 path
             } else {
+                let timer = AtomicDurationTimer::start(&self.stats.local_cas_write_duration_ns);
                 let path = self.cas.store_file(digest, source)?;
+                drop(timer);
                 self.remember_verified_blob(digest, &path);
                 self.stats.stores.fetch_add(1, Ordering::Relaxed);
                 self.stats
@@ -2186,7 +2206,22 @@ impl CacheAgent {
             }
             self.verified_blobs.lock().unwrap().remove(digest);
         }
-        let path = self.cas.find(digest)?;
+        // Blobs are published by rename without an fsync, so a crash can leave
+        // one torn under a valid name. It is not restored from, and it is not
+        // an error either: the compilation runs again and its publication
+        // replaces the bad bytes, the same way a blob that was never stored
+        // gets there. Reporting it as a failure would surface a warning for a
+        // build that is behaving correctly.
+        let path = match self.cas.find(digest) {
+            Ok(path) => path,
+            Err(error) => {
+                warn!(
+                    "local CAS blob {} is not restorable and will be republished: {error}",
+                    digest.hash
+                );
+                return Ok(None);
+            }
+        };
         if let Some(path) = &path {
             self.remember_verified_blob(digest, path);
         }

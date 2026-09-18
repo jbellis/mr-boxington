@@ -1120,6 +1120,7 @@ fn record_prediction(
     flight: Option<&crate::scheduler::Flight>,
     remote_claim: Option<&str>,
 ) {
+    let _phase = crate::phase_timing::phase("predict");
     let Ok(payload) = serde_json::to_string(prediction) else {
         return;
     };
