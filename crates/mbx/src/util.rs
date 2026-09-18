@@ -6,15 +6,32 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 /// Capture clock-independent snapshots for compiler inputs known up front.
+///
+/// A source file is snapshotted by its metadata change token, which catches a
+/// rewrite that keeps the length and restores the mtime. An artifact another
+/// compilation in this build produced is snapshotted by content instead: a
+/// dependent Cargo pipelines behind a crate's metadata reads the `.rmeta`
+/// while that crate's rustc is still running, and rustc hardlinks the file
+/// into its incremental session directory when it finishes, which changes the
+/// token without changing a byte. Nothing rewrites an artifact in place while
+/// Cargo holds the build directory, so bytes, length, and file object are the
+/// comparison that describes what the dependent actually read. The `source`
+/// is always a source, whatever its extension is spelled like.
 #[cfg(unix)]
 pub(crate) fn snapshot_compiler_inputs<'a>(
     paths: impl IntoIterator<Item = &'a Path>,
+    source: Option<&Path>,
 ) -> std::io::Result<BTreeMap<PathBuf, FileSnapshot>> {
     let digests = crate::session::file_digest_cache();
     paths
         .into_iter()
         .map(|path| {
-            let snapshot = FileSnapshot::capture_with_cache(path, digests).map_err(|error| {
+            let snapshot = if source != Some(path) && is_compiler_artifact(path) {
+                FileSnapshot::capture_content_with_cache(path, digests)
+            } else {
+                FileSnapshot::capture_with_cache(path, digests)
+            };
+            let snapshot = snapshot.map_err(|error| {
                 std::io::Error::new(
                     error.kind(),
                     format!(
@@ -37,9 +54,20 @@ pub(crate) fn snapshot_compiler_inputs<'a>(
         .collect()
 }
 
+/// Whether a compiler input is an artifact this build produced rather than a
+/// source: Rust metadata, an rlib, or a proc-macro or dynamic library.
+#[cfg(unix)]
+fn is_compiler_artifact(path: &Path) -> bool {
+    matches!(
+        path.extension().and_then(|extension| extension.to_str()),
+        Some("rmeta" | "rlib" | "so" | "dylib" | "dll")
+    )
+}
+
 #[cfg(not(unix))]
 pub(crate) fn snapshot_compiler_inputs<'a>(
     _paths: impl IntoIterator<Item = &'a Path>,
+    _source: Option<&Path>,
 ) -> std::io::Result<BTreeMap<PathBuf, FileSnapshot>> {
     Ok(BTreeMap::new())
 }
@@ -514,7 +542,7 @@ mod tests {
     fn compiler_input_snapshot_fails_closed() {
         let directory = tempfile::tempdir().unwrap();
         let missing = directory.path().join("missing-input");
-        let error = snapshot_compiler_inputs([missing.as_path()]).unwrap_err();
+        let error = snapshot_compiler_inputs([missing.as_path()], None).unwrap_err();
         assert!(
             error
                 .to_string()
