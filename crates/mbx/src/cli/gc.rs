@@ -1,5 +1,6 @@
 use super::cache::{
-    GcActionStoreReport, GcIncrementalReport, GcReport, GcTargetReport, print_json,
+    GcActionStoreReport, GcGeneratedReport, GcIncrementalReport, GcReport, GcTargetReport,
+    print_json,
 };
 use crate::config::{Config, RetentionSettings};
 use crate::{store, target};
@@ -76,7 +77,22 @@ pub(super) fn run(
             }
         }
     };
-    let target_budget = target_budget(retention, max_bytes, incremental.remaining_bytes);
+    // Generated source trees share the learned incremental budget: both are
+    // per-checkout state that a compilation reads, and both come back on
+    // their own when evicted.
+    let generated = collect_generated(
+        config,
+        incremental_budget(retention, max_bytes)
+            .map(|budget| budget.saturating_sub(incremental.remaining_bytes)),
+        retention.target_max_age,
+        dry_run,
+    );
+    // What survives counts against the combined budget the same as learned
+    // incremental state: bytes on the disk the limit was set for.
+    let reserved_bytes = incremental
+        .remaining_bytes
+        .saturating_add(generated.remaining_bytes);
+    let target_budget = target_budget(retention, max_bytes, reserved_bytes);
     let pruned = target::collect(
         &config.target.root,
         target_budget,
@@ -93,7 +109,7 @@ pub(super) fn run(
     let store_budget = store_budget(
         retention,
         max_bytes,
-        projected_target_bytes.saturating_add(incremental.remaining_bytes),
+        projected_target_bytes.saturating_add(reserved_bytes),
     );
     // Small and never load-bearing: a swept flight costs at most one
     // compilation that would have been a hit, so it is not part of the
@@ -111,7 +127,7 @@ pub(super) fn run(
     let outcome = match outcome {
         Ok(outcome) => outcome,
         Err(error) => {
-            let mut freed_bytes = incremental.removed_bytes;
+            let mut freed_bytes = incremental.removed_bytes + generated.removed_bytes;
             match pruned {
                 Ok(pruned) => {
                     // Credit what the targets gave back even though the store
@@ -128,6 +144,7 @@ pub(super) fn run(
             record_collection(&store, 0, freed_bytes, dry_run);
             if !json {
                 print_incremental_removals(&incremental, dry_run);
+                print_generated_removals(&generated, dry_run);
             }
             return Err(error);
         }
@@ -135,7 +152,9 @@ pub(super) fn run(
     record_collection(
         &store,
         outcome.removed_bytes,
-        pruned.as_ref().map_or(0, |pruned| pruned.removed_bytes) + incremental.removed_bytes,
+        pruned.as_ref().map_or(0, |pruned| pruned.removed_bytes)
+            + incremental.removed_bytes
+            + generated.removed_bytes,
         dry_run,
     );
     if json {
@@ -170,18 +189,81 @@ pub(super) fn run(
                 skipped_active_directories: incremental.skipped_active_directories,
                 untracked_directories: incremental.untracked_directories,
             },
+            generated: GcGeneratedReport {
+                removed_directories: generated.removed_directories,
+                removed_bytes: generated.removed_bytes,
+                remaining_directories: generated.remaining_directories,
+                remaining_bytes: generated.remaining_bytes,
+            },
         })?;
     } else {
         print_gc_store_outcome(&outcome, dry_run);
         // This collection is independent of the managed-target walk below,
         // so report it even if that walk failed.
         print_incremental_removals(&incremental, dry_run);
+        print_generated_removals(&generated, dry_run);
         let pruned = pruned?;
         if pruned.removed_views > 0 {
             println!("{}", target_removals(&pruned, dry_run));
         }
     }
     Ok(())
+}
+
+/// Collect the stable copies of build-script output nothing has used lately.
+///
+/// Aged like target directories: a copy is only ever reached through a
+/// compilation in some checkout, so what keeps a checkout's target also keeps
+/// what its compilations read. A failure is logged and counts as nothing
+/// freed; the trees are small beside what the rest of a sweep handles.
+fn collect_generated(
+    config: &Config,
+    max_bytes: Option<u64>,
+    max_age: Option<std::time::Duration>,
+    dry_run: bool,
+) -> crate::out_dir::PruneOutcome {
+    match crate::out_dir::collect(
+        &config.cache_dir.join(crate::out_dir::ROOT),
+        max_bytes,
+        max_age,
+        dry_run,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            log::warn!("generated source trees were not collected: {error}");
+            // Still on the disk, so still against the budget: measure what
+            // remains rather than let a failed walk count as empty space. A
+            // root that cannot be listed cannot be measured either, and the
+            // sweep goes on without the number rather than not at all, since
+            // one unreadable directory must not stop every other collection.
+            match crate::out_dir::stats(&config.cache_dir.join(crate::out_dir::ROOT)) {
+                Some(outcome) => outcome,
+                None => {
+                    log::warn!(
+                        "generated source trees could not be measured; this sweep's combined budget does not account for them"
+                    );
+                    crate::out_dir::PruneOutcome::default()
+                }
+            }
+        }
+    }
+}
+
+fn print_generated_removals(outcome: &crate::out_dir::PruneOutcome, dry_run: bool) {
+    if outcome.removed_directories > 0 {
+        println!("{}", generated_removals(outcome, dry_run));
+    }
+}
+
+/// One line describing the generated source trees a sweep freed.
+fn generated_removals(outcome: &crate::out_dir::PruneOutcome, dry_run: bool) -> String {
+    let verb = if dry_run { "would remove" } else { "removed" };
+    format!(
+        "{verb} {} generated source trees ({} logical); {} logical remain",
+        outcome.removed_directories,
+        ByteSize::b(outcome.removed_bytes).display().iec(),
+        ByteSize::b(outcome.remaining_bytes).display().iec(),
+    )
 }
 
 fn print_incremental_removals(outcome: &crate::incremental::PruneOutcome, dry_run: bool) {
@@ -313,7 +395,12 @@ pub(super) fn sweep_store(config: &Config, retention: &RetentionSettings) -> Swe
                 let incremental_bytes =
                     crate::incremental::stats(&config.cache_dir.join("incremental"))
                         .map_or(0, |stats| stats.bytes);
-                target_bytes.saturating_add(incremental_bytes)
+                let generated_bytes =
+                    crate::out_dir::stats(&config.cache_dir.join(crate::out_dir::ROOT))
+                        .map_or(0, |stats| stats.remaining_bytes);
+                target_bytes
+                    .saturating_add(incremental_bytes)
+                    .saturating_add(generated_bytes)
             });
             let store_budget = store_budget(retention, config.gc.max_bytes, non_store_bytes);
             crate::scheduler::prune_flights(&config.cache_dir);
@@ -550,6 +637,21 @@ pub(super) fn prune_targets(
             (0, remaining)
         }
     };
+    let generated = collect_generated(
+        config,
+        incremental_budget(retention, store_reserve)
+            .map(|budget| budget.saturating_sub(incremental_remaining)),
+        retention.target_max_age,
+        false,
+    );
+    if generated.removed_directories > 0 {
+        crate::session::note(&format!(
+            "mbx[gc]: {}",
+            generated_removals(&generated, false)
+        ));
+    }
+    let incremental_bytes = incremental_bytes.saturating_add(generated.removed_bytes);
+    let incremental_remaining = incremental_remaining.saturating_add(generated.remaining_bytes);
     let target_budget = target_budget(retention, store_reserve, incremental_remaining);
     match target::collect(
         &config.target.root,

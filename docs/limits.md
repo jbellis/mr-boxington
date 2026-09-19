@@ -259,30 +259,72 @@ System roots are exempt from manifests. Enumerating an SDK on every compile
 costs more than the risk, and anything read from one is digested like any other
 input.
 
-## `OUT_DIR` sharing remaps generated source paths
+<span id="out-dir-sharing-remaps-generated-source-paths"></span>
+<span id="out-dir-sharing-copies-generated-sources-under-the-cache"></span>
 
-A generated source path can contain an absolute checkout-specific `OUT_DIR`.
-A compilation that reads one is cached for the checkout it ran in, and
-recompiles the first time each new checkout builds it. mbx cannot tell whether
-such an artifact depends on the path: reading the outputs back finds a path
-that was kept verbatim, but not one the crate derived a value from.
+## Share compilations that read `OUT_DIR` {#out-dir-sharing}
 
-mbx remaps the path so rustc records a placeholder instead, which is what lets
-a dependency recompiled in a second checkout come out byte-identical, so the
-crates above it still share. Two cases stay checkout-specific anyway. A
-workspace member records its own directory, which `MBX_SHARE_WORKSPACE_ROOT`
-covers and the `OUT_DIR` remapping does not. A crate that keeps the value it
-read through `env!` embeds it. Both produce a different artifact in each
-checkout, and their dependents recompile with them.
+By default, mbx can reuse Rust compilations across checkouts when their
+build-script output matches. This includes crates that load generated code:
 
-Set `MBX_SHARE_OUT_DIR=0` to keep generated source paths literal in debug
-information, at the cost of that dependent sharing.
+```rust
+include!(concat!(env!("OUT_DIR"), "/generated.rs"));
+```
 
-This covers C and C++ as well as Rust. A build script that generates headers
-into `OUT_DIR` passes that directory to its own compilations, which record it
-in debug information, so the same remapping applies: rustc is told
-`--remap-path-prefix` and the C compiler `-fdebug-prefix-map`.
-`MBX_SHARE_OUT_DIR=0` turns both off together.
+Cargo normally places `OUT_DIR` under each checkout's target directory. That
+path becomes a cache-key input when a crate reads it, causing a miss in a new
+checkout even if `generated.rs` is identical. mbx copies the output to
+`out-dirs/v1/<digest>` under its cache and gives rustc that shared path as
+`OUT_DIR`. The digest covers the directory layout, file names, contents, and
+executable bits. Matching output trees therefore use the same path and can
+reuse the compilation when its other inputs also match.
+
+The literal `OUT_DIR` value remains part of the key. Code that stores the path
+or derives a value from it sees the same value in both checkouts.
+
+### When sharing is unavailable
+
+- **Generated output differs.** A build script that embeds a checkout path in
+  its output produces a different tree and cache key for each checkout.
+- **The source scan misses the reference.** mbx scans Rust files beneath the
+  compiler's input file directory. References found only in external sources,
+  skipped directories, or beyond the scan limit may leave rustc using Cargo's
+  original `OUT_DIR`.
+- **The output cannot be copied.** Trees containing symlinks or unsupported
+  entries are left in place. Copy errors also fall back to Cargo's `OUT_DIR`.
+- **Cache locations differ.** Reuse across machines requires the same absolute
+  cache path, as well as matching output and other compilation inputs.
+
+### Compatibility and cleanup
+
+For eligible compilations, `env!("OUT_DIR")` names the cached copy. Its files
+and directories are marked read-only; code that needs to modify generated
+output during compilation should disable sharing. Build scripts still write
+their output to the directory Cargo gives them before mbx makes the copy.
+
+`mbx cache stats` reports these copies as **generated source trees**. Automatic
+collection and `mbx gc` remove copies according to `target.max_age`, based on
+when mbx last used them for a compilation or cache lookup. The copies share
+`gc.incremental_max_size` with learned incremental state, least recently used
+first, and the remaining copies count toward `gc.max_total_size`. A compilation holds a lease on
+the copy it reads until rustc exits, and collection leaves a leased copy in
+place. A build Cargo considers fresh does not refresh the use timestamp. mbx
+recreates an evicted copy when a later compilation needs it, so an embedded
+`OUT_DIR` path should not be treated as permanent runtime storage.
+
+To preserve Cargo's original `OUT_DIR` and literal generated source paths:
+
+```sh
+MBX_SHARE_OUT_DIR=0 mbx build
+```
+
+Or set `share_out_dir = false` in the workspace's `.mbx.toml`. Rust
+compilations that read `OUT_DIR` then remain checkout-specific.
+
+The setting also controls generated source path remapping in debug information:
+`--remap-path-prefix` for Rust and `-fdebug-prefix-map` for C/C++. C and C++
+compilations use the original build-script output directory; the shared copy
+described above is supplied to rustc.
 
 ## A rebuilt workspace crate records its checkout
 
@@ -295,8 +337,8 @@ because what it consumes differs.
 Most builds never see this: a workspace crate that can be restored is restored,
 byte for byte. It shows up where a crate has to be compiled in each checkout
 anyway, which is what a compilation keyed to its checkout does. One crate low in
-the graph that reads `OUT_DIR` or `CARGO_MANIFEST_DIR` can carry most of a large
-workspace with it.
+the graph that reads `CARGO_MANIFEST_DIR`, or reads `OUT_DIR` without sharing,
+can cause much of a large workspace to rebuild.
 
 Set `MBX_SHARE_WORKSPACE_ROOT=1` (or `share_workspace_root = true`) to map the
 workspace root to a placeholder, which leaves the two checkouts producing the

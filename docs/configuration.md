@@ -170,12 +170,14 @@ credentials, diagnostics, target placement, and garbage collection are not
 accepted from a repository-owned file. mbx reports an error for an unsupported
 or misspelled workspace setting.
 
-`share_out_dir = true` is the global default. It remaps generated source paths
-rather than making a compilation that reads `OUT_DIR` shareable: that
-compilation is cached for the checkout it ran in either way. A workspace may
-set it to false when generated source paths must remain literal in debug
-information. This applies to C and C++ objects as well as Rust artifacts,
-because a build script's generated headers reach both.
+`share_out_dir = true` is the global default. It lets Rust compilations reuse
+cached artifacts across checkouts with matching build-script output by giving
+rustc a shared copy of that output as `OUT_DIR`. It also remaps generated source
+paths in Rust and C/C++ debug information. Set it to false when a build needs
+Cargo's original `OUT_DIR` or literal generated source paths; Rust compilations
+that read `OUT_DIR` then remain checkout-specific. See
+[`OUT_DIR` sharing](/limits#out-dir-sharing) for eligibility and compatibility
+details.
 
 `share_workspace_root = false` is the global default. Setting it to true maps
 the workspace root to a placeholder wherever rustc records a source path, so a
