@@ -280,6 +280,193 @@ fn a_successful_migration_removes_old_outputs_after_placement() {
     assert_eq!(stats(&config.target.root).unwrap().views, 1);
 }
 
+#[test]
+fn adopting_an_existing_target_keeps_its_outputs_under_the_managed_root() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = test_config(directory.path(), true);
+    let workspace = checkout(directory.path(), "project");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("debug/artifact"), b"old output").unwrap();
+
+    assert!(can_move_existing(&config, &workspace, &target));
+    let outcome = adopt_existing(&config, &workspace, &target, false).unwrap();
+    let managed = outcome.managed.clone().unwrap();
+
+    assert_eq!(outcome.adopted_bytes, 10);
+    assert_eq!(std::fs::read_link(&target).unwrap(), managed);
+    assert_eq!(
+        std::fs::read(managed.join("debug/artifact")).unwrap(),
+        b"old output"
+    );
+    assert_eq!(
+        std::fs::read(target.join("debug/artifact")).unwrap(),
+        b"old output",
+        "the outputs should still be reachable through the link"
+    );
+    assert!(view_record_path(&config.target.root, &workspace).exists());
+    assert_eq!(stats(&config.target.root).unwrap().views, 1);
+    let leftovers: Vec<_> = std::fs::read_dir(&workspace)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .filter(|name| name != "target")
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no backup should remain: {leftovers:?}"
+    );
+}
+
+#[test]
+fn a_declined_adoption_restores_existing_outputs() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = test_config(directory.path(), true);
+    let workspace = checkout(directory.path(), "project");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("artifact"), b"old output").unwrap();
+
+    let outcome = adopt_existing_with(&config, &workspace, &target, false, || None).unwrap();
+
+    assert_eq!(outcome, AdoptionOutcome::default());
+    assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
+    assert_eq!(
+        std::fs::read(target.join("artifact")).unwrap(),
+        b"old output"
+    );
+    assert!(!view_record_path(&config.target.root, &workspace).exists());
+}
+
+#[test]
+fn adoption_refuses_a_directory_cargo_is_using() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = test_config(directory.path(), true);
+    let workspace = checkout(directory.path(), "project");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(target.join("debug")).unwrap();
+    std::fs::write(target.join("debug/artifact"), b"old output").unwrap();
+    let lock_path = target.join("debug/.cargo-lock");
+    std::fs::write(&lock_path, b"").unwrap();
+    let mut build = fslock::LockFile::open(&lock_path).unwrap();
+    build.lock().unwrap();
+
+    let error = adopt_existing(&config, &workspace, &target, false).unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("Cargo is using"),
+        "unexpected error: {error:#}"
+    );
+    assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
+    assert_eq!(
+        std::fs::read(target.join("debug/artifact")).unwrap(),
+        b"old output"
+    );
+    assert!(!view_record_path(&config.target.root, &workspace).exists());
+    assert!(!view_dir(&config.target.root, &workspace).exists());
+    // Closed, not merely unlocked: Cargo closes its lock when it finishes,
+    // and Windows will not rename a directory holding an open handle.
+    drop(build);
+
+    let outcome = adopt_existing(&config, &workspace, &target, false).unwrap();
+
+    assert!(outcome.managed.is_some());
+    assert_eq!(
+        std::fs::read(target.join("debug/artifact")).unwrap(),
+        b"old output"
+    );
+}
+
+#[test]
+fn adoption_sees_a_lock_in_an_editors_cross_compiled_profile() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = test_config(directory.path(), true);
+    let workspace = checkout(directory.path(), "project");
+    let target = workspace.join("target");
+    // Three levels down: an editor's own target directory, a target triple,
+    // and the profile. Cargo's outputs beside a lock are never entered, so a
+    // lock hidden inside one of those must not count either way.
+    let profile = target.join("rust-analyzer/x86_64-unknown-linux-gnu/debug");
+    std::fs::create_dir_all(profile.join("deps")).unwrap();
+    std::fs::write(profile.join(".cargo-lock"), b"").unwrap();
+    std::fs::write(profile.join("deps/.cargo-lock"), b"").unwrap();
+    let mut decoy = fslock::LockFile::open(&profile.join("deps/.cargo-lock")).unwrap();
+    decoy.lock().unwrap();
+    assert!(
+        cargo_locks(&target).unwrap().is_some(),
+        "a lock inside an output directory is not Cargo's"
+    );
+    // The same name directly under the target directory is a custom profile,
+    // whose lock counts.
+    std::fs::create_dir_all(target.join("deps")).unwrap();
+    std::fs::write(target.join("deps/.cargo-lock"), b"").unwrap();
+    let mut custom = fslock::LockFile::open(&target.join("deps/.cargo-lock")).unwrap();
+    custom.lock().unwrap();
+    assert!(
+        cargo_locks(&target).unwrap().is_none(),
+        "a custom profile named like an output directory still holds Cargo's lock"
+    );
+    drop(custom);
+    let mut build = fslock::LockFile::open(&profile.join(".cargo-lock")).unwrap();
+    build.lock().unwrap();
+
+    let error = adopt_existing(&config, &workspace, &target, false).unwrap_err();
+
+    assert!(
+        format!("{error:#}").contains("Cargo is using"),
+        "unexpected error: {error:#}"
+    );
+    assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
+}
+
+#[test]
+fn an_occupied_view_leaves_the_outputs_where_they_are() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = test_config(directory.path(), true);
+    let workspace = checkout(directory.path(), "project");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("artifact"), b"old output").unwrap();
+    // A view with no record but with contents is not this adoption's to
+    // replace, so it must back out before anything has moved.
+    let managed = view_dir(&config.target.root, &workspace);
+    std::fs::create_dir_all(&managed).unwrap();
+    std::fs::write(managed.join("stranded"), b"unrecorded").unwrap();
+
+    let error = adopt_existing(&config, &workspace, &target, false).unwrap_err();
+
+    assert!(
+        error.to_string().contains("could not replace"),
+        "unexpected error: {error:#}"
+    );
+    assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
+    assert_eq!(
+        std::fs::read(target.join("artifact")).unwrap(),
+        b"old output"
+    );
+    assert_eq!(
+        std::fs::read(managed.join("stranded")).unwrap(),
+        b"unrecorded"
+    );
+    assert!(!view_record_path(&config.target.root, &workspace).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn adopting_an_existing_target_never_follows_a_replacement_link() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = test_config(directory.path(), true);
+    let workspace = checkout(directory.path(), "project");
+    let target = workspace.join("target");
+    let elsewhere = directory.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+    std::fs::write(elsewhere.join("keep"), b"not a build output").unwrap();
+    symlink_dir(&elsewhere, &target).unwrap();
+
+    assert!(adopt_existing(&config, &workspace, &target, false).is_err());
+    assert!(elsewhere.join("keep").is_file());
+    assert_eq!(std::fs::read_link(&target).unwrap(), elsewhere);
+}
+
 #[cfg(unix)]
 #[test]
 fn migrating_an_existing_target_never_follows_a_replacement_link() {

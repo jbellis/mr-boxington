@@ -83,6 +83,16 @@ pub struct MigrationOutcome {
     pub removed_bytes: Option<u64>,
 }
 
+/// What adopting an existing target directory produced.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct AdoptionOutcome {
+    /// The managed directory now holding the outputs; `None` when placement
+    /// declined and the directory was put back where it was.
+    pub managed: Option<PathBuf>,
+    /// Logical bytes the adopted outputs occupy.
+    pub adopted_bytes: u64,
+}
+
 /// Remove the managed target view owned by exactly one workspace.
 pub fn remove_workspace(root: &Path, workspace_root: &Path) -> Result<Option<u64>> {
     let record_path = view_record_path(root, workspace_root);
@@ -201,25 +211,7 @@ fn migrate_existing_with(
     }
 
     let managed = view_dir(&config.target.root, workspace_root);
-    let restore = (|| -> Result<()> {
-        match std::fs::symlink_metadata(target_dir) {
-            Ok(metadata)
-                if metadata.file_type().is_symlink()
-                    && std::fs::read_link(target_dir).is_ok_and(|link| link == managed) =>
-            {
-                remove_link(target_dir).wrap_err("could not remove the failed managed link")?;
-            }
-            Ok(_) => eyre::bail!(
-                "{} was occupied while restoring the old target directory",
-                target_dir.display()
-            ),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).wrap_err("could not inspect the failed migration"),
-        }
-        std::fs::rename(&backup, target_dir)
-            .wrap_err_with(|| format!("could not restore {}", target_dir.display()))
-    })();
-    if let Err(error) = restore {
+    if let Err(error) = restore_backup(target_dir, &managed, &backup) {
         let retained = backup_root.keep().join("target");
         return Err(error).wrap_err_with(|| {
             format!(
@@ -229,6 +221,172 @@ fn migrate_existing_with(
         });
     }
     Ok(MigrationOutcome::default())
+}
+
+/// Whether an existing target directory can be renamed into the managed root.
+///
+/// A rename cannot cross filesystems, and copying a target directory is not
+/// worth the disk and time it would take, so a checkout on a different volume
+/// from the managed root is offered removal instead of adoption. The nearest
+/// existing ancestor of the view stands in for a root not created yet.
+pub fn can_move_existing(config: &Config, workspace_root: &Path, target_dir: &Path) -> bool {
+    let managed = view_dir(&config.target.root, workspace_root);
+    managed
+        .ancestors()
+        .find(|ancestor| ancestor.exists())
+        .is_some_and(|existing| crate::store::same_filesystem_paths(target_dir, existing))
+}
+
+/// Move a confirmed existing target directory under the managed root, keeping
+/// its outputs.
+///
+/// Cargo's own build locks prove no build is writing into the directory, and
+/// holding them until the move keeps one from starting there meanwhile. The
+/// directory is then renamed straight into the view and the link and record
+/// are placed exactly as for a checkout that had no target directory, so at
+/// no point does an empty view exist for a concurrent build to fill: a build
+/// that starts after the move finds the outputs already there and the link
+/// it would have made itself. Cargo keeps addressing the outputs through the
+/// `target` link, so nothing recompiles. If placement declines, the directory
+/// goes back where it was.
+pub fn adopt_existing(
+    config: &Config,
+    workspace_root: &Path,
+    target_dir: &Path,
+    requested: bool,
+) -> Result<AdoptionOutcome> {
+    adopt_existing_with(config, workspace_root, target_dir, requested, || {
+        place(config, workspace_root, target_dir, requested)
+    })
+}
+
+fn adopt_existing_with(
+    config: &Config,
+    workspace_root: &Path,
+    target_dir: &Path,
+    requested: bool,
+    place_target: impl FnOnce() -> Option<PathBuf>,
+) -> Result<AdoptionOutcome> {
+    if !std::fs::symlink_metadata(target_dir).is_ok_and(|metadata| metadata.is_dir()) {
+        eyre::bail!(
+            "{} is no longer a real target directory, so it was not adopted",
+            target_dir.display()
+        );
+    }
+    if !can_remove_existing(config, workspace_root, target_dir, requested) {
+        eyre::bail!("{} is not eligible for adoption", target_dir.display());
+    }
+    if !can_move_existing(config, workspace_root, target_dir) {
+        eyre::bail!(
+            "{} is not on the same filesystem as the managed target root {}, so it was not adopted",
+            target_dir.display(),
+            config.target.root.display()
+        );
+    }
+    // A build writing here would keep writing at this path after the rename,
+    // with nothing at it any more.
+    let Some(build_locks) = cargo_locks(target_dir)? else {
+        eyre::bail!(
+            "Cargo is using {}, so it was not adopted",
+            target_dir.display()
+        );
+    };
+    let adopted_bytes = tree_bytes(target_dir);
+    let managed = view_dir(&config.target.root, workspace_root);
+    if let Some(parent) = managed.parent() {
+        std::fs::create_dir_all(parent)
+            .wrap_err_with(|| format!("could not create {}", parent.display()))?;
+    }
+    // Recorded before the outputs move, as placement records before it
+    // creates a directory: a view must never exist that collection cannot
+    // trace to its checkout.
+    let record_path = view_record_path(&config.target.root, workspace_root);
+    let previous_record = read_record_state(&record_path)?;
+    record_view(&config.target.root, workspace_root)?;
+    // Held no further: an open handle inside the directory makes Windows
+    // refuse to rename it.
+    drop(build_locks);
+    if let Err(error) = move_into_view(target_dir, &managed) {
+        if let Err(restore_error) = restore_record_state(&record_path, previous_record) {
+            log::warn!("the target record was not rolled back: {restore_error}");
+        }
+        return Err(error);
+    }
+    if let Some(placed) = place_target() {
+        return Ok(AdoptionOutcome {
+            managed: Some(placed),
+            adopted_bytes,
+        });
+    }
+    // Placement declined and undid its own link, so the original path is free
+    // again unless something else took it.
+    let restore = (|| -> Result<()> {
+        match std::fs::symlink_metadata(target_dir) {
+            Ok(_) => eyre::bail!(
+                "{} was occupied while restoring the old target directory",
+                target_dir.display()
+            ),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).wrap_err("could not inspect the failed adoption"),
+        }
+        std::fs::rename(&managed, target_dir)
+            .wrap_err_with(|| format!("could not restore {}", target_dir.display()))?;
+        restore_record_state(&record_path, previous_record)
+    })();
+    match restore {
+        Ok(()) => Ok(AdoptionOutcome::default()),
+        Err(error) => Err(error.wrap_err(format!(
+            "the old target directory was retained at {}",
+            managed.display()
+        ))),
+    }
+}
+
+/// Rename a target directory into its view.
+///
+/// A POSIX rename replaces an empty directory in one step. Windows refuses
+/// that, so an empty view is removed first; a view that is not empty holds
+/// outputs this call was never asked to replace, and the failure is reported
+/// before anything has moved.
+fn move_into_view(target_dir: &Path, managed: &Path) -> Result<()> {
+    let refused = match std::fs::rename(target_dir, managed) {
+        Ok(()) => return Ok(()),
+        Err(error) => error,
+    };
+    if std::fs::symlink_metadata(managed).is_err() {
+        // Nothing stood in the way, so the refusal is the rename's own.
+        return Err(refused)
+            .wrap_err_with(|| format!("could not move the outputs into {}", managed.display()));
+    }
+    std::fs::remove_dir(managed).wrap_err_with(|| {
+        format!(
+            "could not replace the managed target directory {}",
+            managed.display()
+        )
+    })?;
+    std::fs::rename(target_dir, managed)
+        .wrap_err_with(|| format!("could not move the outputs into {}", managed.display()))
+}
+
+/// Put a backed-up target directory back at its original path, removing the
+/// link a failed placement may have left there.
+fn restore_backup(target_dir: &Path, managed: &Path, backup: &Path) -> Result<()> {
+    match std::fs::symlink_metadata(target_dir) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                && std::fs::read_link(target_dir).is_ok_and(|link| link == managed) =>
+        {
+            remove_link(target_dir).wrap_err("could not remove the failed managed link")?;
+        }
+        Ok(_) => eyre::bail!(
+            "{} was occupied while restoring the old target directory",
+            target_dir.display()
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error).wrap_err("could not inspect the failed migration"),
+    }
+    std::fs::rename(backup, target_dir)
+        .wrap_err_with(|| format!("could not restore {}", target_dir.display()))
 }
 
 /// Whether placement could use the managed root, without changing any paths.
@@ -540,6 +698,14 @@ fn lock_replaced_view(
 /// `None` means a build is running there. The locks come back held for the
 /// caller that needs them held, such as a migration that replaces the view;
 /// collection only asks and lets them go.
+///
+/// Cargo's lock is `<profile>/.cargo-lock`, or
+/// `<target-triple>/<profile>/.cargo-lock` when cross-compiling, and an
+/// editor's target directory nested one level down repeats that shape, so the
+/// walk goes three levels deep. A directory holding a lock is a profile, and
+/// the output directories Cargo fills a profile with hold thousands of entries
+/// and never a lock, so those are not entered. The same names above a lock
+/// are entered: a custom profile may be called `deps`.
 fn cargo_locks(directory: &Path) -> Result<Option<Vec<fslock::LockFile>>> {
     let mut pending = vec![(directory.to_path_buf(), 0)];
     let mut locks = Vec::new();
@@ -550,6 +716,8 @@ fn cargo_locks(directory: &Path) -> Result<Option<Vec<fslock::LockFile>>> {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => return Err(error.into()),
         };
+        let mut is_profile = false;
+        let mut children = Vec::new();
         for entry in entries {
             let entry = entry?;
             let kind = entry.file_type()?;
@@ -559,12 +727,28 @@ fn cargo_locks(directory: &Path) -> Result<Option<Vec<fslock::LockFile>>> {
                     return Ok(None);
                 }
                 locks.push(lock);
-            } else if kind.is_dir() && depth < 2 {
-                pending.push((entry.path(), depth + 1));
+                is_profile = true;
+            } else if kind.is_dir() && depth < 3 {
+                children.push((entry.file_name(), entry.path()));
             }
+        }
+        for (name, path) in children {
+            if is_profile && is_profile_output_dir(&name) {
+                continue;
+            }
+            pending.push((path, depth + 1));
         }
     }
     Ok(Some(locks))
+}
+
+/// Whether a directory name is one Cargo creates inside a profile directory
+/// for outputs, beside the lock rather than above one.
+fn is_profile_output_dir(name: &std::ffi::OsStr) -> bool {
+    matches!(
+        name.to_str(),
+        Some("deps" | "build" | "incremental" | "examples" | ".fingerprint" | "doc")
+    )
 }
 
 /// Point `target_dir` at `managed` so the paths people type keep working.
@@ -1126,7 +1310,7 @@ fn view_key(workspace_root: &Path) -> String {
     CacheDigest::blake3(workspace_root.to_string_lossy().as_bytes()).hash
 }
 
-fn tree_bytes(directory: &Path) -> u64 {
+pub(crate) fn tree_bytes(directory: &Path) -> u64 {
     let mut total = 0;
     let mut pending = vec![directory.to_path_buf()];
     while let Some(next) = pending.pop() {
