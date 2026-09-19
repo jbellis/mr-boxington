@@ -32,7 +32,15 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const VIEWS_DIR: &str = "v1";
+/// Marks a view moved aside for removal; never part of a view's own name,
+/// which is a bare hex digest.
+const REMOVAL_SUFFIX: &str = ".removing-";
 const VIEW_RECORD_VERSION: u8 = 1;
+/// How recently a view's record must have been refreshed for collection to
+/// treat a build as having just claimed it. Records carry whole seconds, so a
+/// refresh in the same second as the selection is invisible to a comparison;
+/// a record this fresh is a build starting, whatever the selection said.
+const RECENTLY_CLAIMED: u64 = 2;
 
 /// Which checkout a managed target directory belongs to.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,6 +69,9 @@ pub(crate) struct CollectionOutcome {
     pub removed_bytes: u64,
     pub removed_stale_views: u64,
     pub removed_live_views: u64,
+    /// Selected for removal, then found in use by a build that started after
+    /// the selection was made.
+    pub kept_active_views: u64,
     pub remaining_bytes: u64,
     pub remaining_views: u64,
 }
@@ -518,16 +529,34 @@ fn lock_replaced_view(
     {
         return Ok(Vec::new());
     }
-    let mut pending = vec![(existing, 0)];
+    match cargo_locks(&existing)? {
+        Some(locks) => Ok(locks),
+        None => eyre::bail!("Cargo is using {}", existing.display()),
+    }
+}
+
+/// Take every Cargo lock in a target directory, or report that one is held.
+///
+/// `None` means a build is running there. The locks come back held for the
+/// caller that needs them held, such as a migration that replaces the view;
+/// collection only asks and lets them go.
+fn cargo_locks(directory: &Path) -> Result<Option<Vec<fslock::LockFile>>> {
+    let mut pending = vec![(directory.to_path_buf(), 0)];
     let mut locks = Vec::new();
     while let Some((directory, depth)) = pending.pop() {
-        for entry in std::fs::read_dir(&directory)? {
+        let entries = match std::fs::read_dir(&directory) {
+            Ok(entries) => entries,
+            // A directory that vanished under the walk holds no lock.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        for entry in entries {
             let entry = entry?;
             let kind = entry.file_type()?;
             if kind.is_file() && entry.file_name() == ".cargo-lock" {
                 let mut lock = fslock::LockFile::open(&entry.path())?;
                 if !lock.try_lock()? {
-                    eyre::bail!("Cargo is using {}", directory.display());
+                    return Ok(None);
                 }
                 locks.push(lock);
             } else if kind.is_dir() && depth < 2 {
@@ -535,7 +564,7 @@ fn lock_replaced_view(
             }
         }
     }
-    Ok(locks)
+    Ok(Some(locks))
 }
 
 /// Point `target_dir` at `managed` so the paths people type keep working.
@@ -767,7 +796,24 @@ pub(crate) fn collect(
     max_age: Option<Duration>,
     dry_run: bool,
 ) -> Result<CollectionOutcome> {
+    collect_with(root, max_bytes, max_age, dry_run, || {}, || {})
+}
+
+/// [`collect`] with hooks where a build can arrive: between selecting views
+/// and removing them, and between removing a directory and its record. Tests
+/// stand in for that build.
+fn collect_with(
+    root: &Path,
+    max_bytes: Option<u64>,
+    max_age: Option<Duration>,
+    dry_run: bool,
+    before_removal: impl FnOnce(),
+    mut after_removal: impl FnMut(),
+) -> Result<CollectionOutcome> {
     let mut outcome = CollectionOutcome::default();
+    if !dry_run {
+        remove_abandoned_removals(root);
+    }
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_secs())
@@ -842,14 +888,51 @@ pub(crate) fn collect(
         }
     }
 
-    for (record_path, directory, _, bytes, live) in entries {
+    before_removal();
+    for (record_path, directory, updated, bytes, live) in entries {
         if !selected.contains(&record_path) {
             continue;
         }
+        // The selection above is a snapshot, and collection runs in a process
+        // of its own after the build that scheduled it: a build can begin in
+        // one of the selected checkouts while the earlier ones are still being
+        // removed. Its placement refreshes the record, and Cargo holds its
+        // lock for as long as it compiles, so either is grounds to leave the
+        // directory standing until the next sweep looks again. Every selected
+        // view gets the checks, not only the live ones: a checkout deleted and
+        // cloned again at the same path has the same view, and the clone can
+        // start building it before its predecessor's directory is gone.
+        if !dry_run {
+            let claimed_since = read_view_record(&record_path)
+                .is_some_and(|record| recently_claimed(root, &record, updated));
+            let in_use = match cargo_locks(&directory) {
+                Ok(locks) => locks.is_none(),
+                Err(error) => {
+                    log::warn!(
+                        "could not tell whether {} is in use: {error}",
+                        directory.display()
+                    );
+                    true
+                }
+            };
+            if claimed_since || in_use {
+                outcome.kept_active_views += 1;
+                remaining = remaining.saturating_add(bytes);
+                continue;
+            }
+        }
+        // Moved aside in one step before its files go. Holding Cargo's lock
+        // would not keep a build out: unlinking the lock file frees it, and
+        // Cargo simply creates another. A build that starts after the rename
+        // finds no directory and makes a fresh one, the same as it would after
+        // the removal finished; a tree that is half gone is never at the path
+        // a build can reach. Windows refuses the rename while anything inside
+        // is open, which is the same answer.
         let removal = if dry_run {
             Ok(())
         } else {
-            std::fs::remove_dir_all(&directory)
+            let aside = removal_path(&directory);
+            std::fs::rename(&directory, &aside).and_then(|()| std::fs::remove_dir_all(&aside))
         };
         match removal {
             Ok(()) => {
@@ -878,8 +961,20 @@ pub(crate) fn collect(
                 continue;
             }
         }
+        if !dry_run {
+            after_removal();
+        }
         // Last, so a failed removal above leaves the record to try again with.
+        // And only if it still describes the directory just removed: a build
+        // that placed the checkout while the removal ran has written a new
+        // record and made a new directory, and taking that record would leave
+        // the directory invisible to every later collection.
+        let superseded = !dry_run
+            && (read_view_record(&record_path)
+                .is_some_and(|record| recently_claimed(root, &record, updated))
+                || directory.exists());
         if !dry_run
+            && !superseded
             && let Err(error) = std::fs::remove_file(&record_path)
             && error.kind() != std::io::ErrorKind::NotFound
         {
@@ -892,6 +987,51 @@ pub(crate) fn collect(
     outcome.remaining_bytes = remaining;
     outcome.remaining_views = total_views.saturating_sub(outcome.removed_views);
     Ok(outcome)
+}
+
+/// Whether a record read back during collection shows a build claiming the
+/// view since it was selected on `updated`.
+///
+/// The grace for a same-second refresh applies only while the checkout
+/// exists: a record written moments ago for a checkout that is already gone
+/// is a test fixture or a deleted clone, not a build about to start.
+fn recently_claimed(root: &Path, record: &ViewRecord, updated: u64) -> bool {
+    if record.updated_secs > updated {
+        return true;
+    }
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    now.saturating_sub(record.updated_secs) <= RECENTLY_CLAIMED
+        && crate::store::checkout_is_live_on(root, &record.workspace_root)
+}
+
+/// Where a view goes while its files are removed.
+fn removal_path(directory: &Path) -> PathBuf {
+    let name = directory
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    directory.with_file_name(format!("{name}{REMOVAL_SUFFIX}{}", std::process::id()))
+}
+
+/// Finish removing views a collector that died left moved aside.
+///
+/// They have no record, so nothing else lists or protects them; a collector
+/// still deleting one holds no lock either, but the removal is idempotent and
+/// two of them racing only means the files go sooner.
+fn remove_abandoned_removals(root: &Path) {
+    let Ok(listing) = std::fs::read_dir(views_root(root)) else {
+        return;
+    };
+    for entry in listing.flatten() {
+        if entry.file_name().to_string_lossy().contains(REMOVAL_SUFFIX)
+            && entry.file_type().is_ok_and(|kind| kind.is_dir())
+        {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 /// Every managed target directory under `root`, as record and directory.
