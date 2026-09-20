@@ -4042,3 +4042,101 @@ fn cc_publication_failures_are_visible_without_counting_a_second_outcome() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn private_shims_keep_native_builds_cached_across_checkouts() {
+    if !has_c_compiler() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let mut warm_hits = 0;
+    for name in ["first", "second"] {
+        let project = directory.path().join(name);
+        write_c_project(&project);
+        let shims = directory.path().join(format!("{name} shims"));
+        let report = directory.path().join(format!("{name}.json"));
+        let (stats, _) = build_with(
+            &project,
+            &cache,
+            &report,
+            &[("MBX_SHIMS_DIR", shims.to_str().unwrap())],
+        );
+        if name == "second" {
+            warm_hits = count(&stats, "hits");
+        }
+        let cc = shims.join(mbx::session::CC_SHIM_STEM);
+        assert!(
+            cc.is_file(),
+            "the configured persistent compiler should exist"
+        );
+        let probe = isolated_command(&cc).arg("--version").output().unwrap();
+        assert!(
+            probe.status.success(),
+            "the compiler path must outlive its session: {}",
+            String::from_utf8_lossy(&probe.stderr)
+        );
+        // The same directory works on a later invocation with retained outputs.
+        build_with(
+            &project,
+            &cache,
+            &report,
+            &[("MBX_SHIMS_DIR", shims.to_str().unwrap())],
+        );
+    }
+    assert!(
+        warm_hits > 0,
+        "private wrappers must retain shared build results"
+    );
+    assert!(
+        !cache.join("shims").exists(),
+        "the shared default must remain untouched"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn private_shims_support_nested_exec_and_survive_the_command() {
+    if !has_c_compiler() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let cache = directory.path().join("cache");
+    let shims = directory.path().join("private shims");
+    std::fs::write(
+        directory.path().join("input.c"),
+        "int value(void) { return 7; }\n",
+    )
+    .unwrap();
+    let output = mbx_command()
+        .current_dir(directory.path())
+        .env("MBX_CACHE_DIR", &cache)
+        .env("MBX_SHIMS_DIR", &shims)
+        .env("MBX_GC_AUTO", "0")
+        .env("TEST_MBX_BINARY", env!("CARGO_BIN_EXE_mbx"))
+        .args([
+            "exec",
+            "sh",
+            "-c",
+            "command -v cc; \"$TEST_MBX_BINARY\" exec sh -c 'cc -c input.c -o result.o'",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        shims.join("cc").to_str().unwrap()
+    );
+    assert!(directory.path().join("result.o").is_file());
+    assert!(!cache.join("shims").exists());
+    let probe = isolated_command(shims.join("cc"))
+        .arg("--version")
+        .output()
+        .unwrap();
+    assert!(probe.status.success());
+}

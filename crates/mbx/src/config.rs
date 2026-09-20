@@ -115,6 +115,10 @@ pub(crate) struct RawConfig {
     /// Cache root. NFS is unsupported for local build storage.
     #[usage(env = "MBX_CACHE_DIR", default_note = "platform cache directory")]
     cache_dir: Option<PathBuf>,
+    /// Persistent compiler shims. Containers sharing a cache should each use a
+    /// private local directory that survives builds. Relative paths use the cache root.
+    #[usage(env = "MBX_SHIMS_DIR", default_note = "<cache_dir>/shims")]
+    shims_dir: Option<PathBuf>,
     /// Write a JSON build report to this path.
     #[usage(env = "MBX_STATS_REPORT")]
     stats_report: Option<PathBuf>,
@@ -399,6 +403,8 @@ struct RawHttp {
 #[derive(Debug, Clone)]
 pub struct Config {
     pub cache_dir: PathBuf,
+    /// Persistent executable wrappers, separate from shared build artifacts.
+    pub shims_dir: PathBuf,
     pub stats_report: Option<PathBuf>,
     pub verify: bool,
     pub verify_sample_rate: u8,
@@ -493,6 +499,7 @@ impl Config {
     pub fn for_test(cache_dir: &std::path::Path) -> Self {
         Self {
             cache_dir: cache_dir.to_path_buf(),
+            shims_dir: cache_dir.join("shims"),
             stats_report: None,
             verify: false,
             verify_sample_rate: 0,
@@ -870,6 +877,10 @@ impl Config {
         let cache_dir = raw.cache_dir.or_else(default_cache_dir).ok_or_else(|| {
             eyre::eyre!("could not determine a cache directory; set MBX_CACHE_DIR")
         })?;
+        let shims_dir = match raw.shims_dir {
+            Some(directory) => cache_dir.join(directory),
+            None => cache_dir.join("shims"),
+        };
         let target_root = match raw.target.root {
             Some(root) if root.is_absolute() => root,
             Some(root) => cache_dir.join(root),
@@ -986,6 +997,7 @@ impl Config {
         };
         let config = Self {
             cache_dir,
+            shims_dir,
             gc,
             target,
             scheduler,
@@ -1424,6 +1436,36 @@ mod tests {
     }
 
     #[test]
+    fn private_shims_resolve_relative_to_the_cache_and_environment_overrides_the_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let cache = directory.path().join("cache");
+        let private = directory.path().join("private shims");
+        let cache_text = cache.to_str().unwrap();
+        let from_file = configured(
+            Some("shims_dir = 'worker/shims'"),
+            &[("MBX_CACHE_DIR", cache_text)],
+        )
+        .unwrap();
+        assert_eq!(from_file.shims_dir, cache.join("worker/shims"));
+        let from_environment = configured(
+            Some("shims_dir = 'worker/shims'"),
+            &[
+                ("MBX_CACHE_DIR", cache_text),
+                ("MBX_SHIMS_DIR", private.to_str().unwrap()),
+            ],
+        )
+        .unwrap();
+        assert_eq!(from_environment.shims_dir, private);
+        assert_eq!(from_environment.store_dir(), cache.join("actions"));
+        let relative = configured(
+            None,
+            &[("MBX_CACHE_DIR", cache_text), ("MBX_SHIMS_DIR", "local")],
+        )
+        .unwrap();
+        assert_eq!(relative.shims_dir, cache.join("local"));
+    }
+
+    #[test]
     fn defaults_apply_without_configuration() {
         let (config, retention) = configured_retention(None, &[]).unwrap();
         assert_eq!(
@@ -1440,6 +1482,7 @@ mod tests {
         assert!(config.share_out_dir);
         assert!(config.build_script_execution);
         assert!(config.store_dir().ends_with("actions"));
+        assert_eq!(config.shims_dir, config.cache_dir.join("shims"));
         assert!(config.gc.auto, "collection runs until it is turned off");
         assert_eq!(config.gc.max_bytes, 20 * GIB, "5% of a 400GiB disk");
         assert_eq!(config.gc.interval, DEFAULT_GC_INTERVAL);

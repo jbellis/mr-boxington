@@ -359,6 +359,7 @@ fn reasons_read_as_prose() {
 pub(super) fn managed_target_config(root: &Path) -> Config {
     Config {
         cache_dir: root.join("cache"),
+        shims_dir: root.join("cache").join("shims"),
         stats_report: None,
         verify: false,
         verify_sample_rate: 0,
