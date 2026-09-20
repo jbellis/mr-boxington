@@ -2679,6 +2679,7 @@ fn a_cargo_hardlink_build_runs_the_automatic_collector() {
             ("MBX_GC_AUTO", "1"),
             ("MBX_GC_MAX_SIZE", "1"),
             ("MBX_GC_INTERVAL", "0"),
+            ("MBX_LOG", "mbx::cli::gc=debug"),
         ],
     );
     assert!(
@@ -2686,8 +2687,8 @@ fn a_cargo_hardlink_build_runs_the_automatic_collector() {
         "the shim must cache the build: {stats}"
     );
     assert!(
-        !stderr.contains("mbx[gc]:"),
-        "the build should not wait for collection: {stderr}"
+        !stderr.contains("the automatic sweep runs in the foreground"),
+        "the build must launch the detached collector: {stderr}"
     );
     wait_for_sweep_report(store.path());
     let stats = mbx(store.path(), &["cache", "stats"]);
@@ -2696,6 +2697,12 @@ fn a_cargo_hardlink_build_runs_the_automatic_collector() {
         "the collector must evict the stored objects: {stats}"
     );
     let log = std::fs::read_to_string(store.path().join("actions/gc/v1/sweep.log")).unwrap();
+    // Foreground fallback can also evict objects and leave a report, but its
+    // diagnostics go to the build's stderr, not the detached collector's log.
+    assert!(
+        log.contains("the automatic sweep freed"),
+        "the detached collector must complete a sweep: {log}"
+    );
     assert!(
         !log.contains("no such command"),
         "the collector must not run Cargo: {log}"
