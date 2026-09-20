@@ -8,7 +8,7 @@ use bytesize::ByteSize;
 use eyre::{Context, Result, bail};
 use mbx_cache_core::{RemoteCacheMode, S3ConditionalWrites};
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 use usage_config::{EnvLayer, FileLayer, FileScope, Layers};
 
@@ -116,7 +116,8 @@ pub(crate) struct RawConfig {
     #[usage(env = "MBX_CACHE_DIR", default_note = "platform cache directory")]
     cache_dir: Option<PathBuf>,
     /// Persistent compiler shims. Containers sharing a cache should each use a
-    /// private local directory that survives builds. Relative paths use the cache root.
+    /// private local directory that survives builds. Relative paths use the cache root
+    /// and cannot traverse above it with `..`.
     #[usage(env = "MBX_SHIMS_DIR", default_note = "<cache_dir>/shims")]
     shims_dir: Option<PathBuf>,
     /// Write a JSON build report to this path.
@@ -878,7 +879,22 @@ impl Config {
             eyre::eyre!("could not determine a cache directory; set MBX_CACHE_DIR")
         })?;
         let shims_dir = match raw.shims_dir {
-            Some(directory) => cache_dir.join(directory),
+            Some(directory) if directory.is_absolute() => directory,
+            Some(directory) => {
+                let mut relative = PathBuf::new();
+                for component in directory.components() {
+                    match component {
+                        Component::Normal(part) => relative.push(part),
+                        Component::CurDir => (),
+                        Component::ParentDir if relative.pop() => (),
+                        _ => bail!(
+                            "invalid shims_dir: relative paths must stay beneath cache_dir; \
+                             use an absolute path for a directory outside the cache"
+                        ),
+                    }
+                }
+                cache_dir.join(relative)
+            }
             None => cache_dir.join("shims"),
         };
         let target_root = match raw.target.root {
@@ -1463,6 +1479,22 @@ mod tests {
         )
         .unwrap();
         assert_eq!(relative.shims_dir, cache.join("local"));
+    }
+
+    #[test]
+    fn relative_shims_cannot_traverse_above_the_cache_root() {
+        for path in ["../private", "worker/../../private", "../cache/private"] {
+            let error = configured(None, &[("MBX_SHIMS_DIR", path)]).unwrap_err();
+            assert!(error.to_string().contains("invalid shims_dir"), "{error}");
+            let file = format!("shims_dir = '{path}'");
+            assert!(configured(Some(&file), &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn relative_shims_normalize_parent_components_within_the_cache_root() {
+        let config = configured(None, &[("MBX_SHIMS_DIR", "worker/../private/./shims")]).unwrap();
+        assert_eq!(config.shims_dir, config.cache_dir.join("private/shims"));
     }
 
     #[test]

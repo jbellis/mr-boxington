@@ -70,7 +70,8 @@ MBX_CACHE_DIR=/shared/mbx MBX_SHIMS_DIR=/var/lib/worker/mbx-shims mbx build
 
 The shim directory must survive subsequent builds: CMake and other build systems
 can record absolute compiler or launcher paths. Absolute values are used directly;
-relative values resolve beneath `cache_dir`. The default remains
+relative values resolve beneath `cache_dir` and are rejected if `..` would traverse
+above it. The default remains
 `<cache_dir>/shims`. This setting also covers `mbx exec` and CMake launchers;
 cached artifacts remain in the shared cache. It is a global or environment setting,
 not a workspace policy.
