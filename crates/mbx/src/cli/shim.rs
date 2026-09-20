@@ -13,7 +13,13 @@ static PATH_BEFORE_SHIM_EXCLUSION: OnceLock<OsString> = OnceLock::new();
 
 /// Whether this process was installed under Cargo's name by `mbx setup`.
 pub fn is_cargo_shim() -> bool {
-    invoked_as_cargo() || std::env::var_os(CARGO_SHIM_MODE_ENV).is_some_and(|value| value == "1")
+    match std::env::var_os(CARGO_SHIM_MODE_ENV).as_deref() {
+        // Internal commands must remain mbx commands even when current_exe()
+        // points at an installation hardlinked or copied under Cargo's name.
+        Some(value) if value == "0" => false,
+        Some(value) if value == "1" => true,
+        _ => invoked_as_cargo(),
+    }
 }
 
 fn invoked_as_cargo() -> bool {
