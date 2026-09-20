@@ -167,21 +167,70 @@ pub fn write_advisory(path: &Path, contents: &[u8]) -> Result<()> {
     Ok(())
 }
 
-/// Format a duration for humans, widening precision as the duration grows.
+/// Format a duration for humans, widening units as the duration grows.
+///
+/// A measurement below a minute keeps the precision that makes it worth
+/// reading; past that, [`format_clock`] takes over, because a build that took
+/// "813.00s" is a number to convert rather than a time to read. Nothing is
+/// reported as `0ns`: a duration that never happened is "0s".
+///
+/// The handover to the clock is placed where the seconds rendering stops
+/// fitting, not at the minute itself: `{:.2?}` rounds, so 59.996s would read
+/// "60.00s" -- a minute spelled in the unit this function exists to grow out
+/// of, sitting in the same output as "1m 5s". The clock takes that value and
+/// reads it as "1m".
 pub fn format_duration(duration: Duration) -> String {
-    if duration < Duration::from_millis(1) {
+    /// The largest duration `{:.2?}` still renders as seconds under a minute.
+    const PRECISE_MAX: Duration = Duration::from_nanos(59_995_000_000);
+
+    if duration.is_zero() {
+        "0s".into()
+    } else if duration < Duration::from_millis(1) {
         format!("{duration:.0?}")
     } else if duration < Duration::from_secs(1) {
         format!("{duration:.1?}")
-    } else {
+    } else if duration < PRECISE_MAX {
         format!("{duration:.2?}")
+    } else {
+        format_clock(duration)
     }
+}
+
+/// A duration the way a person would say it: "6h 14m", "13m 33s", "45s".
+///
+/// The two largest units that are actually present, each whole. Two units
+/// carry all the precision a wall-clock reading needs, and a zero unit in
+/// between must not spend one of the slots: "1d 0h" would hide real minutes
+/// behind it and understate the span it exists to state.
+///
+/// Seconds are rounded rather than dropped, so this meets the precise rendering
+/// in [`format_duration`] without a gap: the last value that reads "59.99s" is
+/// followed by "1m", not by a second reading of "59s".
+pub fn format_clock(duration: Duration) -> String {
+    let mut rest = duration
+        .as_secs()
+        .saturating_add(u64::from(duration.subsec_millis() >= 500));
+    if rest == 0 {
+        return "0s".into();
+    }
+    let mut parts = Vec::new();
+    for (size, suffix) in [(86_400, "d"), (3_600, "h"), (60, "m"), (1, "s")] {
+        let amount = rest / size;
+        rest %= size;
+        if amount > 0 {
+            parts.push(format!("{amount}{suffix}"));
+            if parts.len() == 2 {
+                break;
+            }
+        }
+    }
+    parts.join(" ")
 }
 
 /// Format a long span the way a retention policy is written.
 ///
 /// [`format_duration`] measures what a build spent and would render a month as
-/// `2592000.00s`. A policy is stated in coarse units, so this says "30 days".
+/// `30d`. A policy is written out in one unit, so this says "30 days".
 ///
 /// The largest unit that divides evenly, never one that would round: this
 /// describes when files get deleted, and calling 36 hours "1 day" would
@@ -625,6 +674,55 @@ mod tests {
             "a missing destination answers as its filesystem, not as a failure"
         );
         assert!(!unmade.exists(), "the probe must not create the directory");
+    }
+
+    #[test]
+    fn durations_read_as_precision_below_a_minute_and_as_a_clock_above_one() {
+        // Below a minute the fraction is the point of the measurement.
+        assert_eq!(format_duration(Duration::from_micros(400)), "400\u{b5}s");
+        assert_eq!(format_duration(Duration::from_millis(1_234)), "1.23s");
+        assert_eq!(format_duration(Duration::from_millis(59_994)), "59.99s");
+        // At a minute it becomes a time somebody reads rather than converts.
+        assert_eq!(format_duration(Duration::from_secs(60)), "1m");
+        assert_eq!(format_duration(Duration::from_secs(813)), "13m 33s");
+        assert_eq!(
+            format_duration(Duration::from_secs(6 * 3_600 + 840)),
+            "6h 14m"
+        );
+        // A duration that never happened is not "0ns".
+        assert_eq!(format_duration(Duration::ZERO), "0s");
+    }
+
+    #[test]
+    fn a_minute_is_never_rendered_as_sixty_seconds() {
+        // `{:.2?}` rounds, so every value in this range would read "60.00s"
+        // beside the "1m 5s" of a build one tick longer.
+        for (duration, expected) in [
+            (Duration::from_nanos(59_994_999_999), "59.99s"),
+            (Duration::from_nanos(59_995_000_000), "1m"),
+            (Duration::from_nanos(59_999_999_999), "1m"),
+            (Duration::from_secs(60), "1m"),
+        ] {
+            assert_eq!(format_duration(duration), expected, "for {duration:?}");
+        }
+    }
+
+    #[test]
+    fn clock_readings_keep_the_two_units_that_are_present() {
+        assert_eq!(format_clock(Duration::from_secs(45)), "45s");
+        assert_eq!(format_clock(Duration::from_secs(61)), "1m 1s");
+        assert_eq!(format_clock(Duration::from_secs(6 * 3_600)), "6h");
+        // A zero unit in the middle must not spend a slot and hide the minutes.
+        assert_eq!(format_clock(Duration::from_secs(86_400 + 300)), "1d 5m");
+        assert_eq!(format_clock(Duration::from_secs(86_400 + 3_660)), "1d 1h");
+        // Seconds are rounded, so this picks up where the precise rendering in
+        // format_duration leaves off instead of repeating a second of it.
+        assert_eq!(format_clock(Duration::from_millis(45_900)), "46s");
+        assert_eq!(format_clock(Duration::from_millis(45_400)), "45s");
+        assert_eq!(format_clock(Duration::from_millis(900)), "1s");
+        assert_eq!(format_clock(Duration::from_millis(400)), "0s");
+        // The rounding carries into the larger unit rather than showing "1m 60s".
+        assert_eq!(format_clock(Duration::from_millis(119_600)), "2m");
     }
 
     #[test]
