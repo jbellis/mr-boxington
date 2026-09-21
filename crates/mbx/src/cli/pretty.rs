@@ -41,12 +41,10 @@ pub(super) fn enabled(arguments: &[String]) -> bool {
         && terminal::size().is_ok_and(|(cols, rows)| cols >= 50 && rows >= 16)
 }
 
+/// Identify the command used by the terminal display, skipping Cargo globals
+/// such as the invocation-local target configuration added by mbx.
 fn cargo_verb(arguments: &[String]) -> Option<&str> {
-    arguments
-        .get(usize::from(
-            arguments.first().is_some_and(|arg| arg.starts_with('+')),
-        ))
-        .map(String::as_str)
+    super::launch::cargo_subcommand(arguments)
 }
 
 fn eligible(arguments: &[String]) -> bool {

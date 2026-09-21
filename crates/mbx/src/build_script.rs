@@ -1,5 +1,6 @@
 //! Cache Cargo build-script execution after the script has declared its inputs.
 
+use crate::ar::ArDeterminism;
 use crate::materialize::{
     apply_file_mode, denormalize_output_text, file_mode, find_blobs, normalize_output_text,
     read_canonical_blob, read_verified_blob, record_action_hit, replay_bytes, staging_directory,
@@ -31,6 +32,9 @@ struct Invocation<'a> {
 
 #[derive(Debug, Serialize)]
 struct Action<'a> {
+    /// The `ZERO_AR_DATE` the script will read, so a change of archive policy
+    /// is a different entry instead of a stale restore. See [`crate::ar`].
+    archive_timestamps: Option<&'a str>,
     binary_action: &'a CacheDigest,
     cargo_environment: &'a BTreeMap<String, Option<String>>,
     environment: &'a BTreeMap<String, Option<String>>,
@@ -220,6 +224,38 @@ fn install_launcher(mbx: &Path, executable: &Path) -> std::io::Result<()> {
     std::fs::copy(mbx, executable).map(|_| ())
 }
 
+/// Apply mbx's archive-timestamp policy to a build script's environment.
+///
+/// Set on every host rather than only on macOS: the variable is read by Apple's
+/// archive tools wherever they run, which includes cctools cross-compiling to
+/// an Apple target from Linux, and is inert for toolchains that do not know it.
+/// See [`crate::ar`] for why the timestamp matters to the cache.
+fn apply_ar_determinism(command: &mut Command) {
+    let inherited = std::env::var_os(crate::ar::ZERO_AR_DATE).is_some();
+    if crate::ar::normalizes(ar_mode(), ar_profile().as_deref(), inherited) {
+        command.env(crate::ar::ZERO_AR_DATE, "1");
+    }
+}
+
+fn ar_mode() -> ArDeterminism {
+    std::env::var(session::AR_DETERMINISM_ENV).map_or_else(
+        |_| ArDeterminism::default(),
+        |value| ArDeterminism::parse(&value),
+    )
+}
+
+fn ar_profile() -> Option<String> {
+    std::env::var(crate::ar::PROFILE).ok()
+}
+
+/// The `ZERO_AR_DATE` this build script will see, for its cache key.
+fn archive_timestamp_key() -> Option<String> {
+    // `var_os`, matching `apply_ar_determinism`: the two have to agree about
+    // whether a value was inherited, including one that is not UTF-8.
+    let inherited = std::env::var_os(crate::ar::ZERO_AR_DATE);
+    crate::ar::effective_zero_ar_date(ar_mode(), ar_profile().as_deref(), inherited.as_deref())
+}
+
 /// Run the preserved program without consulting the cache.
 pub(crate) fn run_real() -> ExitCode {
     let Some(invoked) = session::build_script_invocation_path() else {
@@ -232,6 +268,7 @@ pub(crate) fn run_real() -> ExitCode {
     let mut command = Command::new(real);
     command.args(std::env::args_os().skip(1));
     command.env_remove(session::BUILD_SCRIPT_SHIM_PATH_ENV);
+    apply_ar_determinism(&mut command);
     match command.status() {
         Ok(status) => crate::materialize::exit_code(status),
         Err(error) => {
@@ -271,6 +308,7 @@ pub(crate) fn run() -> Result<ExitCode> {
     let mut command = Command::new(&real);
     command.args(std::env::args_os().skip(1));
     command.env_remove(session::BUILD_SCRIPT_SHIM_PATH_ENV);
+    apply_ar_determinism(&mut command);
     let output = command
         .output()
         .wrap_err("failed to execute the build script")?;
@@ -481,14 +519,18 @@ fn build_action(
     let out_dir = (!prediction.portable_out_dir)
         .then(|| std::env::var("OUT_DIR"))
         .transpose()?;
+    let archive_timestamps = archive_timestamp_key();
     let bytes = canonical_json(&Action {
+        archive_timestamps: archive_timestamps.as_deref(),
         binary_action,
         cargo_environment: &cargo_environment,
         environment: &environment,
         inputs: &inputs,
         kind: ADAPTER,
         out_dir: out_dir.as_deref(),
-        version: 2,
+        // Bumped with `archive_timestamps`: an entry stored before it cannot
+        // say which archive policy produced it, so it is not reused.
+        version: 3,
     })?;
     let digest = CacheDigest::blake3(&bytes);
     Ok((bytes, digest))

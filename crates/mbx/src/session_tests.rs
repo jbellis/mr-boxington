@@ -1,3 +1,4 @@
+use super::shims::{first_in_path, is_shim_directory, mark_shim_directory};
 use super::*;
 use crate::config::SummaryStyle;
 
@@ -63,6 +64,7 @@ fn test_config(cache_dir: &Path) -> Config {
         cache_dir: cache_dir.to_path_buf(),
         shims_dir: cache_dir.join("shims"),
         stats_report: None,
+        ar_determinism: "auto".into(),
         verify: false,
         verify_sample_rate: 0,
         incremental: false,
@@ -642,6 +644,138 @@ fn a_shim_directory_never_supplies_the_real_compiler() {
         resolved.map(|path| std::fs::canonicalize(path).unwrap()),
         Some(std::fs::canonicalize(&real_cc).unwrap()),
         "a shim must never be chosen as the compiler it stands in for"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn another_installations_shim_directory_never_supplies_the_real_compiler() {
+    // The directory excluded by location is only ever this install's own. A
+    // second mbx on the machine -- a different container image, a checkout
+    // built from source, an upgrade mid-rollout -- owns a shim directory that
+    // matches neither that location nor this binary's device and inode. Taking
+    // its `cc` makes the two installs hand the compilation back and forth
+    // until the machine runs out of processes, so a marked directory is
+    // skipped whoever wrote it.
+    let directory = tempfile::tempdir().unwrap();
+    let mine = directory.path().join("mine");
+    let theirs = directory.path().join("theirs");
+    let real_dir = directory.path().join("bin");
+    for path in [&mine, &theirs, &real_dir] {
+        std::fs::create_dir(path).unwrap();
+    }
+    let other_mbx = directory.path().join("other-mbx");
+    std::fs::write(&other_mbx, b"#!/bin/sh\n").unwrap();
+    std::os::unix::fs::symlink(&other_mbx, theirs.join("cc")).unwrap();
+    mark_shim_directory(&theirs);
+    let real_cc = real_dir.join("cc");
+    std::fs::write(&real_cc, b"#!/bin/sh\n").unwrap();
+
+    let running = directory.path().join("mbx");
+    std::fs::write(&running, b"#!/bin/sh\n").unwrap();
+    let path =
+        std::env::join_paths([mine.as_path(), theirs.as_path(), real_dir.as_path()]).unwrap();
+
+    assert_eq!(
+        resolve_in_path(&path, "cc", &running, &mine)
+            .map(|path| std::fs::canonicalize(path).unwrap()),
+        Some(std::fs::canonicalize(&real_cc).unwrap()),
+        "another install's shim must never be chosen as the compiler"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_compiler_named_inside_another_installations_shims_is_left_alone() {
+    // Same directory, reached the other way: a build that names its compiler
+    // outright, having inherited `CC` from an outer session belonging to a
+    // different install.
+    let directory = tempfile::tempdir().unwrap();
+    let mine = directory.path().join("mine");
+    let theirs = directory.path().join("theirs");
+    std::fs::create_dir(&mine).unwrap();
+    std::fs::create_dir(&theirs).unwrap();
+    let planted = theirs.join("aarch64-linux-musl-gcc");
+    std::fs::write(&planted, b"#!/bin/sh\n").unwrap();
+    mark_shim_directory(&theirs);
+    let executable = directory.path().join("mbx");
+    std::fs::write(&executable, b"#!/bin/sh\n").unwrap();
+
+    assert_eq!(
+        resolve_named_compiler(&planted.display().to_string(), &executable, &mine),
+        None,
+        "a compiler inside another install's shim directory must not be wrapped"
+    );
+}
+
+#[test]
+fn a_pin_naming_a_shim_falls_back_to_the_search() {
+    let directory = tempfile::tempdir().unwrap();
+    let shims = directory.path().join("shims");
+    let real_dir = directory.path().join("bin");
+    std::fs::create_dir(&shims).unwrap();
+    std::fs::create_dir(&real_dir).unwrap();
+    mark_shim_directory(&shims);
+    let running = directory.path().join("mbx");
+    std::fs::write(&running, b"#!/bin/sh\n").unwrap();
+
+    // A pin left by an older mbx, naming a shim rather than a compiler.
+    assert!(!pin_names_a_compiler(&shims.join("cc"), Some(&running)));
+    // The pin naming this very binary, which no marker is needed to catch.
+    assert!(!pin_names_a_compiler(&running, Some(&running)));
+    // An ordinary pin is still used.
+    assert!(pin_names_a_compiler(&real_dir.join("cc"), Some(&running)));
+}
+
+#[cfg(unix)]
+#[test]
+fn host_driver_lookup_skips_another_installations_shims() {
+    // `MBX_REAL_CC` and `MBX_REAL_CXX` are what the installed shim actually
+    // runs. A foreign shim recorded there is a shim standing in for a shim,
+    // which is the loop this marker exists to stop, so the plain first-match
+    // lookup has to skip marked directories too.
+    let directory = tempfile::tempdir().unwrap();
+    let theirs = directory.path().join("theirs");
+    let real_dir = directory.path().join("bin");
+    std::fs::create_dir(&theirs).unwrap();
+    std::fs::create_dir(&real_dir).unwrap();
+    let other_mbx = directory.path().join("other-mbx");
+    std::fs::write(&other_mbx, b"#!/bin/sh\n").unwrap();
+    std::os::unix::fs::symlink(&other_mbx, theirs.join("cc")).unwrap();
+    mark_shim_directory(&theirs);
+    let real_cc = real_dir.join("cc");
+    std::fs::write(&real_cc, b"#!/bin/sh\n").unwrap();
+
+    let path = std::env::join_paths([theirs.as_path(), real_dir.as_path()]).unwrap();
+    assert_eq!(
+        first_in_path(&path, "cc").map(|path| std::fs::canonicalize(path).unwrap()),
+        Some(std::fs::canonicalize(&real_cc).unwrap()),
+        "a host driver must never resolve to another install's shim"
+    );
+}
+
+#[test]
+fn marking_a_directory_agrees_with_reading_it_back() {
+    let directory = tempfile::tempdir().unwrap();
+    let plain = directory.path().join("plain");
+    std::fs::create_dir(&plain).unwrap();
+    assert!(!is_shim_directory(&plain));
+    mark_shim_directory(&plain);
+    assert!(is_shim_directory(&plain), "a marked directory reads back");
+    // Idempotent: a second call leaves the existing marker alone.
+    mark_shim_directory(&plain);
+    assert!(is_shim_directory(&plain));
+
+    // A `.mbx-shims` that is not a file is not a marker, and marking must not
+    // treat it as one and skip the write. It still cannot be written here, so
+    // what this pins is that the two helpers agree rather than drift.
+    let occupied = directory.path().join("occupied");
+    std::fs::create_dir(&occupied).unwrap();
+    std::fs::create_dir(occupied.join(".mbx-shims")).unwrap();
+    mark_shim_directory(&occupied);
+    assert!(
+        !is_shim_directory(&occupied),
+        "a directory named .mbx-shims must never count as a marker"
     );
 }
 

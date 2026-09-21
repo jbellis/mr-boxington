@@ -495,8 +495,9 @@ fn spawn_collector(config: &Config) -> Result<()> {
         .current_dir(&cache_dir)
         .env("MBX_CACHE_DIR", &cache_dir)
         // The build may have arrived through the Cargo shim. The collector is
-        // an mbx command, and must not be dispatched as Cargo.
-        .env_remove("MBX_CARGO_SHIM_MODE")
+        // an mbx command even when current_exe() is a hardlink named cargo;
+        // removing the mode alone would still let argv[0] select the shim.
+        .env("MBX_CARGO_SHIM_MODE", "0")
         .env_remove("MBX_CARGO_SHIM_PATH")
         .stdin(Stdio::null())
         .stdout(Stdio::null())

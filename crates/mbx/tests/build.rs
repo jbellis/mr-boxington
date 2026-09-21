@@ -531,7 +531,17 @@ fn cargo_with(
     arguments: &[&str],
     settings: &[(&str, &str)],
 ) -> (serde_json::Value, String) {
-    let mut command = mbx_command();
+    cargo_with_command(mbx_command(), project, store, report, arguments, settings)
+}
+
+fn cargo_with_command(
+    mut command: Command,
+    project: &Path,
+    store: &Path,
+    report: &Path,
+    arguments: &[&str],
+    settings: &[(&str, &str)],
+) -> (serde_json::Value, String) {
     command
         .current_dir(project)
         .args(arguments)
@@ -2638,6 +2648,64 @@ fn a_build_sweeps_the_store_to_its_budget() {
             .join("actions/gc/v1/last-sweep-report")
             .exists(),
         "the report should be said once"
+    );
+}
+
+#[test]
+fn a_cargo_hardlink_build_runs_the_automatic_collector() {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let install = tempfile::tempdir().unwrap();
+    write_project(project.path());
+
+    // Copy first so the real hardlink works even when the test binary and
+    // temporary storage live on different filesystems. A symlink does not
+    // reproduce this: current_exe() can resolve it back to the mbx basename.
+    let executable = install
+        .path()
+        .join(format!("mbx{}", std::env::consts::EXE_SUFFIX));
+    let shim = install
+        .path()
+        .join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
+    std::fs::copy(env!("CARGO_BIN_EXE_mbx"), &executable).unwrap();
+    std::fs::hard_link(&executable, &shim).unwrap();
+    let (stats, stderr) = cargo_with_command(
+        isolated_command(&shim),
+        project.path(),
+        store.path(),
+        &install.path().join("build.json"),
+        &["build", "--offline"],
+        &[
+            ("MBX_GC_AUTO", "1"),
+            ("MBX_GC_MAX_SIZE", "1"),
+            ("MBX_GC_INTERVAL", "0"),
+            ("MBX_LOG", "mbx::cli::gc=debug"),
+        ],
+    );
+    assert!(
+        count(&stats, "stored_bytes") > 0,
+        "the shim must cache the build: {stats}"
+    );
+    assert!(
+        !stderr.contains("the automatic sweep runs in the foreground"),
+        "the build must launch the detached collector: {stderr}"
+    );
+    wait_for_sweep_report(store.path());
+    let stats = mbx(store.path(), &["cache", "stats"]);
+    assert!(
+        stats.contains("objects: 0"),
+        "the collector must evict the stored objects: {stats}"
+    );
+    let log = std::fs::read_to_string(store.path().join("actions/gc/v1/sweep.log")).unwrap();
+    // Foreground fallback can also evict objects and leave a report, but its
+    // diagnostics go to the build's stderr, not the detached collector's log.
+    assert!(
+        log.contains("the automatic sweep freed"),
+        "the detached collector must complete a sweep: {log}"
+    );
+    assert!(
+        !log.contains("no such command"),
+        "the collector must not run Cargo: {log}"
     );
 }
 
