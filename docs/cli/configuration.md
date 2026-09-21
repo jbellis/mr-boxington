@@ -430,7 +430,7 @@ Remap the workspace root so rustc does not record which checkout a compilation r
 - **Default:** <cache_dir>/shims
 - **Set with:** `MBX_SHIMS_DIR`
 
-Persistent compiler shims. Containers sharing a cache should each use a private local directory that survives builds. Relative paths use the cache root and cannot traverse above it with `..`.
+Persistent compiler shims. Containers sharing a cache should each use a private, dedicated local directory that survives builds and contains no real compilers. Relative paths use the cache root and cannot traverse above it with `..` or normalize to an empty path.
 
 ### `stats_report`
 

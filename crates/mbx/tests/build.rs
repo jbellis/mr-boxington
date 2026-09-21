@@ -4117,6 +4117,17 @@ fn private_shims_keep_native_builds_cached_across_checkouts() {
     if !has_c_compiler() {
         return;
     }
+    let cached = private_shims_warm_hits(&[]);
+    let uncached = private_shims_warm_hits(&[("MBX_CC", "0")]);
+    assert_eq!(
+        cached,
+        uncached + 1,
+        "private shims should restore exactly one additional C compilation"
+    );
+}
+
+#[cfg(unix)]
+fn private_shims_warm_hits(settings: &[(&str, &str)]) -> u64 {
     let directory = tempfile::tempdir().unwrap();
     let cache = directory.path().join("cache");
     let mut warm_hits = 0;
@@ -4125,42 +4136,38 @@ fn private_shims_keep_native_builds_cached_across_checkouts() {
         write_c_project(&project);
         let shims = directory.path().join(format!("{name} shims"));
         let report = directory.path().join(format!("{name}.json"));
-        let (stats, _) = build_with(
-            &project,
-            &cache,
-            &report,
-            &[("MBX_SHIMS_DIR", shims.to_str().unwrap())],
-        );
+        let settings: Vec<(&str, &str)> = [
+            ("MBX_BUILD_SCRIPT_EXECUTION", "0"),
+            ("MBX_SHIMS_DIR", shims.to_str().unwrap()),
+        ]
+        .into_iter()
+        .chain(settings.iter().copied())
+        .collect();
+        let (stats, _) = build_with(&project, &cache, &report, &settings);
         if name == "second" {
             warm_hits = count(&stats, "hits");
         }
-        let cc = shims.join(mbx::session::CC_SHIM_STEM);
-        assert!(
-            cc.is_file(),
-            "the configured persistent compiler should exist"
-        );
-        let probe = isolated_command(&cc).arg("--version").output().unwrap();
-        assert!(
-            probe.status.success(),
-            "the compiler path must outlive its session: {}",
-            String::from_utf8_lossy(&probe.stderr)
-        );
+        if !settings.contains(&("MBX_CC", "0")) {
+            let cc = shims.join(mbx::session::CC_SHIM_STEM);
+            assert!(
+                cc.is_file(),
+                "the configured persistent compiler should exist"
+            );
+            let probe = isolated_command(&cc).arg("--version").output().unwrap();
+            assert!(
+                probe.status.success(),
+                "the compiler path must outlive its session: {}",
+                String::from_utf8_lossy(&probe.stderr)
+            );
+        }
         // The same directory works on a later invocation with retained outputs.
-        build_with(
-            &project,
-            &cache,
-            &report,
-            &[("MBX_SHIMS_DIR", shims.to_str().unwrap())],
-        );
+        build_with(&project, &cache, &report, &settings);
     }
-    assert!(
-        warm_hits > 0,
-        "private wrappers must retain shared build results"
-    );
     assert!(
         !cache.join("shims").exists(),
         "the shared default must remain untouched"
     );
+    warm_hits
 }
 
 #[cfg(unix)]

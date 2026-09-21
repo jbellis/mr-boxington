@@ -61,7 +61,7 @@ moving managed targets to another disk.
 
 Compiler shims are executable wrappers, not cached build artifacts. By default
 both live under `cache_dir`. If containers share that directory but have private
-mbx installations, set `shims_dir` (`MBX_SHIMS_DIR`) to a private local directory
+mbx installations, set `shims_dir` (`MBX_SHIMS_DIR`) to a private, dedicated local directory
 in each container:
 
 ```sh
@@ -71,10 +71,15 @@ MBX_CACHE_DIR=/shared/mbx MBX_SHIMS_DIR=/var/lib/worker/mbx-shims mbx build
 The shim directory must survive subsequent builds: CMake and other build systems
 can record absolute compiler or launcher paths. Absolute values are used directly;
 relative values resolve beneath `cache_dir` and are rejected if `..` would traverse
-above it. The default remains
+above it. Explicit empty values and relative values that normalize to an empty
+path (such as `.`, `./`, or `a/..`) are rejected. The default remains
 `<cache_dir>/shims`. This setting also covers `mbx exec` and CMake launchers;
 cached artifacts remain in the shared cache. It is a global or environment setting,
 not a workspace policy.
+
+Use a directory reserved for mbx shims, with no real compilers in it. mbx marks
+shim directories with `.mbx-shims` and excludes those directories when searching
+for real compilers.
 
 Changing this setting does not rewrite existing generated build configurations.
 If one still records an old shim path, reconfigure that build using the new setting

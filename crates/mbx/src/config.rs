@@ -116,8 +116,9 @@ pub(crate) struct RawConfig {
     #[usage(env = "MBX_CACHE_DIR", default_note = "platform cache directory")]
     cache_dir: Option<PathBuf>,
     /// Persistent compiler shims. Containers sharing a cache should each use a
-    /// private local directory that survives builds. Relative paths use the cache root
-    /// and cannot traverse above it with `..`.
+    /// private, dedicated local directory that survives builds and contains no real compilers.
+    /// Relative paths use the cache root and cannot traverse above it with `..`
+    /// or normalize to an empty path.
     #[usage(env = "MBX_SHIMS_DIR", default_note = "<cache_dir>/shims")]
     shims_dir: Option<PathBuf>,
     /// Write a JSON build report to this path.
@@ -909,6 +910,11 @@ impl Config {
                         ),
                     }
                 }
+                if relative.as_os_str().is_empty() {
+                    bail!(
+                        "invalid shims_dir: relative paths must name a directory beneath cache_dir"
+                    );
+                }
                 cache_dir.join(relative)
             }
             None => cache_dir.join("shims"),
@@ -1505,6 +1511,20 @@ mod tests {
             assert!(error.to_string().contains("invalid shims_dir"), "{error}");
             let file = format!("shims_dir = '{path}'");
             assert!(configured(Some(&file), &[]).is_err());
+        }
+    }
+
+    #[test]
+    fn shims_reject_empty_and_empty_normalizing_paths() {
+        for path in ["", ".", "./", "a/.."] {
+            let file = format!("shims_dir = '{path}'");
+            for result in [
+                configured(None, &[("MBX_SHIMS_DIR", path)]),
+                configured(Some(&file), &[]),
+            ] {
+                let error = result.unwrap_err();
+                assert!(error.to_string().contains("invalid shims_dir"), "{error}");
+            }
         }
     }
 
