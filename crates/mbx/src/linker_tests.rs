@@ -113,11 +113,12 @@ fn search_dirs_are_read_in_the_order_the_driver_looks() {
 
 /// WSL sets `LIBRARY_PATH=/usr/lib/wsl/lib:`, and GCC searches the empty
 /// element after the colon as the current directory, reporting it as `./`.
-/// The driver searched relative to this process's working directory, so the
-/// directories come back absolute against it: a pin is checked later from
-/// other working directories, where `./crt1.o` names some other file.
+/// The driver searched relative to this process's working directory, so a
+/// directory without a root comes back under it: a pin is checked later from
+/// other working directories, where `./crt1.o` names some other file. A
+/// directory with a root is left as the driver spelled it.
 #[test]
-fn relative_search_dirs_are_made_absolute_against_the_working_directory() {
+fn rootless_search_dirs_are_placed_under_the_working_directory() {
     let separator = if cfg!(windows) { ';' } else { ':' };
     let text = format!(
         "install: /usr/lib/gcc/x86_64-linux-gnu/15/\nprograms: =/usr/libexec/gcc/x86_64-linux-gnu/15/\nlibraries: =/usr/lib/wsl/lib/x86_64-linux-gnu/15/{separator}./x86_64-linux-gnu/15/{separator}./{separator}/usr/lib/gcc/x86_64-linux-gnu/15/\n"
@@ -128,21 +129,45 @@ fn relative_search_dirs_are_made_absolute_against_the_working_directory() {
         dirs.libraries,
         vec![
             PathBuf::from("/usr/lib/wsl/lib/x86_64-linux-gnu/15/"),
-            here.join("./x86_64-linux-gnu/15/"),
-            here.join("./"),
+            here.join("x86_64-linux-gnu").join("15"),
+            here.clone(),
             PathBuf::from("/usr/lib/gcc/x86_64-linux-gnu/15/"),
         ]
     );
-    assert!(
-        dirs.libraries
-            .iter()
-            .all(|directory| directory.is_absolute())
+    assert!(dirs.libraries.iter().all(|directory| directory.has_root()));
+    assert_eq!(
+        dirs.programs,
+        vec![PathBuf::from("/usr/libexec/gcc/x86_64-linux-gnu/15/")]
     );
-    assert!(
-        dirs.programs
-            .iter()
-            .all(|directory| directory.is_absolute())
-    );
+}
+
+/// An identity recorded under a search that reaches into the working
+/// directory is keyed by that directory too, and one that does not is not:
+/// a checkout must not answer for another's `./crt1.o`, while every checkout
+/// shares an identity whose search never leaves the toolchain.
+#[test]
+fn a_search_through_the_working_directory_is_told_from_the_environment() {
+    let environment = |library_path: Option<&str>| {
+        BTreeMap::from([("LIBRARY_PATH".to_string(), library_path.map(str::to_owned))])
+    };
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    // WSL's default: the trailing separator is an empty element, which GCC
+    // searches as the current directory.
+    assert!(search_depends_on_working_directory(&environment(Some(
+        &format!("/usr/lib/wsl/lib{separator}")
+    ))));
+    assert!(search_depends_on_working_directory(&environment(Some(
+        &format!("/usr/lib/wsl/lib{separator}lib")
+    ))));
+    assert!(!search_depends_on_working_directory(&environment(Some(
+        "/usr/lib/wsl/lib"
+    ))));
+    assert!(!search_depends_on_working_directory(&environment(None)));
+    assert!(!search_depends_on_working_directory(&BTreeMap::new()));
+    assert!(search_depends_on_working_directory(&BTreeMap::from([(
+        "COMPILER_PATH".to_string(),
+        Some("tools".to_string())
+    )])));
 }
 
 /// A candidate the search passed over because it could not run is pinned

@@ -151,6 +151,18 @@ pub(crate) fn identity_for(
         .iter()
         .map(|name| ((*name).into(), std::env::var(name).ok()))
         .collect::<BTreeMap<_, _>>();
+    // A search that looks in the working directory finds different files in
+    // different checkouts, so an identity recorded in one must not answer for
+    // another. Told from the variables rather than by asking the driver, for
+    // the same reason the search map below is asked for lazily.
+    if search_depends_on_working_directory(&environment)
+        && let Ok(directory) = std::env::current_dir()
+    {
+        environment.insert(
+            "MBX_WORKING_DIRECTORY".into(),
+            Some(directory.display().to_string()),
+        );
+    }
     // The map of where the driver looks, which is what the pins have to
     // cover. Asked once, and only on the way to a probe: a memoized identity
     // must not cost a process to find.
@@ -181,6 +193,25 @@ pub(crate) fn identity_for(
     let (identity, pins) = probe(&driver, fuse_ld.as_ref(), search())?;
     record(&driver, &environment, &identity, pins)?;
     Ok(identity)
+}
+
+/// Whether the driver's search for programs and objects reaches into the
+/// working directory.
+///
+/// GCC searches every element of `COMPILER_PATH` and `LIBRARY_PATH` as
+/// given, and an empty element as `.`, so an element without a root names a
+/// directory that moves with the process. The environment is the whole
+/// answer: the driver is not asked, because this decides whether a recorded
+/// identity can be looked up at all.
+fn search_depends_on_working_directory(environment: &BTreeMap<String, Option<String>>) -> bool {
+    ["COMPILER_PATH", "LIBRARY_PATH"].iter().any(|name| {
+        environment
+            .get(*name)
+            .and_then(Option::as_deref)
+            .is_some_and(|value| {
+                std::env::split_paths(value).any(|directory| !directory.has_root())
+            })
+    })
 }
 
 /// Where the driver looks for programs and for startup objects, in the
@@ -216,23 +247,33 @@ fn search_dirs(driver: &Path) -> Option<SearchDirs> {
     parse_search_dirs(&String::from_utf8_lossy(&output.stdout))
 }
 
-/// Every directory comes back absolute. GCC searches an empty element of
-/// `LIBRARY_PATH` or `COMPILER_PATH` as the current directory and reports it
-/// as `./`, and WSL sets `LIBRARY_PATH=/usr/lib/wsl/lib:` with exactly that
-/// trailing empty element on every shell. The driver ran with this process's
-/// working directory, so that is the directory it searched; a pin has to say
-/// so, because pins are checked later from other working directories, where
-/// `./crt1.o` would name a different file in every checkout.
+/// A directory without a root comes back under the working directory. GCC
+/// searches an empty element of `LIBRARY_PATH` or `COMPILER_PATH` as the
+/// current directory and reports it as `./`, and WSL sets
+/// `LIBRARY_PATH=/usr/lib/wsl/lib:` with exactly that trailing empty element
+/// on every shell. The driver ran with this process's working directory, so
+/// that is the directory it searched; a pin has to say so, because pins are
+/// checked later from other working directories, where `./crt1.o` would name
+/// a different file in every checkout. A working directory that cannot be
+/// read leaves no map at all rather than a relative pin: the identity is then
+/// probed again next session, which is the safe side.
 fn parse_search_dirs(text: &str) -> Option<SearchDirs> {
     let list = |field: &str| {
         text.lines()
             .find_map(|line| line.strip_prefix(field))
             .map(|value| value.trim().trim_start_matches('='))
-            .map(|value| {
+            .and_then(|value| {
                 std::env::split_paths(value)
                     .filter(|directory| !directory.as_os_str().is_empty())
-                    .map(|directory| std::path::absolute(&directory).unwrap_or(directory))
-                    .collect::<Vec<_>>()
+                    .map(|directory| {
+                        if directory.has_root() {
+                            Ok(directory)
+                        } else {
+                            std::path::absolute(&directory)
+                        }
+                    })
+                    .collect::<std::io::Result<Vec<_>>>()
+                    .ok()
             })
             .filter(|directories| !directories.is_empty())
     };
