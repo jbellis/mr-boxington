@@ -180,8 +180,24 @@ after a build, at most once an hour, and needs no configuration. It normally
 runs in the background once the build has returned, so a walk of every managed
 directory never holds up the build that happened to come due, and the next
 build reports what it removed. If the background collector cannot be started,
-the build collects in the foreground instead. A directory that a build claims
-or is compiling in while collection runs is left alone until the next sweep.
+the build collects in the foreground instead.
+
+Every command you run through mbx, such as `mbx test`, `mbx run`, or
+`mbx nextest run`, holds a shared lease on its target directory from start to
+exit. Collection does not remove a directory while any command holds its lease.
+`mbx gc` and the next build's report list such directories as kept, for
+example `kept 1 target directories in use by running commands`. The lease ends
+when the mbx process exits or is killed, and the usual rules below then apply.
+The lease does not protect:
+
+- a binary you start directly from `target/` in a separate command, including
+  test binaries built earlier with `--no-run`;
+- Cargo run directly, without mbx, through the `target` link, which is
+  protected only while Cargo holds its build lock;
+- a child process that keeps running after its mbx process alone was killed.
+  Ctrl-C stops the whole process group, so it ends the command and its lease
+  together.
+
 A target directory is removed when any of these is true:
 
 - Its checkout is gone. This happens regardless of the limits below.
@@ -283,10 +299,11 @@ shortfall from per-checkout state regardless of the budgets:
    `target.evict_first` checkouts ahead of the rest and `target.keep` checkouts
    left alone.
 
-The most recently used target directory, and anything a running build is
-using, is kept as usual. The action store stays at `gc.max_size`, because every
-checkout rebuilds from it. If collection cannot free enough, mbx logs a warning
-and leaves the rest to you. The next build reports what was removed and why:
+The most recently used target directory, and anything a running mbx command
+is using, is kept as usual. The action store stays at `gc.max_size`, because
+every checkout rebuilds from it. If collection cannot free enough, mbx logs a
+warning and leaves the rest to you. The next build reports what was removed
+and why:
 
 ```text
 mbx[gc]: 3.1 GiB free on the disk holding /home/me/.cache/mbx, under the 25.0 GiB minimum; collecting learned incremental state and managed targets past their budgets
@@ -334,11 +351,12 @@ stop creating managed targets, see
 | `mbx adopt [--recursive] [PATH]...` | Adopt existing `target/` directories without deleting their contents |
 | `mbx cache remove /path/to/workspace` | Remove the target and incremental state, then forget that workspace's cache claims |
 
-`mbx clean` also accepts a workspace path. It keeps shared cached objects and
-the workspace's cache claims, so a later build can restore matching outputs.
-`mbx cache remove` forgets those claims as well; objects used by other
-workspaces remain available and normal garbage collection reclaims unneeded
-objects.
+`mbx clean` and `mbx cache remove` keep the target directory, with a warning,
+while a command run through mbx is using it. `mbx clean` also accepts a
+workspace path. It keeps shared cached objects and the workspace's cache
+claims, so a later build can restore matching outputs. `mbx cache remove`
+forgets those claims as well; objects used by other workspaces remain available
+and normal garbage collection reclaims unneeded objects.
 
 Cargo's `cargo clean` follows Cargo's own target-directory behavior and does not
 remove mbx's private incremental state.

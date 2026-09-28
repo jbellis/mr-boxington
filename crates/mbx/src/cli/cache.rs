@@ -389,6 +389,9 @@ pub(super) struct GcTargetReport {
     pub(super) removed_unit_bytes: u64,
     pub(super) remaining_directories: u64,
     pub(super) remaining_bytes: u64,
+    /// Selected for removal but kept, because a running command was using
+    /// them or a build claimed them after the selection.
+    pub(super) kept_active_directories: u64,
 }
 
 #[derive(serde::Serialize)]
@@ -476,7 +479,17 @@ pub(super) fn cache_remove(config: &Config, workspace: &Path) -> Result<()> {
             None
         }
     };
-    let target_bytes = target::remove_workspace(&config.target.root, &workspace)?;
+    let target_bytes = match target::remove_workspace(&config.target.root, &workspace)? {
+        target::RemoveOutcome::Removed(bytes) => Some(bytes),
+        target::RemoveOutcome::Missing => None,
+        target::RemoveOutcome::Active => {
+            log::warn!(
+                "{} is in use by a running command, so its managed target was kept",
+                workspace.display()
+            );
+            None
+        }
+    };
     let removed = store::remove_project(&config.store_dir(), &workspace)?;
     println!(
         "removed {} checkout records for {}",

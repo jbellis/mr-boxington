@@ -55,7 +55,7 @@ pub(super) fn run(config: &Config, args: &CleanArgs) -> Result<ExitCode> {
     }
 
     match target::remove_workspace(&config.target.root, &workspace)? {
-        Some(bytes) => {
+        target::RemoveOutcome::Removed(bytes) => {
             if bytes > 0 {
                 crate::savings::record_quietly(
                     &config.store_dir(),
@@ -71,7 +71,11 @@ pub(super) fn run(config: &Config, args: &CleanArgs) -> Result<ExitCode> {
                 ByteSize::b(bytes).display().iec()
             );
         }
-        None => println!("no managed target for {}", workspace.display()),
+        target::RemoveOutcome::Active => log::warn!(
+            "{} is in use by a running command, so its managed target was kept",
+            workspace.display()
+        ),
+        target::RemoveOutcome::Missing => println!("no managed target for {}", workspace.display()),
     }
     Ok(ExitCode::SUCCESS)
 }

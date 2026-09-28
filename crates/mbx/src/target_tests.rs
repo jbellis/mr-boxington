@@ -605,7 +605,7 @@ fn explicitly_removes_one_workspaces_managed_target() {
 
     let bytes = remove_workspace(&config.target.root, &workspace).unwrap();
 
-    assert_eq!(bytes, Some(7));
+    assert_eq!(bytes, RemoveOutcome::Removed(7));
     assert!(!managed.exists());
     assert!(!workspace.join("target").exists());
     assert_eq!(stats(&config.target.root).unwrap(), ViewStats::default());
@@ -622,7 +622,7 @@ fn explicit_removal_drops_a_link_left_dangling_by_collection() {
 
     let bytes = remove_workspace(&config.target.root, &workspace).unwrap();
 
-    assert_eq!(bytes, Some(0));
+    assert_eq!(bytes, RemoveOutcome::Removed(0));
     assert!(std::fs::symlink_metadata(workspace.join("target")).is_err());
 }
 
@@ -922,6 +922,12 @@ fn counts_nothing_before_anything_is_placed() {
 /// build can start in a checkout that collection had already picked.
 #[test]
 fn a_view_a_build_is_compiling_in_is_kept() {
+    // Releases a lock and then expects collection to find it free, which the
+    // shared test process cannot promise; see `in_own_process`.
+    if !super::lease_tests::in_own_process(module_path!(), "a_view_a_build_is_compiling_in_is_kept")
+    {
+        return;
+    }
     let directory = tempfile::tempdir().unwrap();
     let config = test_config(directory.path(), true);
     let old_workspace = checkout(directory.path(), "old");
@@ -1011,6 +1017,7 @@ fn a_view_claimed_since_the_selection_is_kept() {
             record.updated_secs = 2;
             std::fs::write(&refreshed, serde_json::to_vec(&record).unwrap()).unwrap();
         },
+        |_| {},
         || {},
     )
     .unwrap();
@@ -1063,6 +1070,7 @@ fn a_checkout_recreated_since_the_selection_is_kept() {
             assert!(cargo.try_lock().unwrap());
             std::mem::forget(cargo);
         },
+        |_| {},
         || {},
     )
     .unwrap();
@@ -1099,6 +1107,7 @@ fn a_view_refreshed_within_the_last_seconds_is_kept() {
         false,
         now,
         || {},
+        |_| {},
         || {},
     )
     .unwrap();
@@ -1135,6 +1144,7 @@ fn a_record_rewritten_during_the_removal_is_kept() {
         false,
         now_secs(),
         || {},
+        |_| {},
         move || {
             // The clone's placement: a fresh record, then a fresh directory.
             record_view(&root, &workspace).unwrap();

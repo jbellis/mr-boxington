@@ -15,11 +15,25 @@
 //! ```text
 //! <root>/v1/<digest of the workspace root>/       the target directory itself
 //! <root>/v1/<digest of the workspace root>.json   which checkout it belongs to
+//! <root>/v1/<digest of the workspace root>.lock   held shared by every command using the directory
 //! ```
 //!
 //! The record sits beside the directory rather than inside it because `cargo
 //! clean` empties the directory, and a target directory nothing can trace back
 //! to a checkout could never be collected.
+//!
+//! The lock file is the view's usage lease. Every `mbx cargo` command that may
+//! use the directory holds it shared from before placement until the command
+//! exits, which covers tests, benchmarks and the program `cargo run` starts as
+//! well as compilation. Collection and `mbx clean` must take it exclusively,
+//! without waiting, before they move a directory aside, so a view in use is
+//! never removed. The file sits beside the directory for the same reason as
+//! the record, and because Windows refuses to rename a directory while a file
+//! inside it is open. It is never deleted: a command may have opened it but
+//! not yet locked it, and unlinking it then would let that command lock a file
+//! nobody else can find. Cargo's own `.cargo-lock` and the record refresh at
+//! placement still count as in use, for a build that runs Cargo directly
+//! through the `target` link and so takes no lease.
 
 use crate::config::Config;
 use eyre::{Context, Result};
@@ -159,8 +173,8 @@ pub(crate) struct CollectionOutcome {
     pub removed_bytes: u64,
     pub removed_stale_views: u64,
     pub removed_live_views: u64,
-    /// Selected for removal, then found in use by a build that started after
-    /// the selection was made.
+    /// Selected for removal, then found in use by a running command, or
+    /// claimed by a build that started after the selection was made.
     pub kept_active_views: u64,
     /// Units no build had used for the age limit, removed from target
     /// directories that were kept.
@@ -215,8 +229,115 @@ impl std::fmt::Display for StrandedAdoption {
     }
 }
 
+/// What removing one checkout's managed target directory did.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveOutcome {
+    /// No managed target directory is recorded for the checkout.
+    Missing,
+    /// The directory, its record and the checkout's link were removed; the
+    /// logical bytes the directory held.
+    Removed(u64),
+    /// A running command holds the view's lease, so nothing was removed.
+    Active,
+}
+
+/// Held shared by every command using a view; collection needs it exclusive.
+///
+/// The lock is released when the value is dropped, including when the process
+/// exits for any reason, so a command that crashes leaves nothing to clean up.
+pub(crate) struct ViewLease {
+    _file: std::fs::File,
+}
+
+impl ViewLease {
+    /// Take a shared lock on `<root>/v1/<digest>.lock`, waiting for it.
+    ///
+    /// Commands on one view share it, so they never wait for each other. They
+    /// wait only while a collector holds it exclusively, which lasts as long as
+    /// one rename.
+    pub(crate) fn acquire(root: &Path, workspace_root: &Path) -> Result<Self> {
+        let path = view_lock_path(&view_dir(root, workspace_root));
+        let file =
+            open_view_lock(&path).wrap_err_with(|| format!("could not open {}", path.display()))?;
+        file.lock_shared()
+            .wrap_err_with(|| format!("could not lock {}", path.display()))?;
+        Ok(Self { _file: file })
+    }
+}
+
+/// Whether a record exists for this checkout.
+pub(crate) fn is_recorded(root: &Path, workspace_root: &Path) -> bool {
+    view_record_path(root, workspace_root).exists()
+}
+
+/// `<root>/v1/<digest>.lock` for the view directory `<root>/v1/<digest>`.
+fn view_lock_path(directory: &Path) -> PathBuf {
+    directory.with_extension("lock")
+}
+
+/// Open a view's lock file, creating it and its parent when missing.
+///
+/// Never truncated: the file holds nothing, and on Windows a write to a file
+/// another process has locked fails.
+fn open_view_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+}
+
+/// Take a view's lease exclusively, without waiting.
+///
+/// The returned file holds the reservation until it is dropped. `None` means a
+/// command is using the view, or that the lock could not be taken for another
+/// reason; either way the view must be left alone.
+fn try_reserve_view(directory: &Path) -> Option<std::fs::File> {
+    let path = view_lock_path(directory);
+    let file = match open_view_lock(&path) {
+        Ok(file) => file,
+        Err(error) => {
+            log::warn!(
+                "could not tell whether {} is in use: {error}",
+                directory.display()
+            );
+            return None;
+        }
+    };
+    match file.try_lock() {
+        Ok(()) => Some(file),
+        Err(std::fs::TryLockError::WouldBlock) => None,
+        Err(std::fs::TryLockError::Error(error)) => {
+            log::warn!(
+                "could not tell whether {} is in use: {error}",
+                directory.display()
+            );
+            None
+        }
+    }
+}
+
+/// Move a view aside, in one step, for its files to be removed; returns the
+/// path it now has.
+///
+/// A command that arrives after the rename finds no directory and places a
+/// fresh one, the same as it would after the removal finished; a tree that is
+/// half gone is never at a path a build can reach.
+fn retire_view(directory: &Path) -> std::io::Result<PathBuf> {
+    let aside = removal_path(directory);
+    std::fs::rename(directory, &aside)?;
+    Ok(aside)
+}
+
 /// Remove the managed target view owned by exactly one workspace.
-pub fn remove_workspace(root: &Path, workspace_root: &Path) -> Result<Option<u64>> {
+///
+/// A view a running command holds the lease on is left as it is, record and
+/// link included.
+pub fn remove_workspace(root: &Path, workspace_root: &Path) -> Result<RemoveOutcome> {
     let record_path = view_record_path(root, workspace_root);
     let Some(record) = read_view_record(&record_path) else {
         // Collection removes the record and directory but cannot remove a
@@ -229,20 +350,29 @@ pub fn remove_workspace(root: &Path, workspace_root: &Path) -> Result<Option<u64
             && std::fs::read_link(&link).is_ok_and(|destination| destination == directory)
         {
             remove_link(&link)?;
-            return Ok(Some(0));
+            return Ok(RemoveOutcome::Removed(0));
         }
-        return Ok(None);
+        return Ok(RemoveOutcome::Missing);
     };
     if record.workspace_root != workspace_root {
-        return Ok(None);
+        return Ok(RemoveOutcome::Missing);
     }
     let directory = record_path.with_extension("");
+    let Some(reservation) = try_reserve_view(&directory) else {
+        return Ok(RemoveOutcome::Active);
+    };
     let bytes = tree_bytes(&directory);
-    match std::fs::remove_dir_all(&directory) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+    // The directory, record and link all go while the reservation is held.
+    // A command waiting for its lease then finds none of them and places the
+    // checkout afresh; were the record removed after the reservation, it could
+    // take the record that command had just written, leaving its new directory
+    // untraceable. Only the files go after the reservation is released, since
+    // a waiting command would otherwise wait for the whole deletion.
+    let aside = match retire_view(&directory) {
+        Ok(aside) => Some(aside),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
         Err(error) => return Err(error.into()),
-    }
+    };
     std::fs::remove_file(&record_path).or_else(|error| {
         (error.kind() == std::io::ErrorKind::NotFound)
             .then_some(())
@@ -252,7 +382,14 @@ pub fn remove_workspace(root: &Path, workspace_root: &Path) -> Result<Option<u64
     if std::fs::read_link(&link).is_ok_and(|destination| destination == directory) {
         remove_link(&link)?;
     }
-    Ok(Some(bytes))
+    drop(reservation);
+    if let Some(aside) = aside {
+        // Without a record the moved directory is invisible to everything but
+        // the next collection, which finishes removing it.
+        std::fs::remove_dir_all(&aside)
+            .wrap_err_with(|| format!("could not remove {}", aside.display()))?;
+    }
+    Ok(RemoveOutcome::Removed(bytes))
 }
 
 /// Whether an interactive caller may offer to remove this target directory.
@@ -580,9 +717,10 @@ pub fn place(
         );
         return None;
     }
-    // Cargo keeps its build lock in the old view. Hold those locks across the
-    // link swap, or leave the view alone if a build is still using it. Merely
-    // changing the link can strand Cargo's resolved diagnostic-output paths.
+    // Cargo keeps its build lock in the old view, and a command using it holds
+    // its lease. Hold both across the link swap, or leave the view alone if a
+    // command is still using it. Merely changing the link can strand Cargo's
+    // resolved diagnostic-output paths.
     let build_locks = match lock_replaced_view(target_dir, &managed, workspace_root) {
         Ok(locks) => locks,
         Err(error) => {
@@ -637,12 +775,13 @@ pub fn place(
         }
         return None;
     }
-    // The locks proved no build was using the old view and held that answer
+    // The locks proved no command was using the old view and held that answer
     // across the link swap, which is the step that could strand a build's
-    // resolved paths. They cannot be held any further: an open handle inside
+    // resolved paths. Cargo's cannot be held any further: an open handle inside
     // the old view makes Windows refuse to rename or remove it, and the
     // relocation below would fail with the link already pointing at a view
-    // that has none of the outputs.
+    // that has none of the outputs. The old view's lease goes with them, so
+    // that one release point covers both.
     drop(build_locks);
     // Cargo would create this itself on the way to writing in it. Doing it here
     // keeps the link from dangling in the meantime, which is what someone
@@ -789,27 +928,48 @@ enum Link {
     Replaced(PathBuf),
 }
 
+/// The locks that keep an outdated view unused while placement replaces it.
+#[derive(Default)]
+struct ReplacedViewLocks {
+    /// Cargo's build locks in the old view.
+    _cargo: Vec<fslock::LockFile>,
+    /// The old view's lease, held exclusively.
+    _reservation: Option<std::fs::File>,
+}
+
+/// Lock the outdated view the checkout's link still points at, or fail when
+/// anything is using it.
+///
 /// Cargo's lock is in `<profile>/.cargo-lock`, or
 /// `<target-triple>/<profile>/.cargo-lock` for cross-compilation. Do not follow
 /// symlinks into arbitrary directories while inspecting the managed view.
+/// Cargo's lock covers only compilation, so the old view's lease is taken as
+/// well: a test or program another command started from the old view may
+/// still be running.
 fn lock_replaced_view(
     target_dir: &Path,
     managed: &Path,
     workspace_root: &Path,
-) -> Result<Vec<fslock::LockFile>> {
+) -> Result<ReplacedViewLocks> {
     let Ok(existing) = std::fs::read_link(target_dir) else {
-        return Ok(Vec::new());
+        return Ok(ReplacedViewLocks::default());
     };
     if existing == managed
         || !replaceable_managed_link(&existing, managed, workspace_root)
         || !existing.exists()
     {
-        return Ok(Vec::new());
+        return Ok(ReplacedViewLocks::default());
     }
-    match cargo_locks(&existing)? {
-        Some(locks) => Ok(locks),
-        None => eyre::bail!("Cargo is using {}", existing.display()),
-    }
+    let Some(cargo) = cargo_locks(&existing)? else {
+        eyre::bail!("Cargo is using {}", existing.display());
+    };
+    let Some(reservation) = try_reserve_view(&existing) else {
+        eyre::bail!("a command is using {}", existing.display());
+    };
+    Ok(ReplacedViewLocks {
+        _cargo: cargo,
+        _reservation: Some(reservation),
+    })
 }
 
 /// Take every Cargo lock in a target directory, or report that one is held.
@@ -1119,14 +1279,17 @@ pub(crate) fn collect_by(
         dry_run,
         now_secs(),
         || {},
+        |_| {},
         || {},
     )
 }
 
 /// [`collect`] with the sweep's clock, and with hooks where a build can
-/// arrive: between selecting views and removing them, and between removing a
-/// directory and its record. Tests stand in for that build, and pass a fixed
-/// `now` so the ages they set up do not shift while the sweep runs.
+/// arrive: between selecting views and removing them, while a selected view is
+/// reserved but before it is checked for use, and between removing a directory
+/// and its record. `while_reserved` gets the view directory. Tests stand in for
+/// that build, and pass a fixed `now` so the ages they set up do not shift
+/// while the sweep runs.
 #[allow(clippy::too_many_arguments)]
 fn collect_with(
     root: &Path,
@@ -1136,6 +1299,7 @@ fn collect_with(
     dry_run: bool,
     now: u64,
     before_removal: impl FnOnce(),
+    mut while_reserved: impl FnMut(&Path),
     mut after_removal: impl FnMut(),
 ) -> Result<CollectionOutcome> {
     let mut outcome = CollectionOutcome::default();
@@ -1275,14 +1439,34 @@ fn collect_with(
             continue;
         }
         // The selection above is a snapshot, and collection runs in a process
-        // of its own after the build that scheduled it: a build can begin in
+        // of its own after the build that scheduled it: a command can begin in
         // one of the selected checkouts while the earlier ones are still being
-        // removed. Its placement refreshes the record, and Cargo holds its
-        // lock for as long as it compiles, so either is grounds to leave the
-        // directory standing until the next sweep looks again. Every selected
-        // view gets the checks, not only the live ones: a checkout deleted and
-        // cloned again at the same path has the same view, and the clone can
-        // start building it before its predecessor's directory is gone.
+        // removed, and one may have been running all along. Every `mbx cargo`
+        // command holds the view's lease shared from before placement until it
+        // exits, tests and `cargo run` included, so the reservation taken here
+        // fails while any of them runs. Taking it also keeps one from starting
+        // until the directory has been moved aside, which makes "not in use"
+        // and the move a single step.
+        //
+        // A command that runs Cargo directly through the `target` link takes
+        // no lease. For that, placement refreshes the record and Cargo holds
+        // its lock for as long as it compiles, so either is also grounds to
+        // leave the directory standing until the next sweep looks again.
+        // Every selected view gets the checks, not only the live ones: a
+        // checkout deleted and cloned again at the same path has the same
+        // view, and the clone can start building it before its predecessor's
+        // directory is gone.
+        let reservation = if dry_run {
+            None
+        } else {
+            let Some(reservation) = try_reserve_view(&directory) else {
+                outcome.kept_active_views += 1;
+                remaining = remaining.saturating_add(bytes);
+                continue;
+            };
+            while_reserved(&directory);
+            Some(reservation)
+        };
         if !dry_run {
             let claimed_since = read_view_record(&record_path)
                 .is_some_and(|record| recently_claimed(root, &record, updated, now));
@@ -1302,18 +1486,24 @@ fn collect_with(
                 continue;
             }
         }
-        // Moved aside in one step before its files go. Holding Cargo's lock
-        // would not keep a build out: unlinking the lock file frees it, and
-        // Cargo simply creates another. A build that starts after the rename
-        // finds no directory and makes a fresh one, the same as it would after
-        // the removal finished; a tree that is half gone is never at the path
-        // a build can reach. Windows refuses the rename while anything inside
-        // is open, which is the same answer.
+        // Moved aside in one step, under the reservation, before its files
+        // go. A command that arrives meanwhile waits in its shared lock for no
+        // longer than the rename, then finds no directory and places a fresh
+        // one, the same as it would after the removal finished; the directory
+        // moved aside is not at any path it looks at. The reservation is
+        // released before the files are deleted, so that command does not wait
+        // for the deletion.
+        //
+        // Holding Cargo's lock instead would not keep a build out: unlinking
+        // the lock file frees it, and Cargo simply creates another. Windows
+        // refuses the rename while anything inside is open, which is the same
+        // answer.
         let removal = if dry_run {
             Ok(())
         } else {
-            let aside = removal_path(&directory);
-            std::fs::rename(&directory, &aside).and_then(|()| std::fs::remove_dir_all(&aside))
+            let retired = retire_view(&directory);
+            drop(reservation);
+            retired.and_then(|aside| std::fs::remove_dir_all(&aside))
         };
         match removal {
             Ok(()) => {
@@ -1555,3 +1745,7 @@ pub(crate) fn tree_bytes(directory: &Path) -> u64 {
 #[cfg(test)]
 #[path = "target_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "target_lease_tests.rs"]
+mod lease_tests;

@@ -210,6 +210,32 @@ fn cargo_with_settings_bypass_log_and_roots(
             "MBX_TARGET_ROOT",
         )?;
     }
+    // Held for the whole command, execution included: Cargo's own lock ends
+    // with compilation, and the record refresh above ends with placement,
+    // while `cargo test`, `cargo nextest run` and the program `cargo run`
+    // starts all keep using the directory after both. Collection needs this
+    // lock exclusively before it can remove the view.
+    //
+    // Taken whenever the checkout has a recorded view, not only when
+    // `target.views` is on: with it off, a link an earlier placement left still
+    // sends Cargo's writes into the view (see `target::touch_managed`). A
+    // checkout that never had a view gets no lock file.
+    let view_lease = if existing_target.is_some()
+        || placement_candidate
+        || target::is_recorded(&config.target.root, &roots.workspace_root)
+    {
+        match target::ViewLease::acquire(&config.target.root, &roots.workspace_root) {
+            Ok(lease) => Some(lease),
+            Err(error) => {
+                log::warn!(
+                    "the managed target directory is not protected from collection: {error:#}"
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
     // Placed before the session starts, because the target directory is what
     // the shim maps out of its cache keys and it has to be the one cargo will
     // actually write to.
@@ -484,6 +510,10 @@ fn cargo_with_settings_bypass_log_and_roots(
         }
         other => other,
     };
+    // Released before the sweep is scheduled, so the collector this command
+    // starts does not find the view in use by this very command, and so
+    // ordinary policy applies to the view as soon as the command is over.
+    drop(view_lease);
     account_session(config, settings, session_outcome, removed_target_bytes)
 }
 
