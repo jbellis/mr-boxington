@@ -160,7 +160,7 @@ pub(crate) fn identity_for(
     {
         environment.insert(
             "MBX_WORKING_DIRECTORY".into(),
-            Some(directory.display().to_string()),
+            Some(working_directory_key(&directory)),
         );
     }
     // The map of where the driver looks, which is what the pins have to
@@ -200,18 +200,31 @@ pub(crate) fn identity_for(
 ///
 /// GCC searches every element of `COMPILER_PATH` and `LIBRARY_PATH` as
 /// given, and an empty element as `.`, so an element without a root names a
-/// directory that moves with the process. The environment is the whole
-/// answer: the driver is not asked, because this decides whether a recorded
-/// identity can be looked up at all.
+/// directory that moves with the process; a `GCC_EXEC_PREFIX` without a root
+/// moves the same way. The environment is the whole answer: the driver is
+/// not asked, because this decides whether a recorded identity can be looked
+/// up at all.
 fn search_depends_on_working_directory(environment: &BTreeMap<String, Option<String>>) -> bool {
+    let value = |name: &str| environment.get(name).and_then(Option::as_deref);
     ["COMPILER_PATH", "LIBRARY_PATH"].iter().any(|name| {
-        environment
-            .get(*name)
-            .and_then(Option::as_deref)
-            .is_some_and(|value| {
-                std::env::split_paths(value).any(|directory| !directory.has_root())
-            })
-    })
+        value(name).is_some_and(|value| {
+            std::env::split_paths(value).any(|directory| !directory.has_root())
+        })
+    }) || value("GCC_EXEC_PREFIX").is_some_and(|prefix| !Path::new(prefix).has_root())
+}
+
+/// The working directory as an identity key: the path itself when it is
+/// UTF-8, and otherwise its bytes spelled out, so two directories that differ
+/// only where a lossy conversion would replace a byte still key apart. No
+/// absolute path begins with the marker, so the two spellings cannot meet.
+fn working_directory_key(directory: &Path) -> String {
+    match directory.to_str() {
+        Some(directory) => directory.to_owned(),
+        None => format!(
+            "hex:{}",
+            hex::encode(directory.as_os_str().as_encoded_bytes())
+        ),
+    }
 }
 
 /// Where the driver looks for programs and for startup objects, in the

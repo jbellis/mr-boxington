@@ -168,6 +168,35 @@ fn a_search_through_the_working_directory_is_told_from_the_environment() {
         "COMPILER_PATH".to_string(),
         Some("tools".to_string())
     )])));
+    // A prefix is a single path, and one without a root moves the same way.
+    let prefix =
+        |value: &str| BTreeMap::from([("GCC_EXEC_PREFIX".to_string(), Some(value.to_string()))]);
+    assert!(search_depends_on_working_directory(&prefix("gcc-")));
+    assert!(!search_depends_on_working_directory(&prefix(
+        "/usr/lib/gcc/"
+    )));
+}
+
+/// A working directory keys the identity by its own bytes. Two directories a
+/// lossy conversion would spell the same way must not share a key: their
+/// drivers search different places.
+#[test]
+#[cfg(unix)]
+fn working_directories_key_apart_even_when_not_utf8() {
+    use std::os::unix::ffi::OsStrExt as _;
+    assert_eq!(working_directory_key(Path::new("/work/app")), "/work/app");
+    let first = PathBuf::from(OsStr::from_bytes(b"/work/\xff"));
+    let second = PathBuf::from(OsStr::from_bytes(b"/work/\xfe"));
+    assert_eq!(
+        first.to_string_lossy(),
+        second.to_string_lossy(),
+        "the lossy spellings collide, which is the point"
+    );
+    assert_ne!(
+        working_directory_key(&first),
+        working_directory_key(&second)
+    );
+    assert!(working_directory_key(&first).starts_with("hex:"));
 }
 
 /// A candidate the search passed over because it could not run is pinned
