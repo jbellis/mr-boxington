@@ -2896,9 +2896,10 @@ impl CacheAgent {
     ) -> Result<ExecutableIdentityKey> {
         // Restricted to the variables that actually select what an identity
         // probe reports: the toolchain rustup resolves, the SDK a linker
-        // driver builds against, a `-fuse-ld` linker selection, and the
-        // search path a driver finds its linker on. Anything else would let
-        // one key stand for two different compilers.
+        // driver builds against, a `-fuse-ld` linker selection, the search
+        // path a driver finds its linker on, and the working directory when
+        // that search path reaches into it. Anything else would let one key
+        // stand for two different compilers.
         if !environment.keys().all(|name| {
             matches!(
                 name.as_str(),
@@ -2906,6 +2907,7 @@ impl CacheAgent {
                     | "GCC_EXEC_PREFIX"
                     | "LIBRARY_PATH"
                     | "MBX_FUSE_LD"
+                    | "MBX_WORKING_DIRECTORY"
                     | "PATH"
                     | "RUSTUP_HOME"
                     | "RUSTUP_TOOLCHAIN"

@@ -111,6 +111,124 @@ fn search_dirs_are_read_in_the_order_the_driver_looks() {
     );
 }
 
+/// WSL sets `LIBRARY_PATH=/usr/lib/wsl/lib:`, and GCC searches the empty
+/// element after the colon as the current directory, reporting it as `./`.
+/// The driver searched relative to this process's working directory, so a
+/// directory without a root comes back under it: a pin is checked later from
+/// other working directories, where `./crt1.o` names some other file. A
+/// directory with a root is left as the driver spelled it.
+#[test]
+fn rootless_search_dirs_are_placed_under_the_working_directory() {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let text = format!(
+        "install: /usr/lib/gcc/x86_64-linux-gnu/15/\nprograms: =/usr/libexec/gcc/x86_64-linux-gnu/15/\nlibraries: =/usr/lib/wsl/lib/x86_64-linux-gnu/15/{separator}./x86_64-linux-gnu/15/{separator}./{separator}/usr/lib/gcc/x86_64-linux-gnu/15/\n"
+    );
+    let dirs = parse_search_dirs(&text).expect("both lists are present");
+    let here = std::env::current_dir().unwrap();
+    assert_eq!(
+        dirs.libraries,
+        vec![
+            PathBuf::from("/usr/lib/wsl/lib/x86_64-linux-gnu/15/"),
+            here.join("x86_64-linux-gnu").join("15"),
+            here.clone(),
+            PathBuf::from("/usr/lib/gcc/x86_64-linux-gnu/15/"),
+        ]
+    );
+    assert!(dirs.libraries.iter().all(|directory| directory.has_root()));
+    assert_eq!(
+        dirs.programs,
+        vec![PathBuf::from("/usr/libexec/gcc/x86_64-linux-gnu/15/")]
+    );
+}
+
+/// An identity recorded under a search that reaches into the working
+/// directory is keyed by that directory too, and one that does not is not:
+/// a checkout must not answer for another's `./crt1.o`, while every checkout
+/// shares an identity whose search never leaves the toolchain.
+#[test]
+fn a_search_through_the_working_directory_is_told_from_the_environment() {
+    let environment = |library_path: Option<&str>| {
+        BTreeMap::from([("LIBRARY_PATH".to_string(), library_path.map(str::to_owned))])
+    };
+    let search_depends_on_working_directory = |environment: &BTreeMap<String, Option<String>>| {
+        super::search_depends_on_working_directory(|name| {
+            environment
+                .get(name)
+                .and_then(|value| value.as_deref())
+                .map(std::ffi::OsString::from)
+        })
+    };
+    let separator = if cfg!(windows) { ";" } else { ":" };
+    // WSL's default: the trailing separator is an empty element, which GCC
+    // searches as the current directory.
+    assert!(search_depends_on_working_directory(&environment(Some(
+        &format!("/usr/lib/wsl/lib{separator}")
+    ))));
+    assert!(search_depends_on_working_directory(&environment(Some(
+        &format!("/usr/lib/wsl/lib{separator}lib")
+    ))));
+    assert!(!search_depends_on_working_directory(&environment(Some(
+        "/usr/lib/wsl/lib"
+    ))));
+    assert!(!search_depends_on_working_directory(&environment(None)));
+    assert!(!search_depends_on_working_directory(&BTreeMap::new()));
+    assert!(search_depends_on_working_directory(&BTreeMap::from([(
+        "COMPILER_PATH".to_string(),
+        Some("tools".to_string())
+    )])));
+    // A prefix is a single path, and one without a root moves the same way.
+    let prefix =
+        |value: &str| BTreeMap::from([("GCC_EXEC_PREFIX".to_string(), Some(value.to_string()))]);
+    assert!(search_depends_on_working_directory(&prefix("gcc-")));
+    assert!(!search_depends_on_working_directory(&prefix(
+        "/usr/lib/gcc/"
+    )));
+}
+
+/// A working directory keys the identity by its own bytes. Two directories a
+/// lossy conversion would spell the same way must not share a key: their
+/// drivers search different places.
+#[test]
+#[cfg(unix)]
+fn working_directories_key_apart_even_when_not_utf8() {
+    use std::os::unix::ffi::OsStrExt as _;
+    assert_eq!(working_directory_key(Path::new("/work/app")), "/work/app");
+    let first = PathBuf::from(OsStr::from_bytes(b"/work/\xff"));
+    let second = PathBuf::from(OsStr::from_bytes(b"/work/\xfe"));
+    assert_eq!(
+        first.to_string_lossy(),
+        second.to_string_lossy(),
+        "the lossy spellings collide, which is the point"
+    );
+    assert_ne!(
+        working_directory_key(&first),
+        working_directory_key(&second)
+    );
+    assert!(working_directory_key(&first).starts_with("hex:"));
+}
+
+/// The driver receives `LIBRARY_PATH` as bytes, and searches a rootless
+/// element in it whether or not the rest of the value is UTF-8. The check
+/// reads it the same way, so such a value is not mistaken for an unset one.
+#[test]
+#[cfg(unix)]
+fn a_rootless_element_is_found_in_a_search_variable_that_is_not_utf8() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let value = |bytes: &[u8]| {
+        let value = std::ffi::OsString::from(OsStr::from_bytes(bytes));
+        move |name: &str| (name == "LIBRARY_PATH").then(|| value.clone())
+    };
+    assert!(search_depends_on_working_directory(value(
+        b"/usr/lib/\xff:"
+    )));
+    assert!(search_depends_on_working_directory(value(
+        b"/usr/lib/\xff:lib"
+    )));
+    assert!(!search_depends_on_working_directory(value(
+        b"/usr/lib/\xff:/usr/lib"
+    )));
+}
+
 /// A candidate the search passed over because it could not run is pinned
 /// with its permissions, so `chmod +x` is a change.
 #[test]
