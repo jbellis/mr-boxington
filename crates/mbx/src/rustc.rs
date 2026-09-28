@@ -2821,7 +2821,7 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
     } else {
         // Described before the compiler runs, so a binary replaced while it
         // prints its version is never recorded under the replacement.
-        let pins = compiler_identity_pins(&executable);
+        let mut pins = compiler_identity_pins(&executable);
         let mut command = Command::new(&executable);
         command.arg("-vV");
         for (name, value) in &environment {
@@ -2840,6 +2840,7 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
             );
         }
         let mut stdout = output.stdout;
+        let host = identity_field(&String::from_utf8_lossy(&stdout), "host")?.to_string();
         if clippy {
             let mut command = Command::new(&executable);
             command.arg("--version");
@@ -2862,6 +2863,12 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
             stdout.extend_from_slice(output.stdout.trim_ascii());
             stdout.push(b'\n');
         }
+        let (backend_pins, backends) = codegen_backends(rustc, &host)?;
+        // An unpinned compiler is probed every session, so it stays unpinned.
+        if !pins.is_empty() {
+            pins.extend(backend_pins);
+        }
+        stdout.extend_from_slice(backends.as_bytes());
         let responses = session::request_agent(&[AgentRequest::StoreExecutableIdentity {
             executable,
             environment,
@@ -2886,6 +2893,7 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
                 || line.starts_with("commit-hash:")
                 || line.starts_with("commit-date:")
                 || line.starts_with("LLVM version:")
+                || line.starts_with("mbx-codegen-backend:")
         })
         .collect::<Vec<_>>()
         .join("; ");
@@ -2929,6 +2937,51 @@ fn compiler_identity_pins(executable: &Path) -> Vec<PinnedFile> {
         (Some(executable), Some(driver)) => vec![executable, driver],
         _ => Vec::new(),
     }
+}
+
+/// The backend libraries rustc loads by name from its host's directory in
+/// its sysroot, each pinned before it is hashed into the identity.
+fn codegen_backends(rustc: &OsStr, host: &str) -> Result<(Vec<PinnedFile>, String)> {
+    let mut pins = Vec::new();
+    let mut identity = String::new();
+    let Some(sysroot) = compiler_sysroot(rustc) else {
+        return Ok((pins, identity));
+    };
+    let directory = sysroot
+        .join("lib/rustlib")
+        .join(host)
+        .join("codegen-backends");
+    pins.extend(PinnedFile::describe(directory.clone()));
+    for (path, metadata) in resolved_entries(&directory)? {
+        if !metadata.is_file() {
+            continue;
+        }
+        pins.extend(PinnedFile::describe(path.clone()));
+        let digest = CacheDigest::blake3_file(&path)?;
+        let name = path.file_name().unwrap_or_default();
+        identity += &format!("\nmbx-codegen-backend: {:?} {}\n", name, digest.hash);
+    }
+    Ok((pins, identity))
+}
+
+/// The entries of `directory` sorted by path, with symlinks followed. An
+/// absent directory or a dangling link contributes nothing; any other failure
+/// is an error, so an incomplete listing never becomes an identity.
+fn resolved_entries(directory: &Path) -> Result<Vec<(PathBuf, std::fs::Metadata)>> {
+    let entries = match std::fs::read_dir(directory) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        entries => entries?,
+    };
+    let mut resolved = Vec::new();
+    for entry in entries {
+        let path = entry?.path();
+        match std::fs::metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            metadata => resolved.push((path, metadata?)),
+        }
+    }
+    resolved.sort_by(|(left, _), (right, _)| left.cmp(right));
+    Ok(resolved)
 }
 
 /// The `rustc_driver` library a toolchain installs beside its compiler:

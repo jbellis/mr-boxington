@@ -24,6 +24,57 @@ fn compiler_pins_name_a_toolchain_rustc_and_nothing_else() {
     assert!(pins.iter().all(|pin| pin.state.is_some()));
 }
 
+#[test]
+fn compiler_identity_hashes_sysroot_codegen_backends() {
+    let directory = tempfile::tempdir().unwrap();
+    let bin = directory.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let rustc = bin.join("rustc");
+    std::fs::write(&rustc, "compiler").unwrap();
+    let rustlib = directory.path().join("lib/rustlib");
+    let backends = rustlib.join("aarch64-apple-darwin/codegen-backends");
+    // Another target's backends are never loaded, so they stay out.
+    let other = rustlib.join("x86_64-pc-windows-msvc/codegen-backends");
+    std::fs::create_dir_all(&other).unwrap();
+    std::fs::write(other.join("librustc_codegen_other.dll"), "unused").unwrap();
+    let probe = || codegen_backends(rustc.as_os_str(), "aarch64-apple-darwin").unwrap();
+
+    let (absent, identity) = probe();
+    assert!(identity.is_empty());
+    assert_eq!(absent.len(), 1);
+    assert!(absent[0].state.is_none());
+
+    std::fs::create_dir_all(&backends).unwrap();
+    let library = backends.join("librustc_codegen_cranelift-1.99.0-nightly.dylib");
+    std::fs::write(&library, "backend one").unwrap();
+    assert!(!absent[0].holds());
+    let (pins, first) = probe();
+    assert!(
+        first.contains("mbx-codegen-backend: \"librustc_codegen_cranelift-1.99.0-nightly.dylib\" ")
+    );
+    assert_eq!(
+        pins.iter().map(|pin| pin.path.clone()).collect::<Vec<_>>(),
+        vec![backends.clone(), library.clone()]
+    );
+
+    // A new length: Windows can keep the write time of an immediate rewrite.
+    std::fs::write(&library, "backend 2").unwrap();
+    assert_ne!(probe().1, first);
+    assert!(!pins[1].holds());
+
+    #[cfg(unix)]
+    {
+        let store = directory.path().join("store/librustc_codegen_gcc.so");
+        std::fs::create_dir_all(store.parent().unwrap()).unwrap();
+        std::fs::write(&store, "linked backend").unwrap();
+        std::os::unix::fs::symlink(&store, backends.join("librustc_codegen_gcc.so")).unwrap();
+        std::os::unix::fs::symlink("missing", backends.join("librustc_codegen_gone.so")).unwrap();
+        let (_, linked) = probe();
+        assert!(linked.contains("mbx-codegen-backend: \"librustc_codegen_gcc.so\" "));
+        assert!(!linked.contains("librustc_codegen_gone.so"));
+    }
+}
+
 /// `RUSTC_BOOTSTRAP` enters the key only when set, so builds that never set
 /// it keep their existing keys.
 #[test]

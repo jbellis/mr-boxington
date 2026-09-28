@@ -1227,6 +1227,7 @@ struct Parser<'a> {
     out_dir: Option<PathBuf>,
     explicit_output: Option<PathBuf>,
     target: Option<String>,
+    sysroot_backend: Option<String>,
     options: ParseOptions,
 }
 
@@ -1315,6 +1316,7 @@ impl<'a> Parser<'a> {
             out_dir: None,
             explicit_output: None,
             target: None,
+            sysroot_backend: None,
         }
     }
 
@@ -1331,6 +1333,14 @@ impl<'a> Parser<'a> {
             }
         }
 
+        // rustc searches an explicit sysroot for the backend first, and only the compiler's own is hashed.
+        if let Some(backend) = self.sysroot_backend.take()
+            && self.parsed.iter().any(
+                |argument| matches!(argument, Argument::Path { flag, .. } if flag == "--sysroot"),
+            )
+        {
+            return Err(BypassReason::UnknownFlag(backend));
+        }
         let source = self.source.clone().ok_or(BypassReason::MissingInput)?;
         let link_output = self.classify()?;
         self.require_native_libraries(link_output)?;
@@ -1529,6 +1539,15 @@ impl<'a> Parser<'a> {
                 _ => {}
             }
             if option.starts_with("threads=") {
+                self.parsed.push(Argument::Plain(format!("-Z{option}")));
+                return Ok(());
+            }
+            // rustc loads a value containing a `.` as a library path, which the key doesn't hash.
+            if let Some(backend) = option.strip_prefix("codegen-backend=")
+                && !backend.is_empty()
+                && !backend.contains(['.', '/', '\\'])
+            {
+                self.sysroot_backend = Some(format!("-Z{option}"));
                 self.parsed.push(Argument::Plain(format!("-Z{option}")));
                 return Ok(());
             }

@@ -1521,6 +1521,42 @@ fn models_parallel_frontend_options_in_the_action_key() {
     assert_eq!(attached, separate);
     assert_ne!(key(attached), key(invocation(&["-Zthreads=8"])));
 
+    let cranelift = invocation(&["-Zcodegen-backend=cranelift"]);
+    assert_eq!(cranelift, invocation(&["-Z", "codegen-backend=cranelift"]));
+    assert_ne!(key(cranelift), key(invocation(&["-Zcodegen-backend=llvm"])));
+    assert_ne!(
+        key(invocation(&["-Zcodegen-backend=llvm"])),
+        key(invocation(&[]))
+    );
+    for path in [
+        "codegen-backend=/opt/librustc_codegen_custom.so",
+        "codegen-backend=librustc_codegen_custom.dylib",
+        "codegen-backend=",
+    ] {
+        assert_eq!(
+            RustcInvocation::parse(&args(&[
+                "--crate-name=widget",
+                "--crate-type=lib",
+                "--emit=dep-info,metadata,link",
+                "-Z",
+                path,
+                "src/lib.rs",
+            ])),
+            Err(BypassReason::UnknownFlag(format!("-Z{path}")))
+        );
+    }
+    assert_eq!(
+        RustcInvocation::parse(&args(&[
+            "--crate-name=widget",
+            "--crate-type=lib",
+            "--emit=dep-info,metadata,link",
+            "-Zcodegen-backend=llvm",
+            "--sysroot=/opt/sysroot",
+            "src/lib.rs",
+        ])),
+        Err(BypassReason::UnknownFlag("-Zcodegen-backend=llvm".into()))
+    );
+
     let jobs_frontend = invocation(&["-Zunstable-options", "--jobs-frontend=16"]);
     assert_ne!(key(separate), key(jobs_frontend));
     assert_eq!(
