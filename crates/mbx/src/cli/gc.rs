@@ -63,10 +63,12 @@ pub(super) fn run(
         collector.lock()?;
     }
     let mut low_disk = None;
-    let incremental_limit = incremental_limit(config, retention, max_bytes, &mut low_disk);
+    let store_reserve = occupied_store_budget(config, retention, max_bytes);
+    let incremental_limit = incremental_limit(config, retention, store_reserve, &mut low_disk);
     // The collector below remains the authority for store errors. Estimating
     // a combined budget must not prevent independent target collection when
     // the action store is damaged.
+    let mut accounting_complete = true;
     let incremental = match crate::incremental::collect(
         &config.cache_dir.join("incremental"),
         incremental_limit,
@@ -77,7 +79,10 @@ pub(super) fn run(
         Err(error) => {
             log::warn!("learned incremental state was not collected: {error}");
             let stats = crate::incremental::stats(&config.cache_dir.join("incremental"))
-                .unwrap_or_default();
+                .unwrap_or_else(|_| {
+                    accounting_complete = false;
+                    Default::default()
+                });
             crate::incremental::PruneOutcome {
                 remaining_directories: stats.directories,
                 remaining_bytes: stats.bytes,
@@ -94,13 +99,20 @@ pub(super) fn run(
         incremental_limit.map(|budget| budget.saturating_sub(incremental.remaining_bytes)),
         retention.target_max_age,
         dry_run,
+        &mut accounting_complete,
     );
     // What survives counts against the combined budget the same as learned
     // incremental state: bytes on the disk the limit was set for.
     let reserved_bytes = incremental
         .remaining_bytes
         .saturating_add(generated.remaining_bytes);
-    let target_budget = target_limit(config, retention, max_bytes, reserved_bytes, &mut low_disk);
+    let target_budget = target_limit(
+        config,
+        retention,
+        store_reserve,
+        reserved_bytes,
+        &mut low_disk,
+    );
     // First, ahead of the removals it explains, all of which print below.
     if let Some(disk) = &low_disk
         && !json
@@ -120,17 +132,16 @@ pub(super) fn run(
         dry_run,
     );
     let projected_target_bytes = match &pruned {
-        Ok(outcome) => outcome.remaining_bytes,
+        Ok(outcome) => Some(outcome.remaining_bytes),
         Err(_) if retention.max_total_bytes.is_some() => target::stats(&config.target.root)
-            .map(|stats| stats.bytes)
-            .unwrap_or_default(),
-        Err(_) => 0,
+            .ok()
+            .map(|stats| stats.bytes),
+        Err(_) => None,
     };
-    let store_budget = store_budget(
-        retention,
-        max_bytes,
-        projected_target_bytes.saturating_add(reserved_bytes),
-    );
+    let non_store_bytes = projected_target_bytes
+        .filter(|_| accounting_complete)
+        .map(|bytes| bytes.saturating_add(reserved_bytes));
+    let store_budget = store_budget(retention, max_bytes, non_store_bytes);
     // Small and never load-bearing: a swept flight costs at most one
     // compilation that would have been a hit, so it is not part of the
     // budget arithmetic or the dry run's accounting.
@@ -184,6 +195,13 @@ pub(super) fn run(
             + generated.removed_bytes,
         dry_run,
     );
+    if let Some(warning) = total_budget_warning(
+        retention,
+        non_store_bytes.map(|bytes| outcome.remaining_bytes.saturating_add(bytes)),
+        dry_run,
+    ) {
+        log::warn!("{warning}");
+    }
     if json {
         let pruned = pruned?;
         print_json(&GcReport {
@@ -253,6 +271,7 @@ fn collect_generated(
     max_bytes: Option<u64>,
     max_age: Option<std::time::Duration>,
     dry_run: bool,
+    accounting_complete: &mut bool,
 ) -> crate::out_dir::PruneOutcome {
     match crate::out_dir::collect(
         &config.cache_dir.join(crate::out_dir::ROOT),
@@ -271,9 +290,8 @@ fn collect_generated(
             match crate::out_dir::stats(&config.cache_dir.join(crate::out_dir::ROOT)) {
                 Some(outcome) => outcome,
                 None => {
-                    log::warn!(
-                        "generated source trees could not be measured; this sweep's combined budget does not account for them"
-                    );
+                    *accounting_complete = false;
+                    log::warn!("generated source trees could not be measured");
                     crate::out_dir::PruneOutcome::default()
                 }
             }
@@ -440,18 +458,20 @@ pub(super) fn sweep_store(config: &Config, retention: &RetentionSettings) -> Swe
             let pruned = prune_targets(config, retention, config.gc.max_bytes);
             sweep.delta.freed_target_bytes = pruned.freed_bytes;
             sweep.lines.extend(pruned.removals);
-            let non_store_bytes = pruned.remaining_bytes.unwrap_or_else(|| {
-                let target_bytes =
-                    target::stats(&config.target.root).map_or(0, |stats| stats.bytes);
+            let non_store_bytes = pruned.remaining_bytes.or_else(|| {
+                let target_bytes = target::stats(&config.target.root).ok()?.bytes;
                 let incremental_bytes =
                     crate::incremental::stats(&config.cache_dir.join("incremental"))
-                        .map_or(0, |stats| stats.bytes);
+                        .ok()?
+                        .bytes;
                 let generated_bytes =
-                    crate::out_dir::stats(&config.cache_dir.join(crate::out_dir::ROOT))
-                        .map_or(0, |stats| stats.remaining_bytes);
-                target_bytes
-                    .saturating_add(incremental_bytes)
-                    .saturating_add(generated_bytes)
+                    crate::out_dir::stats(&config.cache_dir.join(crate::out_dir::ROOT))?
+                        .remaining_bytes;
+                Some(
+                    target_bytes
+                        .saturating_add(incremental_bytes)
+                        .saturating_add(generated_bytes),
+                )
             });
             let store_budget = store_budget(retention, config.gc.max_bytes, non_store_bytes);
             crate::scheduler::prune_flights(&config.cache_dir);
@@ -466,6 +486,14 @@ pub(super) fn sweep_store(config: &Config, retention: &RetentionSettings) -> Swe
             sweep.delta.freed_store_bytes = outcome.removed_bytes;
             if outcome.removed_bytes > 0 {
                 sweep.lines.push(evictions(&outcome));
+            }
+            if let Some(warning) = total_budget_warning(
+                retention,
+                non_store_bytes.map(|bytes| outcome.remaining_bytes.saturating_add(bytes)),
+                false,
+            ) {
+                log::warn!("{warning}");
+                sweep.lines.push(warning);
             }
             // After the store's own sweep, which can free space on the cache
             // disk too.
@@ -680,6 +708,7 @@ pub(super) fn prune_targets(
     // collection ever frees, and walking for it on every build would be the
     // slowest, so callers keep this inside the store sweep's throttle.
     let mut low_disk = None;
+    let store_reserve = occupied_store_budget(config, retention, store_reserve);
     let incremental_limit = incremental_limit(config, retention, store_reserve, &mut low_disk);
     let incremental = crate::incremental::collect(
         &config.cache_dir.join("incremental"),
@@ -687,12 +716,19 @@ pub(super) fn prune_targets(
         retention.incremental_max_age,
         false,
     );
+    let mut accounting_complete = true;
     let (incremental_bytes, incremental_remaining) = match incremental {
         Ok(outcome) => (outcome.removed_bytes, outcome.remaining_bytes),
         Err(error) => {
             log::warn!("learned incremental state was not collected: {error}");
             let remaining = crate::incremental::stats(&config.cache_dir.join("incremental"))
-                .map_or(0, |stats| stats.bytes);
+                .map_or_else(
+                    |_| {
+                        accounting_complete = false;
+                        0
+                    },
+                    |stats| stats.bytes,
+                );
             (0, remaining)
         }
     };
@@ -701,6 +737,7 @@ pub(super) fn prune_targets(
         incremental_limit.map(|budget| budget.saturating_sub(incremental_remaining)),
         retention.target_max_age,
         false,
+        &mut accounting_complete,
     );
     if generated.removed_directories > 0 {
         crate::session::note(&format!(
@@ -732,7 +769,8 @@ pub(super) fn prune_targets(
                 pruned.remaining_views
             );
             PruneReport {
-                remaining_bytes: Some(pruned.remaining_bytes.saturating_add(incremental_remaining)),
+                remaining_bytes: accounting_complete
+                    .then_some(pruned.remaining_bytes.saturating_add(incremental_remaining)),
                 freed_bytes: pruned.freed_bytes().saturating_add(incremental_bytes),
                 removals: target_removals(&pruned, false),
             }
@@ -896,6 +934,41 @@ fn warn_if_still_low(config: &Config, retention: &RetentionSettings) {
     }
 }
 
+/// Reserve only occupied store space, capped at what its own sweep will keep.
+/// An empty store must not evict warm targets merely because it could grow.
+/// If measurement fails, keep the former conservative allowance; the store
+/// collector still reports the error without blocking independent cleanup.
+pub(super) fn occupied_store_budget(
+    config: &Config,
+    retention: &RetentionSettings,
+    max_bytes: u64,
+) -> u64 {
+    if retention.max_total_bytes.is_none() {
+        return max_bytes;
+    }
+    store::stats(&config.store_dir()).map_or(max_bytes, |stats| stats.total_bytes().min(max_bytes))
+}
+
+fn total_budget_warning(
+    retention: &RetentionSettings,
+    remaining: Option<u64>,
+    dry_run: bool,
+) -> Option<String> {
+    let budget = retention.max_total_bytes?;
+    let Some(remaining) = remaining else {
+        return Some("could not measure all managed data; gc.max_total_size could not be verified and no space was budgeted for the action store".to_string());
+    };
+    if remaining <= budget {
+        return None;
+    }
+    let verb = if dry_run { "would remain" } else { "remain" };
+    Some(format!(
+        "{} logical {verb} after collection, over gc.max_total_size ({}); active, most-recently-used, kept, or untracked state can prevent reaching this collection target",
+        ByteSize::b(remaining).display().iec(),
+        ByteSize::b(budget).display().iec(),
+    ))
+}
+
 pub(super) fn target_budget(
     retention: &RetentionSettings,
     store_reserve: u64,
@@ -931,9 +1004,12 @@ pub(super) fn incremental_budget(retention: &RetentionSettings, store_reserve: u
 pub(super) fn store_budget(
     retention: &RetentionSettings,
     max_bytes: u64,
-    non_store_bytes: u64,
+    non_store_bytes: Option<u64>,
 ) -> u64 {
     retention.max_total_bytes.map_or(max_bytes, |total| {
-        max_bytes.min(total.saturating_sub(non_store_bytes))
+        // Unknown occupancy cannot establish any room for shared objects.
+        // Independent cleanup still proceeds, and the sweep reports that the
+        // combined budget could not be verified rather than claiming zero use.
+        non_store_bytes.map_or(0, |bytes| max_bytes.min(total.saturating_sub(bytes)))
     })
 }

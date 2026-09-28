@@ -2,7 +2,7 @@ use super::*;
 use std::time::Duration;
 
 #[test]
-fn combined_budget_reserves_the_full_action_store_allowance() {
+fn combined_budget_respects_component_caps_and_occupied_reserves() {
     let retention = RetentionSettings {
         target_max_bytes: Some(80),
         target_max_age: None,
@@ -18,8 +18,8 @@ fn combined_budget_reserves_the_full_action_store_allowance() {
     assert_eq!(incremental_budget(&retention, 70), Some(20));
     assert_eq!(incremental_budget(&retention, 90), Some(10));
     assert_eq!(incremental_budget(&retention, 120), Some(0));
-    assert_eq!(store_budget(&retention, 70, 30), 70);
-    assert_eq!(store_budget(&retention, 70, 60), 40);
+    assert_eq!(store_budget(&retention, 70, Some(30)), 70);
+    assert_eq!(store_budget(&retention, 70, Some(60)), 40);
 }
 
 #[test]
@@ -289,4 +289,146 @@ fn a_directory_and_one_inside_it_are_on_the_same_disk() {
         !crate::util::same_disk(directory.path(), Path::new("/proc")),
         "procfs is a filesystem of its own"
     );
+}
+
+#[test]
+fn a_combined_budget_shares_unoccupied_store_capacity() {
+    for automatic in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut config = super::cargo_tests::managed_target_config(directory.path());
+        config.gc.auto = true;
+        config.gc.interval = Duration::ZERO;
+        config.gc.max_bytes = 160;
+        let retention = RetentionSettings {
+            max_total_bytes: Some(160),
+            min_free: None,
+            ..always_short()
+        };
+        let mut views = Vec::new();
+        for (name, updated_secs) in [("older", 1), ("newer", 2)] {
+            let workspace = directory.path().join(name);
+            std::fs::create_dir_all(&workspace).unwrap();
+            let view = crate::target::place(&config, &workspace, &workspace.join("target"), false)
+                .unwrap();
+            std::fs::write(view.join("artifact"), [0_u8; 64]).unwrap();
+            let record = view.with_extension("json");
+            let mut fields: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+            fields["updated_secs"] = updated_secs.into();
+            std::fs::write(&record, serde_json::to_vec(&fields).unwrap()).unwrap();
+            views.push(view);
+        }
+        let collect = || {
+            if automatic {
+                sweep_store(&config, &retention);
+            } else {
+                gc::run(&config, config.gc.max_bytes, false, false, &retention).unwrap();
+            }
+        };
+        collect();
+        assert!(
+            views.iter().all(|view| view.exists()),
+            "an empty store leaves all 128 target bytes within budget"
+        );
+
+        // Store occupancy, rather than its potential 160-byte allowance,
+        // now puts the combined cache over budget.
+        let objects = config.store_dir().join("cas/v1");
+        std::fs::create_dir_all(&objects).unwrap();
+        std::fs::write(objects.join("object"), [0_u8; 64]).unwrap();
+        assert_eq!(occupied_store_budget(&config, &retention, 160), 64);
+        assert_eq!(occupied_store_budget(&config, &retention, 32), 32);
+        gc::run(&config, config.gc.max_bytes, true, false, &retention).unwrap();
+        assert!(
+            views.iter().all(|view| view.exists()),
+            "dry runs preserve targets"
+        );
+        collect();
+        assert!(
+            !views[0].exists(),
+            "the older target makes room for the occupied store"
+        );
+        assert!(views[1].exists(), "the newest target remains protected");
+        let tight = RetentionSettings {
+            max_total_bytes: Some(32),
+            ..retention
+        };
+        let sweep = sweep_store(&config, &tight);
+        assert!(
+            views[1].exists(),
+            "even an impossible budget preserves the newest target"
+        );
+        assert!(
+            sweep
+                .lines
+                .iter()
+                .any(|line| line.contains("over gc.max_total_size")),
+            "the next build receives the budget warning: {:?}",
+            sweep.lines
+        );
+    }
+}
+
+#[test]
+fn unavailable_component_sizes_do_not_leave_room_in_a_combined_budget() {
+    for component in ["targets", "incremental", "generated"] {
+        for automatic in [false, true] {
+            for combined in [false, true] {
+                let directory = tempfile::tempdir().unwrap();
+                let mut config = super::cargo_tests::managed_target_config(directory.path());
+                config.gc.auto = true;
+                config.gc.interval = Duration::ZERO;
+                config.gc.max_bytes = 160;
+                let retention = RetentionSettings {
+                    max_total_bytes: combined.then_some(160),
+                    min_free: None,
+                    ..always_short()
+                };
+                let broken = match component {
+                    "targets" => config.target.root.join("v1"),
+                    "incremental" => config.cache_dir.join("incremental"),
+                    _ => config.cache_dir.join(crate::out_dir::ROOT),
+                };
+                // A file where a directory is required fails listing on every
+                // platform, including when the tests run with root privileges.
+                std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
+                std::fs::write(&broken, b"not a directory").unwrap();
+                let objects = config.store_dir().join("cas/v1");
+                std::fs::create_dir_all(&objects).unwrap();
+                std::fs::write(objects.join("object"), [0_u8; 64]).unwrap();
+
+                if automatic {
+                    let sweep = sweep_store(&config, &retention);
+                    assert_eq!(
+                        sweep
+                            .lines
+                            .iter()
+                            .any(|line| line.contains("could not be verified")),
+                        combined,
+                        "{component}: {:?}",
+                        sweep.lines
+                    );
+                } else {
+                    // Even a failed preview must leave shared objects alone.
+                    let _ = gc::run(&config, 160, true, false, &retention);
+                    assert_eq!(
+                        crate::store::stats(&config.store_dir())
+                            .unwrap()
+                            .total_bytes(),
+                        64
+                    );
+                    let result = gc::run(&config, 160, false, false, &retention);
+                    assert_eq!(result.is_err(), component == "targets");
+                }
+                assert_eq!(
+                    crate::store::stats(&config.store_dir())
+                        .unwrap()
+                        .total_bytes(),
+                    if combined { 0 } else { 64 },
+                    "{component}, automatic={automatic}, combined={combined}"
+                );
+                assert!(broken.exists(), "the unmeasurable component is left alone");
+            }
+        }
+    }
 }
