@@ -111,6 +111,40 @@ fn search_dirs_are_read_in_the_order_the_driver_looks() {
     );
 }
 
+/// WSL sets `LIBRARY_PATH=/usr/lib/wsl/lib:`, and GCC searches the empty
+/// element after the colon as the current directory, reporting it as `./`.
+/// The driver searched relative to this process's working directory, so the
+/// directories come back absolute against it: a pin is checked later from
+/// other working directories, where `./crt1.o` names some other file.
+#[test]
+fn relative_search_dirs_are_made_absolute_against_the_working_directory() {
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let text = format!(
+        "install: /usr/lib/gcc/x86_64-linux-gnu/15/\nprograms: =/usr/libexec/gcc/x86_64-linux-gnu/15/\nlibraries: =/usr/lib/wsl/lib/x86_64-linux-gnu/15/{separator}./x86_64-linux-gnu/15/{separator}./{separator}/usr/lib/gcc/x86_64-linux-gnu/15/\n"
+    );
+    let dirs = parse_search_dirs(&text).expect("both lists are present");
+    let here = std::env::current_dir().unwrap();
+    assert_eq!(
+        dirs.libraries,
+        vec![
+            PathBuf::from("/usr/lib/wsl/lib/x86_64-linux-gnu/15/"),
+            here.join("./x86_64-linux-gnu/15/"),
+            here.join("./"),
+            PathBuf::from("/usr/lib/gcc/x86_64-linux-gnu/15/"),
+        ]
+    );
+    assert!(
+        dirs.libraries
+            .iter()
+            .all(|directory| directory.is_absolute())
+    );
+    assert!(
+        dirs.programs
+            .iter()
+            .all(|directory| directory.is_absolute())
+    );
+}
+
 /// A candidate the search passed over because it could not run is pinned
 /// with its permissions, so `chmod +x` is a change.
 #[test]

@@ -216,6 +216,13 @@ fn search_dirs(driver: &Path) -> Option<SearchDirs> {
     parse_search_dirs(&String::from_utf8_lossy(&output.stdout))
 }
 
+/// Every directory comes back absolute. GCC searches an empty element of
+/// `LIBRARY_PATH` or `COMPILER_PATH` as the current directory and reports it
+/// as `./`, and WSL sets `LIBRARY_PATH=/usr/lib/wsl/lib:` with exactly that
+/// trailing empty element on every shell. The driver ran with this process's
+/// working directory, so that is the directory it searched; a pin has to say
+/// so, because pins are checked later from other working directories, where
+/// `./crt1.o` would name a different file in every checkout.
 fn parse_search_dirs(text: &str) -> Option<SearchDirs> {
     let list = |field: &str| {
         text.lines()
@@ -224,6 +231,7 @@ fn parse_search_dirs(text: &str) -> Option<SearchDirs> {
             .map(|value| {
                 std::env::split_paths(value)
                     .filter(|directory| !directory.as_os_str().is_empty())
+                    .map(|directory| std::path::absolute(&directory).unwrap_or(directory))
                     .collect::<Vec<_>>()
             })
             .filter(|directories| !directories.is_empty())
