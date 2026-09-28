@@ -1593,10 +1593,13 @@ fn collect_with(
         {
             // The view stays counted as removed: it is gone from the path a
             // build can reach, and the next collection finishes deleting what
-            // was left aside. Its bytes are still on the disk until then, so
-            // they go back to what remains rather than to what was freed.
-            outcome.removed_bytes = outcome.removed_bytes.saturating_sub(bytes);
-            remaining = remaining.saturating_add(bytes);
+            // was left aside. Whatever is still on the disk until then goes
+            // back to what remains rather than to what was freed, measured
+            // rather than assumed, since a deletion that fails partway has
+            // freed the rest.
+            let left = tree_bytes(&aside);
+            outcome.removed_bytes = outcome.removed_bytes.saturating_sub(left);
+            remaining = remaining.saturating_add(left);
             log::warn!(
                 "could not remove the retired target directory {}: {error}",
                 aside.display()

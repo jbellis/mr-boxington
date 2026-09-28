@@ -635,10 +635,10 @@ fn a_dry_run_keeps_a_view_whose_lease_it_cannot_check() {
     assert!(view.exists());
 }
 
-/// A retired directory whose files could not be deleted is still on the
-/// disk. The view is gone from the path a build can reach, but its bytes are
-/// reported as remaining rather than freed, until the next collection finishes
-/// the job.
+/// A retired directory whose files could not all be deleted is still partly
+/// on the disk. The view is gone from the path a build can reach, but what is
+/// still there is reported as remaining rather than freed, until the next
+/// collection finishes the job.
 #[test]
 #[cfg(unix)]
 fn a_deletion_that_fails_after_the_rename_keeps_its_bytes_in_the_total() {
@@ -672,26 +672,30 @@ fn a_deletion_that_fails_after_the_rename_keeps_its_bytes_in_the_total() {
     };
 
     let outcome = collect_expired(&config.target.root);
-    let aside_remains = std::fs::read_dir(views_root(&config.target.root))
+    let aside = std::fs::read_dir(views_root(&config.target.root))
         .unwrap()
         .flatten()
-        .any(|entry| entry.file_name().to_string_lossy().contains(REMOVAL_SUFFIX));
+        .map(|entry| entry.path())
+        .find(|path| {
+            path.file_name()
+                .is_some_and(|name| name.to_string_lossy().contains(REMOVAL_SUFFIX))
+        });
+    // What the failed deletion left, measured the way collection measures.
+    let left = aside.as_deref().map_or(0, tree_bytes);
     unseal(&config.target.root);
-    if !aside_remains && !view.exists() {
+    let Some(aside) = aside else {
         // Running as root: the deletion went through, so there is nothing to
         // account for here.
+        assert!(!view.exists());
         return;
-    }
+    };
 
     assert!(!view.exists(), "the view is gone from its path");
-    assert!(
-        aside_remains,
-        "the files that could not be deleted are still aside"
-    );
+    assert!(aside.exists(), "what could not be deleted is still aside");
     assert_eq!(outcome.removed_views, 1);
-    assert_eq!(outcome.removed_bytes, 0, "nothing was freed yet");
-    assert_eq!(
-        outcome.remaining_bytes, 4_096,
-        "the artifact still on the disk is still counted"
-    );
+    // Deletion may have freed some files before it failed; whichever way it
+    // went, every byte is either freed or remaining, and what remains is what
+    // is still on the disk.
+    assert_eq!(outcome.remaining_bytes, left);
+    assert_eq!(outcome.removed_bytes + outcome.remaining_bytes, 4_096);
 }
