@@ -594,3 +594,104 @@ fn a_command_waiting_on_the_removal_keeps_the_record_it_writes() {
         "the record the waiting command wrote survives the collection"
     );
 }
+
+/// A preview must not promise more than a real run would do. A lease a real
+/// run could not check makes it keep the view, so the dry run reports that
+/// view as kept too, rather than as one it would remove.
+#[test]
+#[cfg(unix)]
+fn a_dry_run_keeps_a_view_whose_lease_it_cannot_check() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if !in_own_process(
+        module_path!(),
+        "a_dry_run_keeps_a_view_whose_lease_it_cannot_check",
+    ) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = lease_test_config(directory.path(), true);
+    let (workspace, view) = expired_view(directory.path(), &config, "project");
+    // A lock file nobody may open. Running as root sees through the mode, in
+    // which case there is nothing here to check.
+    drop(ViewLease::acquire(&config.target.root, &workspace).unwrap());
+    let lock = view_lock_path(&view);
+    std::fs::set_permissions(&lock, std::fs::Permissions::from_mode(0o000)).unwrap();
+    if open_view_lock(&lock).is_ok() {
+        return;
+    }
+
+    let preview = collect(
+        &config.target.root,
+        None,
+        Some(Duration::from_secs(10)),
+        true,
+    )
+    .unwrap();
+    let real = collect_expired(&config.target.root);
+
+    assert_eq!(preview.kept_active_views, 1);
+    assert_eq!(preview.removed_views, 0);
+    assert_eq!(real.kept_active_views, 1, "the real run keeps it too");
+    assert!(view.exists());
+}
+
+/// A retired directory whose files could not be deleted is still on the
+/// disk. The view is gone from the path a build can reach, but its bytes are
+/// reported as remaining rather than freed, until the next collection finishes
+/// the job.
+#[test]
+#[cfg(unix)]
+fn a_deletion_that_fails_after_the_rename_keeps_its_bytes_in_the_total() {
+    use std::os::unix::fs::PermissionsExt as _;
+    if !in_own_process(
+        module_path!(),
+        "a_deletion_that_fails_after_the_rename_keeps_its_bytes_in_the_total",
+    ) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = lease_test_config(directory.path(), true);
+    let (_workspace, view) = expired_view(directory.path(), &config, "project");
+    // A directory nothing can list cannot be emptied, so removing the tree
+    // fails once the rename has succeeded. It sits in a profile's output
+    // directory, which the search for Cargo's locks does not enter, and the
+    // byte count skips what it cannot read: only the deletion is affected.
+    std::fs::create_dir_all(view.join("debug/deps")).unwrap();
+    std::fs::write(view.join("debug/.cargo-lock"), b"").unwrap();
+    let sealed = view.join("debug/deps/sealed");
+    std::fs::create_dir(&sealed).unwrap();
+    std::fs::write(sealed.join("inside"), b"x").unwrap();
+    std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o000)).unwrap();
+    let unseal = |root: &Path| {
+        for entry in std::fs::read_dir(views_root(root)).unwrap().flatten() {
+            let sealed = entry.path().join("debug/deps/sealed");
+            if sealed.exists() {
+                let _ = std::fs::set_permissions(&sealed, std::fs::Permissions::from_mode(0o755));
+            }
+        }
+    };
+
+    let outcome = collect_expired(&config.target.root);
+    let aside_remains = std::fs::read_dir(views_root(&config.target.root))
+        .unwrap()
+        .flatten()
+        .any(|entry| entry.file_name().to_string_lossy().contains(REMOVAL_SUFFIX));
+    unseal(&config.target.root);
+    if !aside_remains && !view.exists() {
+        // Running as root: the deletion went through, so there is nothing to
+        // account for here.
+        return;
+    }
+
+    assert!(!view.exists(), "the view is gone from its path");
+    assert!(
+        aside_remains,
+        "the files that could not be deleted are still aside"
+    );
+    assert_eq!(outcome.removed_views, 1);
+    assert_eq!(outcome.removed_bytes, 0, "nothing was freed yet");
+    assert_eq!(
+        outcome.remaining_bytes, 4_096,
+        "the artifact still on the disk is still counted"
+    );
+}

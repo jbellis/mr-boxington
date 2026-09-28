@@ -325,16 +325,18 @@ fn try_reserve_view(directory: &Path) -> Option<std::fs::File> {
 ///
 /// For a dry run, which must not create the lock file: one that does not
 /// exist is held by nobody. The exclusive lock a free file grants is let go
-/// at once.
+/// at once. A lock that cannot be checked counts as held, as it does for
+/// [`try_reserve_view`], so the preview says what a real run would do.
 fn view_in_use(directory: &Path) -> bool {
-    let Ok(file) = std::fs::OpenOptions::new()
+    let file = match std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(view_lock_path(directory))
-    else {
-        return false;
+    {
+        Ok(file) => file,
+        Err(error) => return error.kind() != std::io::ErrorKind::NotFound,
     };
-    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+    file.try_lock().is_err()
 }
 
 /// Move a view aside, in one step, for its files to be removed; returns the
@@ -1589,9 +1591,12 @@ fn collect_with(
         if let Some(aside) = aside
             && let Err(error) = std::fs::remove_dir_all(&aside)
         {
-            // Counted as removed above: the directory is gone from the path
-            // a build can reach, and the next collection finishes deleting
-            // what it left aside.
+            // The view stays counted as removed: it is gone from the path a
+            // build can reach, and the next collection finishes deleting what
+            // was left aside. Its bytes are still on the disk until then, so
+            // they go back to what remains rather than to what was freed.
+            outcome.removed_bytes = outcome.removed_bytes.saturating_sub(bytes);
+            remaining = remaining.saturating_add(bytes);
             log::warn!(
                 "could not remove the retired target directory {}: {error}",
                 aside.display()
