@@ -479,3 +479,118 @@ fn unrelated_views_are_collected_while_another_is_in_use() {
     assert!(busy.join("artifact").exists());
     assert!(!idle.exists());
 }
+
+/// A preview must say what a real run would do. A view a command is using
+/// would be kept, so the dry run reports it as kept rather than as removed,
+/// and it asks without touching anything: a view that never had a lock file
+/// does not get one from a preview.
+#[test]
+fn a_dry_run_reports_a_view_in_use_without_creating_its_lock_file() {
+    if !in_own_process(
+        module_path!(),
+        "a_dry_run_reports_a_view_in_use_without_creating_its_lock_file",
+    ) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = lease_test_config(directory.path(), true);
+    let (busy_workspace, busy) = expired_view(directory.path(), &config, "busy");
+    let (_idle_workspace, idle) = expired_view(directory.path(), &config, "idle");
+
+    let lease = ViewLease::acquire(&config.target.root, &busy_workspace).unwrap();
+    let outcome = collect(
+        &config.target.root,
+        None,
+        Some(Duration::from_secs(10)),
+        true,
+    )
+    .unwrap();
+
+    assert_eq!(outcome.kept_active_views, 1);
+    assert_eq!(outcome.removed_views, 1, "the idle view would be removed");
+    assert!(busy.exists() && idle.exists(), "a dry run removes nothing");
+    assert!(
+        !view_lock_path(&idle).exists(),
+        "a dry run does not create a lock file for a view that had none"
+    );
+
+    drop(lease);
+    let outcome = collect(
+        &config.target.root,
+        None,
+        Some(Duration::from_secs(10)),
+        true,
+    )
+    .unwrap();
+    assert_eq!(outcome.kept_active_views, 0);
+    assert_eq!(outcome.removed_views, 2);
+}
+
+/// The record goes while the reservation is still held. A command waiting for
+/// its lease therefore finds neither the directory nor a record when it gets
+/// through, and the record it writes for its fresh view is not the one
+/// collection removes.
+#[test]
+fn a_command_waiting_on_the_removal_keeps_the_record_it_writes() {
+    if !in_own_process(
+        module_path!(),
+        "a_command_waiting_on_the_removal_keeps_the_record_it_writes",
+    ) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = lease_test_config(directory.path(), true);
+    let (workspace, view) = expired_view(directory.path(), &config, "project");
+    let record = view_record_path(&config.target.root, &workspace);
+    let lock = view_lock_path(&view);
+
+    let mut waiting: Option<JoinHandle<PathBuf>> = None;
+    let outcome = collect_with(
+        &config.target.root,
+        None,
+        Some(Duration::from_secs(10)),
+        &Precedence::default(),
+        false,
+        now_secs(),
+        || {},
+        |_| {
+            // The command arrives while collection holds the view: it waits
+            // for its lease, then places the checkout as a wrapper would.
+            let (root, workspace, config) = (
+                config.target.root.clone(),
+                workspace.clone(),
+                config.clone(),
+            );
+            let (started, ready) = mpsc::channel();
+            waiting = Some(std::thread::spawn(move || {
+                started.send(()).unwrap();
+                let _lease = ViewLease::acquire(&root, &workspace).unwrap();
+                place(&config, &workspace, &workspace.join("target"), false).unwrap()
+            }));
+            ready.recv().unwrap();
+        },
+        || {
+            // Between the directory and the record: the reservation is still
+            // held, so the waiting command cannot have written anything yet.
+            let probe = open_view_lock(&lock).unwrap();
+            assert!(
+                matches!(
+                    probe.try_lock_shared(),
+                    Err(std::fs::TryLockError::WouldBlock)
+                ),
+                "the record is removed under the reservation"
+            );
+            assert!(!record.exists() || read_view_record(&record).is_some());
+        },
+    )
+    .unwrap();
+
+    assert_eq!(outcome.removed_views, 1);
+    let placed = waiting.unwrap().join().unwrap();
+    assert_eq!(placed, view);
+    assert!(view.exists(), "the waiting command placed a fresh view");
+    assert!(
+        is_recorded(&config.target.root, &workspace),
+        "the record the waiting command wrote survives the collection"
+    );
+}

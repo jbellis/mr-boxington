@@ -254,7 +254,7 @@ impl ViewLease {
     ///
     /// Commands on one view share it, so they never wait for each other. They
     /// wait only while a collector holds it exclusively, which lasts as long as
-    /// one rename.
+    /// one rename and the removal of the view's record.
     pub(crate) fn acquire(root: &Path, workspace_root: &Path) -> Result<Self> {
         let path = view_lock_path(&view_dir(root, workspace_root));
         let file =
@@ -321,6 +321,22 @@ fn try_reserve_view(directory: &Path) -> Option<std::fs::File> {
     }
 }
 
+/// Whether a command holds a view's lease, asked without changing anything.
+///
+/// For a dry run, which must not create the lock file: one that does not
+/// exist is held by nobody. The exclusive lock a free file grants is let go
+/// at once.
+fn view_in_use(directory: &Path) -> bool {
+    let Ok(file) = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(view_lock_path(directory))
+    else {
+        return false;
+    };
+    matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock))
+}
+
 /// Move a view aside, in one step, for its files to be removed; returns the
 /// path it now has.
 ///
@@ -361,13 +377,13 @@ pub fn remove_workspace(root: &Path, workspace_root: &Path) -> Result<RemoveOutc
     let Some(reservation) = try_reserve_view(&directory) else {
         return Ok(RemoveOutcome::Active);
     };
-    let bytes = tree_bytes(&directory);
     // The directory, record and link all go while the reservation is held.
     // A command waiting for its lease then finds none of them and places the
     // checkout afresh; were the record removed after the reservation, it could
     // take the record that command had just written, leaving its new directory
-    // untraceable. Only the files go after the reservation is released, since
-    // a waiting command would otherwise wait for the whole deletion.
+    // untraceable. Only measuring and deleting the files come after the
+    // release: both walk the whole tree, and a waiting command would otherwise
+    // wait for the walk.
     let aside = match retire_view(&directory) {
         Ok(aside) => Some(aside),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -383,9 +399,12 @@ pub fn remove_workspace(root: &Path, workspace_root: &Path) -> Result<RemoveOutc
         remove_link(&link)?;
     }
     drop(reservation);
+    let mut bytes = 0;
     if let Some(aside) = aside {
-        // Without a record the moved directory is invisible to everything but
-        // the next collection, which finishes removing it.
+        // The moved directory is at no path a command looks at, so this is
+        // nobody's wait. Without a record it is invisible to everything but
+        // the next collection, which finishes removing it should this fail.
+        bytes = tree_bytes(&aside);
         std::fs::remove_dir_all(&aside)
             .wrap_err_with(|| format!("could not remove {}", aside.display()))?;
     }
@@ -1457,6 +1476,13 @@ fn collect_with(
         // view, and the clone can start building it before its predecessor's
         // directory is gone.
         let reservation = if dry_run {
+            // Told, not taken: a real run would keep this view, and a preview
+            // that listed it for removal would be wrong about it.
+            if view_in_use(&directory) {
+                outcome.kept_active_views += 1;
+                remaining = remaining.saturating_add(bytes);
+                continue;
+            }
             None
         } else {
             let Some(reservation) = try_reserve_view(&directory) else {
@@ -1487,26 +1513,27 @@ fn collect_with(
             }
         }
         // Moved aside in one step, under the reservation, before its files
-        // go. A command that arrives meanwhile waits in its shared lock for no
-        // longer than the rename, then finds no directory and places a fresh
-        // one, the same as it would after the removal finished; the directory
-        // moved aside is not at any path it looks at. The reservation is
-        // released before the files are deleted, so that command does not wait
-        // for the deletion.
+        // go. The record goes under it too: a command that arrives meanwhile
+        // waits in its shared lock, and must find neither the directory nor a
+        // record when it gets through, or the record it then writes could be
+        // the one taken here, leaving its new directory invisible to every
+        // later collection. It waits for no longer than a rename and an
+        // unlink, then places a fresh view, the same as it would after the
+        // removal finished; the directory moved aside is not at any path it
+        // looks at, and its files are deleted after the release so that
+        // command does not wait for the deletion.
         //
         // Holding Cargo's lock instead would not keep a build out: unlinking
         // the lock file frees it, and Cargo simply creates another. Windows
         // refuses the rename while anything inside is open, which is the same
         // answer.
-        let removal = if dry_run {
-            Ok(())
+        let aside = if dry_run {
+            Ok(None)
         } else {
-            let retired = retire_view(&directory);
-            drop(reservation);
-            retired.and_then(|aside| std::fs::remove_dir_all(&aside))
+            retire_view(&directory).map(Some)
         };
-        match removal {
-            Ok(()) => {
+        let aside = match aside {
+            Ok(aside) => {
                 outcome.removed_views += 1;
                 outcome.removed_bytes += bytes;
                 if live {
@@ -1514,6 +1541,7 @@ fn collect_with(
                 } else {
                     outcome.removed_stale_views += 1;
                 }
+                aside
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 outcome.removed_views += 1;
@@ -1522,6 +1550,7 @@ fn collect_with(
                 } else {
                     outcome.removed_stale_views += 1;
                 }
+                None
             }
             Err(error) => {
                 remaining = remaining.saturating_add(bytes);
@@ -1531,15 +1560,17 @@ fn collect_with(
                 );
                 continue;
             }
-        }
+        };
         if !dry_run {
             after_removal();
         }
-        // Last, so a failed removal above leaves the record to try again with.
-        // And only if it still describes the directory just removed: a build
-        // that placed the checkout while the removal ran has written a new
-        // record and made a new directory, and taking that record would leave
-        // the directory invisible to every later collection.
+        // After the directory, so a failed rename above leaves the record to
+        // try again with. And only if it still describes the directory just
+        // moved: a build that placed the checkout while the removal ran has
+        // written a new record and made a new directory, and taking that
+        // record would leave the directory invisible to every later
+        // collection. A command holding its lease cannot have done so under
+        // the reservation; this covers whatever wrote a record without one.
         let superseded = !dry_run
             && (read_view_record(&record_path)
                 .is_some_and(|record| recently_claimed(root, &record, updated, now))
@@ -1552,6 +1583,18 @@ fn collect_with(
             log::warn!(
                 "could not remove the target record {}: {error}",
                 record_path.display()
+            );
+        }
+        drop(reservation);
+        if let Some(aside) = aside
+            && let Err(error) = std::fs::remove_dir_all(&aside)
+        {
+            // Counted as removed above: the directory is gone from the path
+            // a build can reach, and the next collection finishes deleting
+            // what it left aside.
+            log::warn!(
+                "could not remove the retired target directory {}: {error}",
+                aside.display()
             );
         }
     }
