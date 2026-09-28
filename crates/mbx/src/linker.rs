@@ -155,7 +155,7 @@ pub(crate) fn identity_for(
     // different checkouts, so an identity recorded in one must not answer for
     // another. Told from the variables rather than by asking the driver, for
     // the same reason the search map below is asked for lazily.
-    if search_depends_on_working_directory(&environment)
+    if search_depends_on_working_directory(|name| std::env::var_os(name))
         && let Ok(directory) = std::env::current_dir()
     {
         environment.insert(
@@ -203,14 +203,16 @@ pub(crate) fn identity_for(
 /// directory that moves with the process; a `GCC_EXEC_PREFIX` without a root
 /// moves the same way. The environment is the whole answer: the driver is
 /// not asked, because this decides whether a recorded identity can be looked
-/// up at all.
-fn search_depends_on_working_directory(environment: &BTreeMap<String, Option<String>>) -> bool {
-    let value = |name: &str| environment.get(name).and_then(Option::as_deref);
+/// up at all. The variables are read as the driver receives them, bytes and
+/// all, so a value that is not UTF-8 is still searched for a rootless element.
+fn search_depends_on_working_directory(
+    variable: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> bool {
     ["COMPILER_PATH", "LIBRARY_PATH"].iter().any(|name| {
-        value(name).is_some_and(|value| {
-            std::env::split_paths(value).any(|directory| !directory.has_root())
+        variable(name).is_some_and(|value| {
+            std::env::split_paths(&value).any(|directory| !directory.has_root())
         })
-    }) || value("GCC_EXEC_PREFIX").is_some_and(|prefix| !Path::new(prefix).has_root())
+    }) || variable("GCC_EXEC_PREFIX").is_some_and(|prefix| !Path::new(&prefix).has_root())
 }
 
 /// The working directory as an identity key: the path itself when it is

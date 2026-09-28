@@ -150,6 +150,14 @@ fn a_search_through_the_working_directory_is_told_from_the_environment() {
     let environment = |library_path: Option<&str>| {
         BTreeMap::from([("LIBRARY_PATH".to_string(), library_path.map(str::to_owned))])
     };
+    let search_depends_on_working_directory = |environment: &BTreeMap<String, Option<String>>| {
+        super::search_depends_on_working_directory(|name| {
+            environment
+                .get(name)
+                .and_then(|value| value.as_deref())
+                .map(std::ffi::OsString::from)
+        })
+    };
     let separator = if cfg!(windows) { ";" } else { ":" };
     // WSL's default: the trailing separator is an empty element, which GCC
     // searches as the current directory.
@@ -197,6 +205,28 @@ fn working_directories_key_apart_even_when_not_utf8() {
         working_directory_key(&second)
     );
     assert!(working_directory_key(&first).starts_with("hex:"));
+}
+
+/// The driver receives `LIBRARY_PATH` as bytes, and searches a rootless
+/// element in it whether or not the rest of the value is UTF-8. The check
+/// reads it the same way, so such a value is not mistaken for an unset one.
+#[test]
+#[cfg(unix)]
+fn a_rootless_element_is_found_in_a_search_variable_that_is_not_utf8() {
+    use std::os::unix::ffi::OsStrExt as _;
+    let value = |bytes: &[u8]| {
+        let value = std::ffi::OsString::from(OsStr::from_bytes(bytes));
+        move |name: &str| (name == "LIBRARY_PATH").then(|| value.clone())
+    };
+    assert!(search_depends_on_working_directory(value(
+        b"/usr/lib/\xff:"
+    )));
+    assert!(search_depends_on_working_directory(value(
+        b"/usr/lib/\xff:lib"
+    )));
+    assert!(!search_depends_on_working_directory(value(
+        b"/usr/lib/\xff:/usr/lib"
+    )));
 }
 
 /// A candidate the search passed over because it could not run is pinned
