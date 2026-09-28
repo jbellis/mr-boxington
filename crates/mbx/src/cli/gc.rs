@@ -227,6 +227,7 @@ pub(super) fn run(
                 removed_unit_bytes: pruned.removed_unit_bytes,
                 remaining_directories: pruned.remaining_views,
                 remaining_bytes: pruned.remaining_bytes,
+                kept_active_directories: pruned.kept_active_views,
             },
             incremental: GcIncrementalReport {
                 removed_directories: incremental.removed_directories,
@@ -385,7 +386,7 @@ pub(super) fn target_removals(outcome: &target::CollectionOutcome, dry_run: bool
     let mut lines = Vec::new();
     let kept = if outcome.kept_active_views > 0 {
         format!(
-            ", {} kept for builds that started meanwhile",
+            ", {} kept for running commands or builds that started meanwhile",
             outcome.kept_active_views
         )
     } else {
@@ -399,6 +400,14 @@ pub(super) fn target_removals(outcome: &target::CollectionOutcome, dry_run: bool
             outcome.removed_stale_views,
             outcome.removed_live_views,
             ByteSize::b(outcome.remaining_bytes).display().iec(),
+        ));
+    } else if outcome.kept_active_views > 0 {
+        // Said on its own when nothing else went, so a collection that could
+        // not free a directory somebody is using does not look like one that
+        // found nothing to do.
+        lines.push(format!(
+            "kept {} target directories in use by running commands",
+            outcome.kept_active_views
         ));
     }
     if outcome.removed_units > 0 {

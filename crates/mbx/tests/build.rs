@@ -562,14 +562,20 @@ fn cargo_with(
     cargo_with_command(mbx_command(), project, store, report, arguments, settings)
 }
 
-fn cargo_with_command(
+/// Prepare `command` to run `arguments` in `project` against `store`, with the
+/// settings a test does not name taken out of the machine's hands and
+/// `settings` applied on top.
+///
+/// Separate from running it so a test can start the command and act while it
+/// is still running.
+fn isolated_cargo_command(
     mut command: Command,
     project: &Path,
     store: &Path,
     report: &Path,
     arguments: &[&str],
     settings: &[(&str, &str)],
-) -> (serde_json::Value, String) {
+) -> Command {
     command
         .current_dir(project)
         .args(arguments)
@@ -627,6 +633,18 @@ fn cargo_with_command(
     for (name, value) in settings {
         command.env(name, value);
     }
+    command
+}
+
+fn cargo_with_command(
+    command: Command,
+    project: &Path,
+    store: &Path,
+    report: &Path,
+    arguments: &[&str],
+    settings: &[(&str, &str)],
+) -> (serde_json::Value, String) {
+    let mut command = isolated_cargo_command(command, project, store, report, arguments, settings);
     // Tests that copy mbx to a new path and run the copy can hit ETXTBSY: a
     // sibling test that forks while the copy is open for write hands its child
     // that descriptor until the child reaches its own exec.
@@ -3736,6 +3754,173 @@ mod target_views {
             output.contains("removed 1 target directories"),
             "gc should say what it freed: {output}"
         );
+    }
+
+    /// What a fixture program prints once it is running, and then waits for
+    /// its standard input to close before it exits.
+    ///
+    /// The line is the test's sign that Cargo has finished and the program is
+    /// what is running; closing standard input is how the test lets it go. No
+    /// clock is involved, so the window in which `mbx gc` runs is exactly the
+    /// time the program is running, however slow the machine.
+    const WAIT_FOR_STDIN: &str = r#"{
+    use std::io::{Read, Write};
+    let mut out = std::io::stdout();
+    out.write_all(b"ready\n").unwrap();
+    out.flush().unwrap();
+    let mut rest = String::new();
+    std::io::stdin().read_to_string(&mut rest).unwrap();
+}"#;
+
+    /// Run `mbx gc` with a maximum age every managed target directory in
+    /// `store` has passed, once its record has been aged.
+    fn gc_expired_targets(store: &Path) -> (String, String) {
+        let output = mbx_command()
+            .arg("gc")
+            .env("MBX_CACHE_DIR", store)
+            .env("MBX_TARGET_MAX_AGE", "1s")
+            .output()
+            .expect("mbx gc should run");
+        let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(
+            output.status.success(),
+            "gc failed ({}):\nstdout: {stdout}\nstderr: {stderr}",
+            output.status
+        );
+        (stdout, stderr)
+    }
+
+    /// Start `arguments` under mbx in `project`, whose program prints
+    /// `ready` and then waits on standard input, and check that `mbx gc`
+    /// keeps the managed target directory while the program runs and
+    /// removes it once the command has exited.
+    ///
+    /// Once Cargo has finished compiling, the target directory is still in
+    /// use: `cargo run` executes the program from it, and `cargo test`
+    /// executes the test binaries from it. Removing it underneath them takes
+    /// away files they may still open, such as a test's fixtures or a
+    /// program's own dynamic libraries.
+    fn assert_gc_waits_for(project: &Path, arguments: &[&str]) {
+        let store = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        // A file rather than a pipe, so that nothing has to drain it while the
+        // test waits on standard output, and so a failure can quote it.
+        let stderr_path = reports.path().join("stderr");
+        let mut child = isolated_cargo_command(
+            mbx_command(),
+            project,
+            store.path(),
+            &reports.path().join("run.json"),
+            arguments,
+            &[("MBX_TARGET_VIEWS", "1")],
+        )
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(std::fs::File::create(&stderr_path).unwrap())
+        .spawn()
+        .expect("mbx should start");
+        let child_stderr = || std::fs::read_to_string(&stderr_path).unwrap_or_default();
+
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut seen = String::new();
+        loop {
+            let mut line = String::new();
+            let read = std::io::BufRead::read_line(&mut stdout, &mut line).unwrap();
+            assert!(
+                read > 0,
+                "the program should say it is running before stdout closes ({:?}):\nstdout: {seen}\nstderr: {}",
+                child.wait(),
+                child_stderr()
+            );
+            seen.push_str(&line);
+            // libtest prints its own lines around a test, and when it runs
+            // tests one at a time it opens the test's line before the test
+            // runs, so only the end of the line is the program's.
+            if line.trim_end().ends_with("ready") {
+                break;
+            }
+        }
+
+        let view = managed(project);
+        assert!(
+            view.starts_with(store.path().join("targets/v1")),
+            "the target directory should be managed: {}",
+            view.display()
+        );
+        // Make the view old enough to expire, so the only thing standing
+        // between it and collection is the command still using it.
+        let record = view.with_extension("json");
+        let mut fields: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record).expect("the view should have a record"))
+                .unwrap();
+        fields["updated_secs"] = 1.into();
+        std::fs::write(&record, serde_json::to_vec(&fields).unwrap()).unwrap();
+
+        let (gc_stdout, gc_stderr) = gc_expired_targets(store.path());
+        assert!(
+            view.is_dir() && record.is_file(),
+            "gc should keep a target directory a running command uses:\ngc stdout: {gc_stdout}\ngc stderr: {gc_stderr}\nmbx stderr: {}",
+            child_stderr()
+        );
+        assert!(
+            gc_stdout
+                .lines()
+                .any(|line| line == "kept 1 target directories in use by running commands"),
+            "gc should say why it kept the target directory:\ngc stdout: {gc_stdout}\ngc stderr: {gc_stderr}"
+        );
+
+        drop(child.stdin.take());
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut stdout, &mut rest).unwrap();
+        let status = child.wait().unwrap();
+        assert!(
+            status.success(),
+            "the command should succeed ({status}):\nstdout: {seen}{rest}\nstderr: {}",
+            child_stderr()
+        );
+
+        let (gc_stdout, gc_stderr) = gc_expired_targets(store.path());
+        assert!(
+            !view.exists(),
+            "gc should remove the expired target directory once the command has exited:\ngc stdout: {gc_stdout}\ngc stderr: {gc_stderr}"
+        );
+        assert!(
+            gc_stdout.contains("removed 1 target directories"),
+            "gc should say what it removed:\ngc stdout: {gc_stdout}\ngc stderr: {gc_stderr}"
+        );
+    }
+
+    #[test]
+    fn gc_leaves_a_target_directory_alone_while_cargo_run_is_running() {
+        let project = tempfile::tempdir().unwrap();
+        write_project(project.path());
+        std::fs::write(
+            project.path().join("src/main.rs"),
+            format!("fn main() {WAIT_FOR_STDIN}\n"),
+        )
+        .unwrap();
+
+        // mbx runs the program itself once Cargo has exited, so Cargo's own
+        // lock on the target directory is gone by the time the program runs.
+        assert_gc_waits_for(project.path(), &["run", "--offline"]);
+    }
+
+    #[test]
+    fn gc_leaves_a_target_directory_alone_while_cargo_test_is_running() {
+        let project = tempfile::tempdir().unwrap();
+        write_project(project.path());
+        // Written through the raw handle, which libtest does not capture, so
+        // the line reaches the test even though the test passes.
+        std::fs::write(
+            project.path().join("src/lib.rs"),
+            format!(
+                "pub fn double(value: u32) -> u32 {{\n    value * 2\n}}\n\n#[test]\nfn waits_for_its_caller() {WAIT_FOR_STDIN}\n"
+            ),
+        )
+        .unwrap();
+
+        assert_gc_waits_for(project.path(), &["test", "--offline"]);
     }
 
     #[test]
