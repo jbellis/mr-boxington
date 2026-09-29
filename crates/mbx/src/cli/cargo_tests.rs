@@ -429,6 +429,7 @@ pub(super) fn managed_target_config(root: &Path) -> Config {
         linker: Default::default(),
         target: crate::config::TargetSettings {
             views: true,
+            lanes: true,
             seed: false,
             root: root.join("targets"),
         },
@@ -545,4 +546,346 @@ fn a_configured_target_directory_is_neither_adopted_nor_asked_about() {
 
     assert_eq!(decided, None);
     assert!(target_dir.join("artifact").is_file());
+}
+
+fn lane_roots(workspace: &Path) -> Roots {
+    Roots {
+        workspace_root: workspace.to_path_buf(),
+        target_dir: workspace.join("target"),
+        build_dir: None,
+        target_dir_requested: false,
+    }
+}
+
+fn placed(workspace: &Path) -> TargetViewPlacement {
+    TargetViewPlacement {
+        directory: Some(workspace.join("managed")),
+        touch_path: workspace.join("target"),
+    }
+}
+
+fn lane(
+    working_dir: &Path,
+    config: &Config,
+    roots: &Roots,
+    placement: &TargetViewPlacement,
+    arguments: &[String],
+) -> Option<PathBuf> {
+    check_lane(
+        config,
+        roots,
+        placement,
+        std::ffi::OsStr::new("cargo"),
+        working_dir,
+        arguments,
+    )
+}
+
+fn arguments(arguments: &[&str]) -> Vec<String> {
+    arguments.iter().map(ToString::to_string).collect()
+}
+
+#[test]
+fn check_and_clippy_get_a_lane_inside_the_managed_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = managed_target_config(directory.path());
+    let workspace = directory.path().join("project");
+    let roots = lane_roots(&workspace);
+    let placement = placed(&workspace);
+
+    for command in [
+        &["check"][..],
+        &["clippy", "--workspace", "--", "-D", "warnings"],
+        &["+stable", "clippy"],
+        &["--config", "term.color='never'", "check", "--all-targets"],
+    ] {
+        assert_eq!(
+            lane(
+                directory.path(),
+                &config,
+                &roots,
+                &placement,
+                &arguments(command)
+            ),
+            Some(workspace.join(CHECK_LANE_TARGET_DIR)),
+            "{command:?}"
+        );
+    }
+}
+
+#[test]
+fn commands_that_leave_outputs_behind_keep_the_shared_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = managed_target_config(directory.path());
+    let workspace = directory.path().join("project");
+    let roots = lane_roots(&workspace);
+    let placement = placed(&workspace);
+
+    for command in [
+        &["build"][..],
+        &["test"],
+        &["run"],
+        &["doc"],
+        &["nextest", "run"],
+        // Program arguments are not subcommands.
+        &["run", "--", "check"],
+    ] {
+        assert_eq!(
+            lane(
+                directory.path(),
+                &config,
+                &roots,
+                &placement,
+                &arguments(command)
+            ),
+            None,
+            "{command:?}"
+        );
+    }
+}
+
+#[test]
+fn a_lane_is_only_used_where_mbx_is_placing_an_undirected_target() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = managed_target_config(directory.path());
+    let workspace = directory.path().join("project");
+    let placement = placed(&workspace);
+    let check = arguments(&["check"]);
+
+    // A flag, the environment, or Cargo's configuration named the directory.
+    let requested = Roots {
+        target_dir_requested: true,
+        ..lane_roots(&workspace)
+    };
+    assert_eq!(
+        lane(directory.path(), &config, &requested, &placement, &check),
+        None
+    );
+
+    // Configuration moved the target somewhere other than the default.
+    let elsewhere = Roots {
+        target_dir: directory.path().join("elsewhere"),
+        ..lane_roots(&workspace)
+    };
+    assert_eq!(
+        lane(directory.path(), &config, &elsewhere, &placement, &check),
+        None
+    );
+
+    // Cargo keeps its intermediate files, and the lock, out of the target.
+    let separate = Roots {
+        build_dir: Some(directory.path().join("build")),
+        ..lane_roots(&workspace)
+    };
+    assert_eq!(
+        lane(directory.path(), &config, &separate, &placement, &check),
+        None
+    );
+
+    // A build directory that is the target itself is not separate.
+    let same = Roots {
+        build_dir: Some(workspace.join("target")),
+        ..lane_roots(&workspace)
+    };
+    assert!(lane(directory.path(), &config, &same, &placement, &check).is_some());
+
+    // Placement declined, so there is no managed view to put a lane in.
+    let unplaced = TargetViewPlacement {
+        directory: None,
+        touch_path: workspace.join("target"),
+    };
+    assert_eq!(
+        lane(
+            directory.path(),
+            &config,
+            &lane_roots(&workspace),
+            &unplaced,
+            &check
+        ),
+        None
+    );
+
+    config.target.lanes = false;
+    assert_eq!(
+        lane(
+            directory.path(),
+            &config,
+            &lane_roots(&workspace),
+            &placement,
+            &check
+        ),
+        None
+    );
+}
+
+#[test]
+fn a_lane_is_named_right_after_the_subcommand() {
+    let lane = Path::new("/work/project/target/check");
+
+    assert_eq!(
+        lane_cargo_arguments(
+            &arguments(&["+stable", "clippy", "--workspace", "--", "-D", "warnings"]),
+            lane
+        ),
+        arguments(&[
+            "+stable",
+            "clippy",
+            "--target-dir",
+            "/work/project/target/check",
+            "--workspace",
+            "--",
+            "-D",
+            "warnings",
+        ])
+    );
+    assert_eq!(
+        lane_cargo_arguments(
+            &arguments(&["--config", "term.color='never'", "check"]),
+            lane
+        ),
+        arguments(&[
+            "--config",
+            "term.color='never'",
+            "check",
+            "--target-dir",
+            "/work/project/target/check",
+        ])
+    );
+}
+
+#[test]
+fn a_config_naming_the_build_directory_rules_out_a_lane() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = managed_target_config(directory.path());
+    let workspace = directory.path().join("project");
+    std::fs::create_dir_all(workspace.join(".cargo")).unwrap();
+    // The same path as the target, so the probe reports nothing unusual, yet
+    // the lock lives where the caller put it and no lane can move it.
+    std::fs::write(
+        workspace.join(".cargo/config.toml"),
+        "[build]\nbuild-dir = \"target\"\n",
+    )
+    .unwrap();
+    let roots = Roots {
+        build_dir: Some(workspace.join("target")),
+        ..lane_roots(&workspace)
+    };
+    let check = arguments(&["check"]);
+
+    assert!(build_dir_configured(&workspace, &check));
+    assert_eq!(
+        lane(&workspace, &config, &roots, &placed(&workspace), &check),
+        None
+    );
+}
+
+#[test]
+fn a_config_flag_that_could_name_the_build_directory_rules_out_a_lane() {
+    for named in [
+        &["--config", "build.build-dir='target'", "check"][..],
+        &["--config=build.build-dir='target'", "check"],
+        // A file can set anything, including the build directory.
+        &["--config", "extra.toml", "check"],
+    ] {
+        assert!(build_dir_named_in(&arguments(named)), "{named:?}");
+    }
+    for unrelated in [
+        &["--config", "term.color='never'", "check"][..],
+        &["check", "--", "--config", "extra.toml"],
+        &["check"],
+        &["--config"],
+    ] {
+        assert!(!build_dir_named_in(&arguments(unrelated)), "{unrelated:?}");
+    }
+}
+
+#[test]
+fn a_plain_command_name_is_not_expanded() {
+    let cargo = std::ffi::OsStr::new("cargo");
+    for typed in [
+        &["check"][..],
+        &["+stable", "clippy", "--workspace"],
+        &["build", "--release"],
+        &["test"],
+    ] {
+        let typed = arguments(typed);
+        assert_eq!(
+            super::cargo_invocation::expanded_arguments(cargo, &typed),
+            Some(typed.clone()),
+        );
+    }
+}
+
+#[test]
+fn a_target_dir_ahead_of_the_program_arguments_rules_out_a_lane() {
+    for named in [
+        &["check", "--target-dir", "elsewhere"][..],
+        &["clippy", "--target-dir=elsewhere", "--workspace"],
+        &["--target-dir", "elsewhere", "check"],
+    ] {
+        assert!(target_dir_named_in(&arguments(named)), "{named:?}");
+    }
+    for unrelated in [
+        &["check", "--workspace"][..],
+        &["clippy", "--", "--target-dir", "elsewhere"],
+    ] {
+        assert!(!target_dir_named_in(&arguments(unrelated)), "{unrelated:?}");
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let config = managed_target_config(directory.path());
+    let workspace = directory.path().join("project");
+    let roots = lane_roots(&workspace);
+    let check = arguments(&["check", "--target-dir", "elsewhere"]);
+    assert_eq!(
+        lane(
+            directory.path(),
+            &config,
+            &roots,
+            &placed(&workspace),
+            &check
+        ),
+        None
+    );
+}
+
+#[test]
+fn configuration_is_read_from_the_directory_the_command_moves_to() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    std::fs::create_dir_all(project.join(".cargo")).unwrap();
+    std::fs::write(
+        project.join(".cargo/config.toml"),
+        "[build]\nbuild-dir = \"target\"\n",
+    )
+    .unwrap();
+    let elsewhere = directory.path().join("elsewhere");
+    std::fs::create_dir_all(&elsewhere).unwrap();
+
+    for moved in [
+        &["-C", "../project", "check"][..],
+        &["-C../project", "check"],
+        &["--directory", "../project", "check"],
+        &["--directory=../project", "check"],
+        &["-C", "..", "-C", "project", "check"],
+        &["-C", project.to_str().unwrap(), "check"],
+        // Global options may follow the command, and clap takes `=` after `-C`.
+        &["check", "-C", "../project"],
+        &["check", "--directory=../project", "--workspace"],
+        &["-C=../project", "check"],
+        &["check", "-C=../project"],
+    ] {
+        let moved = arguments(moved);
+        assert_eq!(
+            invocation_dir(&elsewhere, &moved).canonicalize().unwrap(),
+            project.canonicalize().unwrap(),
+            "{moved:?}"
+        );
+        // The setting is in the project, not where the command was typed.
+        assert!(build_dir_configured(&elsewhere, &moved), "{moved:?}");
+    }
+
+    // Arguments after `--` belong to the program, not to Cargo.
+    let unmoved = arguments(&["check", "--", "-C", "../project"]);
+    assert_eq!(invocation_dir(&elsewhere, &unmoved), elsewhere);
 }

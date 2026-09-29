@@ -3667,6 +3667,282 @@ mod target_views {
     }
 
     #[test]
+    fn check_and_clippy_get_their_own_directory_inside_the_managed_target() {
+        // Clippy is an external subcommand, so it takes a different route to
+        // the lane than the built-in `check` does.
+        for command in ["check", "clippy"] {
+            if command == "clippy" && !clippy_available() {
+                continue;
+            }
+            let store = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let reports = tempfile::tempdir().unwrap();
+            write_project(project.path());
+            let settings = [("MBX_TARGET_VIEWS", "1")];
+
+            cargo_with(
+                project.path(),
+                store.path(),
+                &reports.path().join("check.json"),
+                &[command, "--offline"],
+                &settings,
+            );
+
+            let directory = managed(project.path());
+            assert!(
+                directory.join("check/debug/.cargo-lock").is_file(),
+                "`{command}` should write to the lane inside the managed target"
+            );
+            assert!(
+                !directory.join("debug").exists(),
+                "`{command}` should leave the build's profile directory alone"
+            );
+
+            build_with(
+                project.path(),
+                store.path(),
+                &reports.path().join("build.json"),
+                &settings,
+            );
+            assert!(
+                project.path().join("target/debug/libfixture.rlib").exists(),
+                "a build should still write where builds have always written"
+            );
+        }
+    }
+
+    fn clippy_available() -> bool {
+        Command::new(cargo())
+            .args(["clippy", "--version"])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
+
+    fn lane_check(
+        project: &Path,
+        store: &Path,
+        report: &Path,
+        settings: &[(&str, &str)],
+        stderr: Stdio,
+    ) -> std::process::Child {
+        isolated_cargo_command(
+            mbx_command(),
+            project,
+            store,
+            report,
+            &["check", "--offline"],
+            settings,
+        )
+        .stdout(Stdio::null())
+        .stderr(stderr)
+        .spawn()
+        .expect("mbx should run")
+    }
+
+    /// Wait for `predicate` to hold of `path`'s contents, up to `wait`.
+    fn file_eventually(
+        path: &Path,
+        wait: std::time::Duration,
+        predicate: impl Fn(&str) -> bool,
+    ) -> bool {
+        let deadline = std::time::Instant::now() + wait;
+        while std::time::Instant::now() < deadline {
+            if std::fs::read_to_string(path).is_ok_and(|text| predicate(&text)) {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        false
+    }
+
+    /// Whether `child` finished within `wait`, killing it if it did not.
+    fn finishes_within(child: &mut std::process::Child, wait: std::time::Duration) -> bool {
+        let deadline = std::time::Instant::now() + wait;
+        while std::time::Instant::now() < deadline {
+            if child.try_wait().unwrap().is_some() {
+                return true;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        child.kill().unwrap();
+        child.wait().unwrap();
+        false
+    }
+
+    #[test]
+    fn a_check_does_not_wait_for_a_build_holding_the_target_lock() {
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_project(project.path());
+        build_with(
+            project.path(),
+            store.path(),
+            &reports.path().join("build.json"),
+            &[("MBX_TARGET_VIEWS", "1")],
+        );
+        // What a build in progress holds for as long as it compiles.
+        let lock = std::fs::File::open(project.path().join("target/debug/.cargo-lock"))
+            .expect("a build should leave Cargo's lock file behind");
+        lock.lock().unwrap();
+
+        // The control: with lanes off, Cargo reports that it is waiting on the
+        // build's lock. Observing that, rather than a slow start, is what makes
+        // the run below a test of the lane.
+        let log = reports.path().join("queued.log");
+        let mut queued = lane_check(
+            project.path(),
+            store.path(),
+            &reports.path().join("queued.json"),
+            &[("MBX_TARGET_VIEWS", "1"), ("MBX_TARGET_LANES", "0")],
+            Stdio::from(std::fs::File::create(&log).unwrap()),
+        );
+        let blocked = file_eventually(&log, std::time::Duration::from_secs(60), |text| {
+            text.lines().any(|line| {
+                line.contains("waiting for file lock on") && !line.contains("package cache")
+            })
+        });
+        queued.kill().unwrap();
+        queued.wait().unwrap();
+        assert!(
+            blocked,
+            "without a lane the check should wait for the build's lock: {}",
+            std::fs::read_to_string(&log).unwrap_or_default()
+        );
+
+        let mut check = lane_check(
+            project.path(),
+            store.path(),
+            &reports.path().join("check.json"),
+            &[("MBX_TARGET_VIEWS", "1")],
+            Stdio::null(),
+        );
+        assert!(
+            finishes_within(&mut check, std::time::Duration::from_secs(60)),
+            "a check in its own lane should not wait for the build"
+        );
+        assert!(check.wait().unwrap().success());
+    }
+
+    #[test]
+    fn an_alias_for_check_gets_the_lane_too() {
+        // `c` is Cargo's own shorthand; `chk` is one this project defines.
+        for alias in ["c", "chk"] {
+            let store = tempfile::tempdir().unwrap();
+            let project = tempfile::tempdir().unwrap();
+            let reports = tempfile::tempdir().unwrap();
+            write_project(project.path());
+            std::fs::create_dir_all(project.path().join(".cargo")).unwrap();
+            std::fs::write(
+                project.path().join(".cargo/config.toml"),
+                "[alias]\nchk = \"check\"\n",
+            )
+            .unwrap();
+
+            cargo_with(
+                project.path(),
+                store.path(),
+                &reports.path().join("alias.json"),
+                &[alias, "--offline"],
+                &[("MBX_TARGET_VIEWS", "1")],
+            );
+
+            let directory = managed(project.path());
+            assert!(
+                directory.join("check/debug/.cargo-lock").is_file(),
+                "`{alias}` should write to the lane"
+            );
+            assert!(!directory.join("debug").exists(), "`{alias}`");
+        }
+    }
+
+    #[test]
+    fn an_alias_that_names_a_target_directory_keeps_it() {
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_project(project.path());
+        std::fs::create_dir_all(project.path().join(".cargo")).unwrap();
+        std::fs::write(
+            project.path().join(".cargo/config.toml"),
+            "[alias]\nchk-elsewhere = \"check --target-dir elsewhere\"\n",
+        )
+        .unwrap();
+
+        cargo_with(
+            project.path(),
+            store.path(),
+            &reports.path().join("alias.json"),
+            &["chk-elsewhere", "--offline"],
+            &[("MBX_TARGET_VIEWS", "1")],
+        );
+
+        // Where the alias sent it, not a lane laid over the top of it.
+        assert!(project.path().join("elsewhere/debug").is_dir());
+        if let Ok(managed) = std::fs::read_link(project.path().join("target")) {
+            assert!(!managed.join("check").exists());
+        }
+    }
+
+    #[test]
+    fn a_build_directory_in_the_environment_keeps_a_check_in_the_shared_target() {
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_project(project.path());
+
+        // The target's own path, so nothing about the probe looks unusual.
+        let output = isolated_cargo_command(
+            mbx_command(),
+            project.path(),
+            store.path(),
+            &reports.path().join("check.json"),
+            &["check", "--offline"],
+            &[("MBX_TARGET_VIEWS", "1")],
+        )
+        .env("CARGO_BUILD_BUILD_DIR", "target")
+        .output()
+        .expect("mbx should run");
+
+        assert!(
+            output.status.success(),
+            "check failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let directory = managed(project.path());
+        assert!(!directory.join("check").exists());
+        assert!(directory.join("debug").is_dir());
+    }
+
+    #[test]
+    fn a_configured_build_directory_keeps_a_check_in_the_shared_target() {
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_project(project.path());
+        std::fs::create_dir_all(project.path().join(".cargo")).unwrap();
+        // The same path as the target: a lane would move the target but leave
+        // the lock, and the check would still queue behind a build.
+        std::fs::write(
+            project.path().join(".cargo/config.toml"),
+            "[build]\nbuild-dir = \"target\"\n",
+        )
+        .unwrap();
+
+        cargo_with(
+            project.path(),
+            store.path(),
+            &reports.path().join("check.json"),
+            &["check", "--offline"],
+            &[("MBX_TARGET_VIEWS", "1")],
+        );
+
+        let directory = managed(project.path());
+        assert!(!directory.join("check").exists());
+        assert!(directory.join("debug").is_dir());
+    }
+
+    #[test]
     fn mbx_clean_removes_the_managed_view_and_link() {
         let store = tempfile::tempdir().unwrap();
         let project = tempfile::tempdir().unwrap();

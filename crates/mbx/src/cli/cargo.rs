@@ -105,7 +105,7 @@ fn cargo_with_settings_bypass_log_and_roots(
     }
     crate::storage::check_cache(config)?;
     let working_dir = std::env::current_dir()?;
-    let roots = match roots {
+    let mut roots = match roots {
         Some(roots) => roots,
         None => {
             let target_dir_env = std::env::var_os(CARGO_TARGET_DIR_ENV);
@@ -291,6 +291,15 @@ fn cargo_with_settings_bypass_log_and_roots(
         }
         None => (place_target_view(config, &roots), None, None),
     };
+    // Chosen after placement, because it is a directory inside the managed
+    // view: a build that could not place `target/` has nowhere to put one.
+    let check_lane = check_lane(config, &roots, &placement, &cargo, &working_dir, arguments);
+    let lane_arguments = check_lane
+        .as_ref()
+        .map(|lane| lane_cargo_arguments(arguments, lane));
+    if let Some(lane) = &check_lane {
+        roots.target_dir.clone_from(lane);
+    }
     crate::storage::require_local(
         &roots.target_dir,
         "Cargo target directory",
@@ -315,6 +324,7 @@ fn cargo_with_settings_bypass_log_and_roots(
     }
     if config.target.seed
         && !placing_editor
+        && check_lane.is_none()
         && let Some(view) = placement.directory.as_deref()
     {
         seed_target_view(config, &cargo, &roots.workspace_root, view, arguments);
@@ -375,7 +385,10 @@ fn cargo_with_settings_bypass_log_and_roots(
                 if settings.plain_output {
                     environment.insert("CARGO_TERM_PROGRESS_WHEN".into(), "never".into());
                 }
-                return Ok((run_cargo(&cargo, arguments, environment), None));
+                // The lane still applies: without the session Cargo would
+                // otherwise go back to the target a build may be holding.
+                let fallback = lane_arguments.as_deref().unwrap_or(arguments);
+                return Ok((run_cargo(&cargo, fallback, environment), None));
             }
             Err(error) => return Err(error),
         };
@@ -455,7 +468,10 @@ fn cargo_with_settings_bypass_log_and_roots(
         // inherited by tests and build scripts. Their nested Cargo builds
         // resolve their own targets, including any caller-specified setting.
         let placed_arguments;
-        let cargo_arguments = if placement.directory.is_some() {
+        let cargo_arguments = if check_lane.is_some() {
+            placed_arguments = lane_cargo_arguments(arguments, &roots.target_dir);
+            &placed_arguments
+        } else if placement.directory.is_some() {
             placed_arguments = placed_cargo_arguments(arguments, &roots.target_dir);
             &placed_arguments
         } else {
@@ -539,9 +555,138 @@ pub(super) fn placed_cargo_arguments(arguments: &[String], target: &Path) -> Vec
     arguments
 }
 
+/// Send a check to its lane. Unlike the placement above, this has to reach
+/// `cargo-clippy`: an external subcommand never sees the global `--config`, but
+/// it forwards its own flags to the `cargo check` it runs, so the flag goes
+/// right after the subcommand and ahead of anything meant for the compiler.
+pub(super) fn lane_cargo_arguments(arguments: &[String], lane: &Path) -> Vec<String> {
+    let mut arguments = arguments.to_vec();
+    let after_subcommand = super::launch::cargo_subcommand_at(&arguments)
+        .map_or(arguments.len(), |(index, _)| index + 1);
+    arguments.splice(
+        after_subcommand..after_subcommand,
+        ["--target-dir".into(), lane.to_string_lossy().into_owned()],
+    );
+    arguments
+}
+
 pub(super) struct TargetViewPlacement {
     pub(super) directory: Option<PathBuf>,
     pub(super) touch_path: PathBuf,
+}
+
+/// The directory a diagnostics-only command writes to, when it should not
+/// share `target/` with builds.
+///
+/// Cargo holds a lock on the target directory while it compiles, so a `cargo
+/// clippy` started beside a `cargo build` waits for the build to finish. Checks
+/// write metadata rather than the binaries a build leaves in `target/`, so they
+/// can live in a directory of their own inside the managed view, the way the
+/// editor's checks do. The shared cache warms both.
+///
+/// Only for a build that mbx is placing and that nobody has directed
+/// elsewhere: a flag, the environment, or Cargo's configuration naming a target
+/// or build directory is the caller's choice, and one Cargo keeps outside the
+/// target would leave the lock shared anyway.
+pub(super) fn check_lane(
+    config: &Config,
+    roots: &Roots,
+    placement: &TargetViewPlacement,
+    cargo: &std::ffi::OsStr,
+    working_dir: &Path,
+    arguments: &[String],
+) -> Option<PathBuf> {
+    let separate_build_dir = roots
+        .build_dir
+        .as_deref()
+        .is_some_and(|build_dir| *build_dir != *roots.target_dir);
+    // The cheap questions first: this runs on every command.
+    if !(config.target.lanes
+        && placement.directory.is_some()
+        && !roots.target_dir_requested
+        && !separate_build_dir
+        && roots.target_dir == roots.workspace_root.join("target"))
+        || build_dir_configured(working_dir, arguments)
+    {
+        return None;
+    }
+    // What Cargo will run, not what was typed: an alias can name a target of
+    // its own, which the roots probe never sees.
+    let expanded = super::cargo_invocation::expanded_arguments(cargo, arguments)?;
+    (matches!(
+        super::launch::cargo_subcommand(&expanded),
+        Some("check" | "clippy")
+    ) && !target_dir_named_in(&expanded))
+    .then(|| roots.workspace_root.join(super::CHECK_LANE_TARGET_DIR))
+}
+
+/// A `--target-dir` among the arguments meant for Cargo.
+pub(super) fn target_dir_named_in(arguments: &[String]) -> bool {
+    arguments
+        .iter()
+        .take_while(|argument| *argument != "--")
+        .any(|argument| argument == "--target-dir" || argument.starts_with("--target-dir="))
+}
+
+/// Whether the caller named Cargo's build directory, where its lock lives.
+///
+/// The probe reports the directory Cargo will use either way, and one left at
+/// its default is the target itself, so a setting that names the target's own
+/// path is indistinguishable from none. A lane moves the target but not a
+/// build directory that was set, so any setting rules a lane out.
+pub(super) fn build_dir_configured(working_dir: &Path, arguments: &[String]) -> bool {
+    // Checked by name: the configuration loader below reads files, and Cargo
+    // lets this variable stand in for the setting.
+    std::env::var_os("CARGO_BUILD_BUILD_DIR").is_some()
+        || build_dir_named_in(arguments)
+        || match cargo_config2::Config::load_with_cwd(invocation_dir(working_dir, arguments)) {
+            Ok(config) => config.build.build_dir.is_some(),
+            // Cargo will not run with configuration it cannot read either.
+            Err(_) => true,
+        }
+}
+
+/// The directory Cargo reads its configuration from: where it is run, moved by
+/// any `-C` or `--directory`. Cargo takes both as global options, so they count
+/// before or after the command, in every spelling clap accepts, and up to the
+/// arguments meant for the program.
+pub(super) fn invocation_dir(working_dir: &Path, arguments: &[String]) -> PathBuf {
+    let mut directory = working_dir.to_path_buf();
+    let mut arguments = arguments.iter().take_while(|argument| *argument != "--");
+    while let Some(argument) = arguments.next() {
+        let moved = if argument == "-C" || argument == "--directory" {
+            arguments.next().map(String::as_str)
+        } else if let Some(value) = argument.strip_prefix("--directory=") {
+            Some(value)
+        } else {
+            argument
+                .strip_prefix("-C")
+                .map(|value| value.strip_prefix('=').unwrap_or(value))
+        };
+        if let Some(moved) = moved {
+            directory = directory.join(moved);
+        }
+    }
+    directory
+}
+
+/// A `--config` that mentions the build directory, or names a file that could.
+pub(super) fn build_dir_named_in(arguments: &[String]) -> bool {
+    let mut arguments = arguments.iter().take_while(|argument| *argument != "--");
+    while let Some(argument) = arguments.next() {
+        let value = match argument.strip_prefix("--config=") {
+            Some(value) => value,
+            None if argument == "--config" => match arguments.next() {
+                Some(value) => value,
+                None => return false,
+            },
+            None => continue,
+        };
+        if value.contains("build-dir") || !value.contains('=') {
+            return true;
+        }
+    }
+    false
 }
 
 /// Place the editor's explicit target inside the checkout's managed view.
