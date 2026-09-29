@@ -692,3 +692,151 @@ fn mascot_lid_descends_a_pixel_per_frame_through_jumps_in_progress() {
         assert_eq!(lids.last(), Some(&0), "{lids:?}");
     }
 }
+
+const ERASE: &str = "\r\x1b[2A\x1b[J";
+
+fn drawn_frame() -> Frame {
+    let mut frame = Frame::default();
+    frame.draw(b"", "block\r\nrows\r\n".into(), 2);
+    frame
+}
+
+#[test]
+fn finished_lines_wait_and_reach_the_terminal_with_the_block_repainted() {
+    let mut frame = drawn_frame();
+    // Nothing is erased until the replacement is ready to go out with it.
+    assert!(frame.write(b"warning: one\r\n").is_empty());
+    assert!(frame.write(b"warning: two\r\n").is_empty());
+    assert_eq!(
+        String::from_utf8(frame.present(true)).unwrap(),
+        format!("{ERASE}warning: one\r\nwarning: two\r\nblock\r\nrows\r\n")
+    );
+    assert_eq!(frame.drawn, 2);
+    assert!(frame.present(true).is_empty(), "nothing left to repaint");
+}
+
+#[test]
+fn partial_lines_are_shown_at_once_and_keep_the_block_away() {
+    let mut frame = drawn_frame();
+    assert!(frame.write(b"held\r\n").is_empty());
+    assert_eq!(
+        String::from_utf8(frame.write(b"Password: ")).unwrap(),
+        format!("{ERASE}held\r\nPassword: ")
+    );
+    assert_eq!(frame.drawn, 0);
+    assert!(frame.present(true).is_empty(), "no block to repaint");
+}
+
+#[test]
+fn a_new_frame_carries_held_output_and_diagnostics_above_the_block() {
+    let mut frame = drawn_frame();
+    assert!(frame.write(b"line\r\n").is_empty());
+    assert_eq!(
+        String::from_utf8(frame.draw(b"note\n", "next\r\n".into(), 1)).unwrap(),
+        format!("{ERASE}line\r\nnote\r\nnext\r\n")
+    );
+    assert_eq!(frame.drawn, 1);
+}
+
+#[test]
+fn output_after_the_block_is_committed_passes_through_untouched() {
+    let mut frame = drawn_frame();
+    frame.commit();
+    assert_eq!(frame.write(b"output\r\n"), b"output\r\n");
+    assert!(frame.present(true).is_empty());
+}
+
+#[test]
+fn a_crlf_split_across_chunks_is_written_together() {
+    let mut frame = drawn_frame();
+    // The PTY's CRLF reaches the decoder as `text\r` and then `\n`.
+    assert!(frame.write(b"Finished\r").is_empty());
+    assert!(frame.write(b"\n").is_empty());
+    assert_eq!(
+        String::from_utf8(frame.present(true)).unwrap(),
+        format!("{ERASE}Finished\r\nblock\r\nrows\r\n")
+    );
+}
+
+#[test]
+fn a_crlf_split_across_reads_keeps_the_block_until_the_lf_arrives() {
+    let mut frame = drawn_frame();
+    assert!(frame.write(b"Finished\r").is_empty());
+    // The read ended between CR and LF: nothing is erased yet.
+    assert!(frame.present(true).is_empty());
+    assert_eq!(frame.drawn, 2);
+    assert!(frame.write(b"\n").is_empty());
+    assert_eq!(
+        String::from_utf8(frame.present(true)).unwrap(),
+        format!("{ERASE}Finished\r\nblock\r\nrows\r\n")
+    );
+}
+
+#[test]
+fn a_bare_carriage_return_is_shown_above_the_next_frame_not_overwritten_by_it() {
+    let mut frame = drawn_frame();
+    assert!(frame.write(b"progress\r").is_empty());
+    assert!(frame.present(true).is_empty());
+    assert_eq!(
+        String::from_utf8(frame.draw(b"", "next\r\n".into(), 1)).unwrap(),
+        format!("{ERASE}progress\r\nnext\r\n")
+    );
+}
+
+#[test]
+fn only_output_ending_in_a_cr_makes_a_frame_wait() {
+    let mut frame = drawn_frame();
+    assert!(!frame.trailing_cr());
+    frame.write(b"Finished\r");
+    assert!(frame.trailing_cr());
+    frame.write(b"\n");
+    assert!(!frame.trailing_cr());
+}
+
+#[test]
+fn the_lf_after_a_bare_cr_that_a_frame_already_ended_is_not_written_twice() {
+    let mut frame = drawn_frame();
+    assert!(frame.write(b"50%\r").is_empty());
+    assert_eq!(
+        String::from_utf8(frame.draw(b"", "next\r\n".into(), 1)).unwrap(),
+        format!("{ERASE}50%\r\nnext\r\n")
+    );
+    // The child's LF arrives after the grace period, once the line has ended.
+    assert!(frame.write(b"\n").is_empty());
+    assert!(frame.present(true).is_empty(), "no blank row");
+    // Only one LF is owed; the next is ordinary output.
+    assert!(frame.write(b"\n").is_empty());
+    assert_eq!(
+        String::from_utf8(frame.present(true)).unwrap(),
+        "\r\x1b[1A\x1b[J\nnext\r\n"
+    );
+}
+
+#[test]
+fn clearing_the_block_ends_a_held_bare_cr_line() {
+    let mut frame = drawn_frame();
+    assert!(frame.write(b"progress\r").is_empty());
+    assert_eq!(
+        String::from_utf8(frame.clear()).unwrap(),
+        format!("{ERASE}progress\r\n")
+    );
+    assert_eq!(frame.drawn, 0);
+    assert!(frame.write(b"\n").is_empty(), "the LF is already owed");
+}
+
+#[test]
+fn each_carriage_return_gets_its_own_grace_period() {
+    let start = Instant::now();
+    let mut frame = drawn_frame();
+    assert!(!frame.awaiting_lf(start), "nothing held");
+    assert!(frame.write(b"a\r").is_empty());
+    assert!(frame.awaiting_lf(start));
+    assert!(frame.awaiting_lf(start + CR_GRACE / 2));
+    let expired = start + CR_GRACE;
+    assert!(!frame.awaiting_lf(expired), "no LF came: draw the line");
+    frame.draw(b"", "next\r\n".into(), 1);
+    // A new CR after the flush must not inherit the expired timer.
+    assert!(frame.write(b"b\r").is_empty());
+    assert!(frame.awaiting_lf(expired + Duration::from_millis(1)));
+    assert!(!frame.awaiting_lf(expired + Duration::from_millis(1) + CR_GRACE));
+}

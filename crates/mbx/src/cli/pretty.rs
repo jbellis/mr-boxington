@@ -225,9 +225,11 @@ fn run_inner(
                     screen.clear()?;
                 }
             }
+            let awaiting_lf = screen.awaiting_lf();
             if !proxy
                 && decoder.pending.is_empty()
                 && !decoder.partial
+                && !awaiting_lf
                 && last_frame.elapsed() >= Duration::from_millis(80)
             {
                 model.update_stats(stats());
@@ -238,6 +240,8 @@ fn run_inner(
                     screen.height(),
                 ))?;
                 last_frame = Instant::now();
+            } else {
+                screen.repaint()?;
             }
         }
         decoder.finish(&mut screen)?;
@@ -514,8 +518,148 @@ impl Decoder {
     }
 }
 
-struct Screen {
+/// The progress block on screen and the child output waiting to be shown with it.
+///
+/// Every method returns the bytes to write instead of writing them, so a caller
+/// can present each change in one synchronized update and tests can inspect it.
+#[derive(Default)]
+struct Frame {
+    /// Rows of the block above the cursor, zero once it is erased or committed.
     drawn: u16,
+    /// The last block drawn, repainted below output that arrives between frames.
+    block: String,
+    rows: u16,
+    /// Complete lines of child output not yet shown, in arrival order.
+    held: Vec<u8>,
+    /// A held CR was ended with an LF of our own, so the child's LF, if it
+    /// arrives, must not end the line a second time.
+    lf_owed: bool,
+    /// When a frame first found the held CR waiting. Cleared when held output is
+    /// shown, so the next CR gets a full grace period of its own.
+    cr_since: Option<Instant>,
+}
+
+impl Frame {
+    fn erase(&mut self, out: &mut Vec<u8>) {
+        if self.drawn > 0 {
+            out.extend_from_slice(format!("\r\x1b[{}A\x1b[J", self.drawn).as_bytes());
+            self.drawn = 0;
+        }
+    }
+
+    /// Output that ends a line waits while a block is showing, so that
+    /// [`Frame::present`] or [`Frame::draw`] can erase, print and repaint it
+    /// in one update. A CR waits too: the PTY's CRLF arrives as two chunks, and
+    /// nothing may be written between them. Anything else (a prompt, a partial
+    /// line) is shown at once, without the block, which stays away until the
+    /// line is complete.
+    fn write(&mut self, bytes: &[u8]) -> Vec<u8> {
+        let bytes = match bytes {
+            [b'\n', rest @ ..] if self.lf_owed => rest,
+            _ => bytes,
+        };
+        self.lf_owed = false;
+        if bytes.is_empty() {
+            return Vec::new();
+        }
+        self.held.extend_from_slice(bytes);
+        if self.drawn > 0 && matches!(bytes.last(), Some(b'\n' | b'\r')) {
+            Vec::new()
+        } else {
+            self.present(false)
+        }
+    }
+
+    /// Show held output, and put the last block back below it if `repaint`.
+    /// Output that ends in a CR keeps waiting for a repaint: its LF may be in
+    /// the next read, and a bare CR would have the block overwrite the line it
+    /// returned to. The next [`Frame::draw`] shows it, on a line of its own.
+    fn present(&mut self, repaint: bool) -> Vec<u8> {
+        let repaint = repaint && self.drawn > 0;
+        if repaint && (self.held.is_empty() || self.trailing_cr()) {
+            return Vec::new();
+        }
+        let mut out = Vec::with_capacity(self.held.len());
+        self.erase(&mut out);
+        out.append(&mut self.held);
+        self.cr_since = None;
+        if repaint {
+            out.extend_from_slice(self.block.as_bytes());
+            self.drawn = self.rows;
+        }
+        out
+    }
+
+    /// Move held output to `out`. A line that ends in a bare CR is ended with an
+    /// LF, or the block drawn next would print over it.
+    fn flush_held(&mut self, out: &mut Vec<u8>) {
+        let unterminated = self.trailing_cr();
+        out.append(&mut self.held);
+        self.cr_since = None;
+        if unterminated {
+            out.push(b'\n');
+            self.lf_owed = true;
+        }
+    }
+
+    /// Erase the block and show what was held, for a block about to be redrawn
+    /// from scratch.
+    fn clear(&mut self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.held.len());
+        self.erase(&mut out);
+        self.flush_held(&mut out);
+        out
+    }
+
+    /// Whether a frame should wait for what follows a trailing CR. Drawing now
+    /// would put a newline after half a CRLF and leave a blank row when the LF
+    /// arrives. The wait ends [`CR_GRACE`] after it was first seen.
+    fn awaiting_lf(&mut self, now: Instant) -> bool {
+        if !self.trailing_cr() {
+            self.cr_since = None;
+            return false;
+        }
+        let since = *self.cr_since.get_or_insert(now);
+        now.saturating_duration_since(since) < CR_GRACE
+    }
+
+    /// Held output ends in a CR: either half a CRLF or a line that rewrites itself.
+    fn trailing_cr(&self) -> bool {
+        self.held.ends_with(b"\r")
+    }
+
+    /// Replace the block: erase the old one, then held output, diagnostics
+    /// and the new block.
+    fn draw(&mut self, diagnostics: &[u8], block: String, rows: u16) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.held.len() + block.len());
+        self.erase(&mut out);
+        self.flush_held(&mut out);
+        out.extend_from_slice(
+            String::from_utf8_lossy(diagnostics)
+                .replace("\r\n", "\n")
+                .replace('\n', "\r\n")
+                .as_bytes(),
+        );
+        out.extend_from_slice(block.as_bytes());
+        self.block = block;
+        self.rows = rows;
+        self.drawn = rows;
+        out
+    }
+
+    /// Leave the block in scrollback.
+    fn commit(&mut self) {
+        debug_assert!(self.held.is_empty(), "held output would be lost");
+        self.drawn = 0;
+    }
+}
+
+/// How long a trailing CR may wait for its LF before it is taken as a line
+/// that rewrites itself. A CRLF split by a read boundary completes far sooner.
+const CR_GRACE: Duration = Duration::from_millis(250);
+
+struct Screen {
+    frame: Frame,
     diagnostics: crate::logging::Capture,
 }
 impl Screen {
@@ -523,7 +667,7 @@ impl Screen {
         let diagnostics = crate::logging::Capture::start();
         terminal::enable_raw_mode()?;
         let mut screen = Self {
-            drawn: 0,
+            frame: Frame::default(),
             diagnostics,
         };
         if let Err(error) = execute!(io::stderr(), cursor::Hide) {
@@ -544,39 +688,49 @@ impl Screen {
             .saturating_sub(2)
             .min(27)
     }
-    fn clear(&mut self) -> io::Result<()> {
-        if self.drawn > 0 {
-            write!(io::stderr(), "\r\x1b[{}A\x1b[J", self.drawn)?;
-            self.drawn = 0;
+    /// Write one composed frame. A block that is erased or repainted goes out in
+    /// a single DEC 2026 synchronized update, which unsupported terminals ignore.
+    fn emit(&mut self, bytes: &[u8], synchronized: bool) -> io::Result<()> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        let mut stderr = io::stderr().lock();
+        if synchronized {
+            stderr.sync_update(|output| output.write_all(bytes))??;
+        } else {
+            stderr.write_all(bytes)?;
+            stderr.flush()?;
         }
         Ok(())
     }
+    /// Whether a frame should wait for what follows a trailing CR.
+    fn awaiting_lf(&mut self) -> bool {
+        self.frame.awaiting_lf(Instant::now())
+    }
+    fn clear(&mut self) -> io::Result<()> {
+        let synchronized = self.frame.drawn > 0;
+        let bytes = self.frame.clear();
+        self.emit(&bytes, synchronized)
+    }
     fn draw(&mut self, block: norimel::Block) -> io::Result<()> {
-        // Compose before touching the terminal, then present clear + diagnostics +
-        // replacement together. DEC 2026 is ignored by unsupported terminals.
-        let mut frame = String::new();
-        if self.drawn > 0 {
-            frame.push_str(&format!("\r\x1b[{}A\x1b[J", self.drawn));
-        }
+        // Compose before touching the terminal, then present the erase, held
+        // output, diagnostics and replacement together.
         let diagnostics = self.diagnostics.drain();
-        frame.push_str(
-            &String::from_utf8_lossy(&diagnostics)
-                .replace("\r\n", "\n")
-                .replace('\n', "\r\n"),
-        );
-        frame.push_str(&block.to_string().replace('\n', "\r\n"));
-        frame.push_str("\r\n");
-        io::stderr()
-            .lock()
-            .sync_update(|output| output.write_all(frame.as_bytes()))??;
-        self.drawn = block.size().1;
-        Ok(())
+        let rows = block.size().1;
+        let text = block.to_string().replace('\n', "\r\n") + "\r\n";
+        let bytes = self.frame.draw(&diagnostics, text, rows);
+        self.emit(&bytes, true)
+    }
+    /// Show output held since the last frame, with the block repainted below it.
+    fn repaint(&mut self) -> io::Result<()> {
+        let bytes = self.frame.present(true);
+        self.emit(&bytes, true)
     }
 
     fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.clear()?;
-        io::stderr().write_all(bytes)?;
-        io::stderr().flush()
+        let synchronized = self.frame.drawn > 0;
+        let bytes = self.frame.write(bytes);
+        self.emit(&bytes, synchronized)
     }
     // Cargo JSON contains LF-delimited diagnostic text, unlike bytes read
     // from the child PTY. Raw mode requires explicit carriage returns here.
@@ -584,7 +738,7 @@ impl Screen {
         self.write(text.replace("\r\n", "\n").replace('\n', "\r\n").as_bytes())
     }
     fn commit(&mut self) {
-        self.drawn = 0;
+        self.frame.commit();
     }
 }
 impl Drop for Screen {
