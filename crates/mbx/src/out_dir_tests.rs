@@ -9,6 +9,96 @@ fn write_tree(root: &Path, files: &[(&str, &[u8])]) {
 }
 
 #[test]
+fn a_lease_from_another_pid_namespace_does_not_block_a_compilation() {
+    // Other tests restore OUT_DIR and clear the process-wide lease table.
+    const CHILD_ENV: &str = "MBX_TEST_OUT_DIR_LEASE_COLLISION";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "out_dir::tests::a_lease_from_another_pid_namespace_does_not_block_a_compilation",
+                "--exact",
+                "--test-threads=1",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success()
+                && String::from_utf8_lossy(&output.stdout).contains("test result: ok. 1 passed"),
+            "{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+        return;
+    }
+
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("out-dirs");
+    let digest = "tree";
+    let leases = leases_dir(&root, digest);
+    std::fs::create_dir_all(&leases).unwrap();
+    let occupied = leases.join(format!("{}.lease", std::process::id()));
+    std::fs::write(&occupied, b"another namespace's lease").unwrap();
+    let mut other = fslock::LockFile::open(&occupied).unwrap();
+    assert!(other.try_lock().unwrap());
+
+    let acquiring_root = root.clone();
+    let (sent, received) = std::sync::mpsc::channel();
+    let acquiring = std::thread::spawn(move || {
+        let result = lease(&acquiring_root, digest).and_then(|()| lease(&acquiring_root, digest));
+        let _ = sent.send(result);
+    });
+    received
+        .recv_timeout(Duration::from_secs(5))
+        .expect("lease acquisition must not wait for another namespace")
+        .unwrap();
+    acquiring.join().unwrap();
+    assert_eq!(std::fs::read_dir(&leases).unwrap().count(), 2);
+    let own = std::fs::read_dir(&leases)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path != &occupied)
+        .unwrap();
+    let mut probe = fslock::LockFile::open(&own).unwrap();
+    assert!(!probe.try_lock().unwrap());
+    drop(probe);
+    release(&root, digest);
+    assert!(!own.exists());
+    assert_eq!(
+        std::fs::read(&occupied).unwrap(),
+        b"another namespace's lease"
+    );
+    assert!(leased(&root, digest, false).unwrap());
+    drop(other);
+    assert!(!leased(&root, digest, true).unwrap());
+    assert!(!occupied.exists());
+}
+
+#[test]
+fn a_released_tree_can_be_leased_again_with_stale_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path();
+    let digest = "tree";
+    let leases = leases_dir(root, digest);
+    lease(root, digest).unwrap();
+    let stale = std::fs::read_dir(&leases)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    // Restoring Cargo's OUT_DIR drops the locks but leaves their files behind.
+    release_all_under(root);
+    std::fs::write(&stale, b"a released lease").unwrap();
+    lease(root, digest).unwrap();
+    assert_eq!(std::fs::read_dir(&leases).unwrap().count(), 2);
+    assert_eq!(std::fs::read(&stale).unwrap(), b"a released lease");
+    release_all_under(root);
+    assert!(!leased(root, digest, true).unwrap());
+    assert_eq!(std::fs::read_dir(&leases).unwrap().count(), 0);
+}
+
+#[test]
 fn identical_trees_at_different_paths_share_one_stable_directory() {
     let directory = tempfile::tempdir().unwrap();
     let root = directory.path().join("out-dirs");

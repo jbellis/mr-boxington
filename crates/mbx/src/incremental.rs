@@ -5,14 +5,12 @@ use mbx_cache_core::CacheDigest;
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const RECORD_FILE: &str = "checkout.json";
 const RECORD_VERSION: u8 = 1;
 const LOCKS_DIR: &str = ".locks";
 const REGISTRAR_FILE: &str = "registrar.lock";
-static LEASE_NONCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -281,10 +279,21 @@ fn acquire_lease(root: &Path, key: &str) -> Result<ActiveLease> {
     let mut registrar = fslock::LockFile::open(&registrar_path)?;
     registrar.lock()?;
     std::fs::create_dir_all(&locks)?;
-    let nonce = LEASE_NONCE.fetch_add(1, Ordering::Relaxed);
-    let path = locks.join(format!("{}-{nonce}.lease", std::process::id()));
+    // PIDs repeat across namespaces. Never wait on another session's lease
+    // while holding the registrar its cleanup needs.
+    let path = locks.join(format!(
+        "{}-{}.lease",
+        std::process::id(),
+        crate::util::random_string(12)
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
     let mut lock = fslock::LockFile::open(&path)?;
-    lock.lock()?;
+    if !lock.try_lock()? {
+        eyre::bail!("the incremental lease {} is already held", path.display());
+    }
     drop(registrar);
     Ok(ActiveLease {
         lock: Some(lock),
@@ -402,6 +411,64 @@ fn tree_bytes(root: &Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_lease_from_another_pid_namespace_does_not_block_a_session() {
+        // Isolate the old process-local counter, so the held name is exactly
+        // the one the pre-fix implementation would try first.
+        const CHILD_ENV: &str = "MBX_TEST_INCREMENTAL_LEASE_COLLISION";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "incremental::tests::a_lease_from_another_pid_namespace_does_not_block_a_session",
+                    "--exact",
+                    "--test-threads=1",
+                ])
+                .env(CHILD_ENV, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success()
+                    && String::from_utf8_lossy(&output.stdout)
+                        .contains("test result: ok. 1 passed"),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr),
+            );
+            return;
+        }
+
+        let cache = tempfile::tempdir().unwrap();
+        let key = "checkout";
+        let locks = lock_dir(cache.path(), key);
+        std::fs::create_dir_all(&locks).unwrap();
+        let occupied = locks.join(format!("{}-0.lease", std::process::id()));
+        std::fs::write(&occupied, b"another namespace's lease").unwrap();
+        let mut other = fslock::LockFile::open(&occupied).unwrap();
+        assert!(other.try_lock().unwrap());
+
+        let root = cache.path().to_path_buf();
+        let (sent, received) = std::sync::mpsc::channel();
+        let acquiring = std::thread::spawn(move || {
+            let _ = sent.send(acquire_lease(&root, key));
+        });
+        let own = received
+            .recv_timeout(Duration::from_secs(5))
+            .expect("lease acquisition must not wait for another namespace")
+            .unwrap();
+        acquiring.join().unwrap();
+        assert_ne!(own.path, occupied);
+        assert!(deletion_guard(cache.path(), key, false).unwrap().active);
+        drop(own);
+        assert_eq!(
+            std::fs::read(&occupied).unwrap(),
+            b"another namespace's lease"
+        );
+        assert!(deletion_guard(cache.path(), key, false).unwrap().active);
+        drop(other);
+        assert!(!deletion_guard(cache.path(), key, true).unwrap().active);
+        assert!(!occupied.exists());
+    }
 
     #[test]
     fn abandoned_checkout_state_is_pruned() {
