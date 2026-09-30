@@ -62,12 +62,17 @@ const STAGING_MAX_AGE: Duration = Duration::from_secs(24 * 60 * 60);
 /// later. Held only for the moment of the check, never across the compile.
 const REGISTRAR: &str = ".registrar.lock";
 
-/// Leases held by this process, by lease file, for as long as it lives: the
-/// shim is one compilation, and rustc reads the tree until it exits. Keyed so
+struct Lease {
+    path: PathBuf,
+    lock: fslock::LockFile,
+}
+
+/// Leases held by this process, keyed by tree's lease directory. The shim is
+/// one compilation, and rustc reads the tree until it exits. Keyed so
 /// a second request for the same tree finds the lease already held rather
 /// than blocking on its own lock, which is what a second file lock on a path
 /// this process already holds would do.
-static LEASES: Mutex<std::collections::BTreeMap<PathBuf, fslock::LockFile>> =
+static LEASES: Mutex<std::collections::BTreeMap<PathBuf, Lease>> =
     Mutex::new(std::collections::BTreeMap::new());
 
 /// The `OUT_DIR` Cargo gave this process, once it has been replaced, so a
@@ -219,9 +224,9 @@ fn publish_lock_path(root: &Path, digest: &str) -> PathBuf {
 /// Give up this process's lease on a tree and take its file with it.
 fn release(root: &Path, digest: &str) {
     let leases = leases_dir(root, digest);
-    let path = leases.join(format!("{}.lease", std::process::id()));
-    if LEASES.lock().unwrap().remove(&path).is_some() {
-        let _ = std::fs::remove_file(&path);
+    if let Some(lease) = LEASES.lock().unwrap().remove(&leases) {
+        drop(lease.lock);
+        let _ = std::fs::remove_file(&lease.path);
         let _ = std::fs::remove_dir(&leases);
     }
 }
@@ -244,16 +249,28 @@ fn registrar(root: &Path) -> Result<fslock::LockFile> {
 /// nobody's.
 fn lease(root: &Path, digest: &str) -> Result<()> {
     let leases = leases_dir(root, digest);
-    let path = leases.join(format!("{}.lease", std::process::id()));
     let mut held = LEASES.lock().unwrap();
-    if held.contains_key(&path) {
+    if held.contains_key(&leases) {
         return Ok(());
     }
     let _registrar = registrar(root)?;
     std::fs::create_dir_all(&leases)?;
+    // A PID alone repeats across namespaces; an existing lease must never
+    // make a compiler wait while holding the registrar.
+    let path = leases.join(format!(
+        "{}-{}.lease",
+        std::process::id(),
+        crate::util::random_string(12)
+    ));
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&path)?;
     let mut lock = fslock::LockFile::open(&path)?;
-    lock.lock()?;
-    held.insert(path, lock);
+    if !lock.try_lock()? {
+        eyre::bail!("the OUT_DIR lease {} is already held", path.display());
+    }
+    held.insert(leases, Lease { path, lock });
     Ok(())
 }
 
