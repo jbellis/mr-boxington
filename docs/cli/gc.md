@@ -3,7 +3,7 @@
 
 - **Usage:** `mbx gc [FLAGS]`
 
-Collect learned incremental state and managed targets, then evict cached objects to fit budgets.
+Collect learned incremental state and managed targets, then evict cached objects to fit budgets. When `gc.min_free_size` is short, private state and targets are collected first and shared cache objects may go below `gc.max_size`.
 
 A missing cached object is rebuilt when it is needed again.
 

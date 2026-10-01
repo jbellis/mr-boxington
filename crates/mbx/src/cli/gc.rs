@@ -32,11 +32,12 @@ const COLLECTOR_LOCK: &str = "gc/v1/collector.lock";
 /// detached process, not time on a build.
 pub(super) const LOW_DISK_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-/// A low-disk sweep may need several logical passes because links and
+/// A low-disk sweep may need several passes over one tier, because links and
 /// reflinks can make the physical space recovered smaller than the bytes
-/// removed from a tree. Sixteen rounds is enough to revisit each tier while
-/// keeping a disk filled by unrelated data from making collection unbounded.
-const LOW_DISK_ROUNDS: usize = 16;
+/// removed from a tree. The bound is per tier, so a tier that frees a little
+/// on every pass cannot use up the rounds the shared store needs, and a disk
+/// filled by unrelated data cannot make collection unbounded.
+const LOW_DISK_ROUNDS_PER_TIER: usize = 4;
 
 #[derive(usage::Args)]
 pub(super) struct GcArgs {
@@ -213,6 +214,7 @@ pub(super) fn run(
     } else {
         collect_low_disk(config, retention)
     };
+    let low_disk_freed = low_disk.freed_bytes();
     let mut report_outcome = outcome;
     if let Some(low_store) = low_disk.store {
         add_gc_outcome(&mut report_outcome, low_store);
@@ -229,11 +231,8 @@ pub(super) fn run(
         target_freed_bytes,
         dry_run,
     );
-    let final_non_store_bytes = if dry_run || retention.max_total_bytes.is_none() {
-        non_store_bytes
-    } else {
-        current_non_store_bytes(config).or(non_store_bytes)
-    };
+    let final_non_store_bytes =
+        remeasured_non_store_bytes(config, retention, non_store_bytes, low_disk_freed);
     if let Some(warning) = total_budget_warning(
         retention,
         final_non_store_bytes.map(|bytes| report_outcome.remaining_bytes.saturating_add(bytes)),
@@ -575,6 +574,7 @@ fn run_sweep_body(config: &Config, retention: &RetentionSettings) -> Sweep {
     // The loop measures the disk after every logical pass and reaches the
     // shared store only after private state and targets stop freeing bytes.
     let low_disk = collect_low_disk(config, retention);
+    let low_disk_freed = low_disk.freed_bytes();
     let low_store_freed = low_disk
         .store
         .as_ref()
@@ -593,16 +593,10 @@ fn run_sweep_body(config: &Config, retention: &RetentionSettings) -> Sweep {
         .saturating_add(low_store_freed);
     sweep.lines.extend(low_disk.lines);
 
-    let warning_remaining = retention.max_total_bytes.and_then(|_| {
-        current_non_store_bytes(config)
-            .or(non_store_bytes)
-            .map(|bytes| {
-                let store_bytes = store::stats(&config.store_dir())
-                    .ok()
-                    .map_or(report_outcome.remaining_bytes, |stats| stats.total_bytes());
-                bytes.saturating_add(store_bytes)
-            })
-    });
+    let non_store_bytes =
+        remeasured_non_store_bytes(config, retention, non_store_bytes, low_disk_freed);
+    let warning_remaining =
+        non_store_bytes.map(|bytes| report_outcome.remaining_bytes.saturating_add(bytes));
     if let Some(warning) = total_budget_warning(retention, warning_remaining, false) {
         log::warn!("{warning}");
         sweep.lines.push(warning);
@@ -955,18 +949,13 @@ enum LowDiskTier {
 /// for a miss there.
 fn collect_low_disk(config: &Config, retention: &RetentionSettings) -> LowDiskCollection {
     let mut collection = LowDiskCollection::default();
-    let mut rounds = 0;
     for tier in [
         LowDiskTier::Incremental,
         LowDiskTier::Generated,
         LowDiskTier::Targets,
         LowDiskTier::Store,
     ] {
-        collect_low_disk_tier(config, retention, tier, &mut rounds, &mut collection);
-        if rounds == LOW_DISK_ROUNDS {
-            log::debug!("low-disk collection stopped after {LOW_DISK_ROUNDS} rounds");
-            break;
-        }
+        collect_low_disk_tier(config, retention, tier, &mut collection);
     }
     collection
 }
@@ -975,10 +964,9 @@ fn collect_low_disk_tier(
     config: &Config,
     retention: &RetentionSettings,
     tier: LowDiskTier,
-    rounds: &mut usize,
     collection: &mut LowDiskCollection,
 ) {
-    while *rounds < LOW_DISK_ROUNDS {
+    for _ in 0..LOW_DISK_ROUNDS_PER_TIER {
         let Some(shortfall) =
             low_disk_for_tier(config, retention, tier).map(|disk| disk.shortfall())
         else {
@@ -996,7 +984,6 @@ fn collect_low_disk_tier(
             }
             LowDiskTier::Store => collect_low_disk_store(config, shortfall, collection),
         };
-        *rounds += 1;
         if freed == 0 {
             return;
         }
@@ -1161,6 +1148,33 @@ fn add_gc_outcome(total: &mut store::GcOutcome, outcome: store::GcOutcome) {
         .saturating_add(outcome.removed_session_streams);
     total.removed_bytes = total.removed_bytes.saturating_add(outcome.removed_bytes);
     total.remaining_bytes = outcome.remaining_bytes;
+}
+
+impl LowDiskCollection {
+    fn freed_bytes(&self) -> u64 {
+        self.store
+            .as_ref()
+            .map_or(0, |outcome| outcome.removed_bytes)
+            .saturating_add(self.freed_target_bytes)
+    }
+}
+
+/// What the managed data outside the store occupies after collection.
+///
+/// Measured again only when the low-disk loop removed something. Otherwise
+/// the measurement taken before the store sweep is still right, and walking
+/// every target and learned incremental tree again would cost every sweep
+/// for a warning that only `gc.max_total_size` asks for.
+fn remeasured_non_store_bytes(
+    config: &Config,
+    retention: &RetentionSettings,
+    before: Option<u64>,
+    low_disk_freed: u64,
+) -> Option<u64> {
+    if retention.max_total_bytes.is_none() || low_disk_freed == 0 {
+        return before;
+    }
+    current_non_store_bytes(config).or(before)
 }
 
 fn current_non_store_bytes(config: &Config) -> Option<u64> {
