@@ -104,6 +104,7 @@ pub(crate) const AR_DETERMINISM_ENV: &str = "MBX_AR_DETERMINISM";
 pub(crate) const EAGER_INCREMENTAL_ENV: &str = "MBX_SESSION_EAGER_INCREMENTAL";
 pub(crate) const GC_AUTO_ENV: &str = "MBX_SESSION_GC_AUTO";
 pub(crate) const GC_MIN_FREE_ENV: &str = "MBX_SESSION_GC_MIN_FREE";
+pub(crate) const GC_CACHE_DIR_ENV: &str = "MBX_SESSION_GC_CACHE_DIR";
 pub(crate) const LEARNED_INCREMENTAL_ENV: &str = "MBX_LEARNED_INCREMENTAL";
 pub(crate) const LEARNED_INCREMENTAL_MAX_SIZE_ENV: &str = "MBX_LEARNED_INCREMENTAL_MAX_SIZE";
 pub(crate) const INCREMENTAL_ROOT_ENV: &str = "MBX_INCREMENTAL_ROOT";
@@ -131,9 +132,17 @@ fn session_gc_environment(config: &Config, min_free: Option<MinFree>) -> Vec<(St
         MinFree::ShareOfDisk => "share".into(),
         MinFree::Bytes(bytes) => bytes.to_string(),
     });
+    // The shim runs from the crate it is compiling, so a relative cache path
+    // would probe that crate's disk and could start a collector for a stray
+    // cache there. Keep this session-only path separate from MBX_CACHE_DIR so
+    // nested tools retain the environment they were given.
+    let cache_dir = std::path::absolute(&config.cache_dir)
+        .ok()
+        .map_or_else(String::new, |path| path.to_string_lossy().into_owned());
     vec![
         (GC_AUTO_ENV.into(), u8::from(config.gc.auto).to_string()),
         (GC_MIN_FREE_ENV.into(), min_free),
+        (GC_CACHE_DIR_ENV.into(), cache_dir),
     ]
 }
 
@@ -144,6 +153,33 @@ pub(crate) fn low_disk_min_free() -> Option<MinFree> {
         std::env::var(GC_AUTO_ENV).ok().as_deref(),
         std::env::var(GC_MIN_FREE_ENV).ok().as_deref(),
     )
+}
+
+/// Check the session's resolved cache disk after a real compiler invocation.
+///
+/// Persistent wrappers leave the session-only settings absent or empty, so
+/// they never load configuration just to decide whether to probe the disk.
+pub(crate) fn check_low_disk_after_compile() {
+    let Some(min_free) = low_disk_min_free() else {
+        return;
+    };
+    let Some(cache_dir) = std::env::var_os(GC_CACHE_DIR_ENV).filter(|path| !path.is_empty()) else {
+        return;
+    };
+    let mut config = match Config::load() {
+        Ok(config) => config,
+        Err(error) => {
+            log::debug!("the low-disk sweep check could not load configuration: {error:#}");
+            return;
+        }
+    };
+    config.cache_dir = cache_dir.into();
+    crate::cli::schedule_low_disk_sweep(
+        &config,
+        min_free,
+        &crate::util::disk_space,
+        &crate::cli::spawn_collector,
+    );
 }
 
 fn low_disk_min_free_from_environment(

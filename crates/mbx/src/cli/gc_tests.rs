@@ -357,6 +357,37 @@ fn a_short_disk_collects_live_targets_past_their_budget() {
 }
 
 #[test]
+fn json_report_includes_low_disk_target_removals() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = super::cargo_tests::managed_target_config(directory.path());
+    let mut views = Vec::new();
+    for (name, updated_secs) in [("older", 1), ("newer", 2)] {
+        let workspace = directory.path().join(name);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let view = crate::target::place(&config, &workspace, &workspace.join("target"), false)
+            .expect("the target is managed");
+        std::fs::write(view.join("artifact"), vec![0_u8; 64]).unwrap();
+        let record = view.with_extension("json");
+        let mut fields: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        fields["updated_secs"] = updated_secs.into();
+        std::fs::write(&record, serde_json::to_vec(&fields).unwrap()).unwrap();
+        views.push(view);
+    }
+
+    let retention = always_short();
+    let low_disk = collect_low_disk(&config, &retention);
+    assert!(
+        !views[0].exists(),
+        "low-disk collection removed the older target"
+    );
+
+    let report = low_disk.target_report(&Default::default());
+    assert!(report.removed_directories > 0);
+    assert!(report.removed_bytes > 0);
+}
+
+#[test]
 fn a_short_disk_reaches_the_store_after_private_collections() {
     let directory = tempfile::tempdir().unwrap();
     let config = super::cargo_tests::managed_target_config(directory.path());

@@ -142,6 +142,7 @@ pub(crate) fn document(rustdoc: &OsStr, arguments: &[OsString]) -> Result<ExitCo
     prepare_command(&mut command);
     let output = command.output().wrap_err("failed to run rustdoc")?;
     let duration = duration_ns(started.elapsed());
+    session::check_low_disk_after_compile();
     std::io::stdout().write_all(&output.stdout)?;
     std::io::stderr().write_all(&output.stderr)?;
     // Recorded before the failure check: the lookup above happened either way,

@@ -8,7 +8,44 @@ use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 #[cfg(unix)]
-use std::process::Stdio;
+use std::process::{Child, Output, Stdio};
+
+#[cfg(unix)]
+struct BuildChildGuard(Option<Child>);
+
+#[cfg(unix)]
+impl BuildChildGuard {
+    fn new(child: Child) -> Self {
+        Self(Some(child))
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.0
+            .as_mut()
+            .expect("build child was already consumed")
+            .try_wait()
+    }
+
+    fn wait_with_output(mut self) -> std::io::Result<Output> {
+        self.0
+            .take()
+            .expect("build child was already consumed")
+            .wait_with_output()
+    }
+}
+
+#[cfg(unix)]
+impl Drop for BuildChildGuard {
+    fn drop(&mut self) {
+        let Some(child) = self.0.as_mut() else {
+            return;
+        };
+        if child.try_wait().ok().flatten().is_none() {
+            let _ = child.kill();
+        }
+        let _ = child.wait();
+    }
+}
 
 #[path = "build/semantic_oracle.rs"]
 mod semantic_oracle;
@@ -3421,14 +3458,15 @@ fn a_low_disk_floor_starts_collection_before_the_build_ends() {
     write_dependent_project(project.path());
 
     // Hold the first real compilation until the test has observed that Cargo
-    // is alive, then keep the dependent compiler alive long enough for the
-    // detached collector to claim its stamp.
+    // is alive, then keep the dependent compiler alive until the detached
+    // collector claims its stamp.
     let wrapper = project.path().join("delayed-rustc");
     let compiled = project.path().join("compiler-finished");
     let release = project.path().join("release-compiler");
+    let stamp = store.path().join("actions/gc/v1/last-sweep");
     std::fs::write(
         &wrapper,
-        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name base \"*)\n    if [ \"$status\" -eq 0 ]; then\n      : > \"$TEST_COMPILER_FINISHED\"\n      while [ ! -e \"$TEST_RELEASE_COMPILER\" ]; do sleep 0.02; done\n    fi\n    ;;\n  *\" --crate-name above \"*)\n    [ \"$status\" -eq 0 ] && sleep 2\n    ;;\nesac\nexit \"$status\"\n",
+        "#!/bin/sh\n\"$TEST_REAL_RUSTC\" \"$@\"\nstatus=$?\ncase \" $* \" in\n  *\" --crate-name base \"*)\n    if [ \"$status\" -eq 0 ]; then\n      : > \"$TEST_COMPILER_FINISHED\"\n      while [ ! -e \"$TEST_RELEASE_COMPILER\" ]; do sleep 0.02; done\n    fi\n    ;;\n  *\" --crate-name above \"*)\n    if [ \"$status\" -eq 0 ]; then\n      attempts=0\n      while [ ! -e \"$TEST_SWEEP_STAMP\" ] && [ \"$attempts\" -lt 1500 ]; do\n        sleep 0.02\n        attempts=$((attempts + 1))\n      done\n    fi\n    ;;\nesac\nexit \"$status\"\n",
     )
     .unwrap();
     let mut permissions = std::fs::metadata(&wrapper).unwrap().permissions();
@@ -3452,10 +3490,11 @@ fn a_low_disk_floor_starts_collection_before_the_build_ends() {
             ("TEST_REAL_RUSTC", real_rustc.to_str().unwrap()),
             ("TEST_COMPILER_FINISHED", compiled.to_str().unwrap()),
             ("TEST_RELEASE_COMPILER", release.to_str().unwrap()),
+            ("TEST_SWEEP_STAMP", stamp.to_str().unwrap()),
         ],
     );
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = command.spawn().expect("mbx should run");
+    let mut child = BuildChildGuard::new(command.spawn().expect("mbx should run"));
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !compiled.exists() && std::time::Instant::now() < deadline {
@@ -3471,7 +3510,6 @@ fn a_low_disk_floor_starts_collection_before_the_build_ends() {
     );
 
     std::fs::write(&release, b"").unwrap();
-    let stamp = store.path().join("actions/gc/v1/last-sweep");
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     while !stamp.exists() && std::time::Instant::now() < deadline {
         assert!(

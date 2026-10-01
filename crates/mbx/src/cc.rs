@@ -314,6 +314,9 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
     .wrap_err_with(|| format!("failed to run {}", Path::new(compiler).display()))?;
     drop(permit);
     crate::scheduler::record_compiler_memory(&demand, &output.status);
+    if verification.is_none() {
+        session::check_low_disk_after_compile();
+    }
     let duration_ns = duration_ns(started.elapsed());
     session::record_compiler_invocation_with_diagnostic(
         if verification.is_some() {

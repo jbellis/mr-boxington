@@ -1,4 +1,3 @@
-use crate::config::Config;
 use crate::materialize::{
     CachedCompilation, CachedOutput, Materialization, StagedOutputs, apply_file_mode,
     denormalize_output_text, executable_mode_matches, exit_code, file_mode, find_blobs,
@@ -149,28 +148,6 @@ struct Compilation<'a> {
     portable: &'a Portable,
     /// Identity of the linker, for an invocation whose key must describe it.
     linker: Option<LinkerIdentity>,
-}
-
-/// A session opts the shim into this check by carrying the resolved retention
-/// setting. Persistent wrappers leave that value absent and never load a
-/// second configuration just to decide whether to probe the disk.
-fn check_low_disk_after_compile() {
-    let Some(min_free) = session::low_disk_min_free() else {
-        return;
-    };
-    let config = match Config::load() {
-        Ok(config) => config,
-        Err(error) => {
-            log::debug!("the low-disk sweep check could not load configuration: {error:#}");
-            return;
-        }
-    };
-    crate::cli::schedule_low_disk_sweep(
-        &config,
-        min_free,
-        &crate::util::disk_space,
-        &crate::cli::spawn_collector,
-    );
 }
 
 pub(crate) fn compile(
@@ -745,7 +722,7 @@ pub(crate) fn compile(
             }
         }
     }
-    check_low_disk_after_compile();
+    session::check_low_disk_after_compile();
     session::record_compiler_invocation_with_diagnostic(
         recorded_outcome,
         Some(&timing.crate_name),
@@ -1011,7 +988,7 @@ fn compile_execution_only_build_script(
             if !forwarded {
                 let _ = replay_bytes(&[], &output.stderr);
             }
-            check_low_disk_after_compile();
+            session::check_low_disk_after_compile();
             return Ok(ExitCode::FAILURE);
         }
         session::report_shim_warning(&format!(
@@ -1073,7 +1050,7 @@ fn compile_execution_only_build_script(
             ));
         }
     }
-    check_low_disk_after_compile();
+    session::check_low_disk_after_compile();
     if !forwarded {
         let _ = replay_output(&output);
     }

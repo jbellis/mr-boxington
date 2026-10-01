@@ -13,6 +13,13 @@ fn low_disk_session_settings_require_an_explicit_session_policy() {
         vec![
             (GC_AUTO_ENV.to_string(), "1".to_string()),
             (GC_MIN_FREE_ENV.to_string(), "90".to_string()),
+            (
+                GC_CACHE_DIR_ENV.to_string(),
+                std::path::absolute("/cache")
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         ]
     );
     assert_eq!(
@@ -34,6 +41,21 @@ fn low_disk_session_settings_require_an_explicit_session_policy() {
         low_disk_min_free_from_environment(Some("1"), Some("share")),
         Some(crate::config::MinFree::ShareOfDisk)
     );
+}
+
+#[test]
+fn low_disk_session_cache_dir_is_absolute_for_shims() {
+    let config = Config::for_test(Path::new("relative-cache"));
+    let environment = session_gc_environment(&config, None);
+    let cache_dir = environment
+        .iter()
+        .find_map(|(name, value)| (name == GC_CACHE_DIR_ENV).then_some(value));
+    let expected = std::path::absolute("relative-cache")
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    assert_eq!(cache_dir, Some(&expected));
 }
 
 #[test]
