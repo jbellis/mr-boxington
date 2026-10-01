@@ -607,7 +607,9 @@ impl RustcInvocation {
         let owned = discovered
             .inputs
             .iter()
-            .filter(|input| !linked.contains(input.path.as_path()))
+            .filter(|input| {
+                !linked.contains(input.path.as_path()) && !discovered.is_native_only(&input.path)
+            })
             .map(|input| (input.path.as_path(), &input.digest))
             .collect::<BTreeMap<_, _>>();
         let mut bytes = Vec::new();
@@ -798,10 +800,17 @@ impl RustcInvocation {
         // leaves thousands of files there, which was enough to push the
         // serialized prediction past the protocol's payload limit and lose the
         // prediction entirely for the crate that most needed one.
+        //
+        // A file dep-info itself names stays, even beneath a recorded
+        // directory. It is a source of the crate, and rediscovery can only tell
+        // it from the objects around it if the prediction says which it is.
+        // There are few of those; the thousands of objects are not named.
         let mut inputs = BTreeSet::new();
         for input in &discovered.inputs {
             let normalized = builder.normalize_path(&input.path)?;
-            if !under_any_directory(&normalized, &native_directories) {
+            if !under_any_directory(&normalized, &native_directories)
+                || !discovered.is_native_only(&input.path)
+            {
                 inputs.insert(normalized);
             }
         }
@@ -1135,6 +1144,7 @@ impl RustcInputPrediction {
             return Err(BypassReason::UnsupportedPrediction);
         }
         let mut paths = BTreeSet::new();
+        let mut named = BTreeSet::new();
         let admitted_roots = dep_info::native_input_roots(working_dir, path_mappings);
         let mut native_bytes = 0_u64;
         for path in &self.inputs {
@@ -1149,9 +1159,12 @@ impl RustcInputPrediction {
                     &mut native_bytes,
                 )?;
             } else {
-                paths.insert(denormalize_path(path, path_mappings)?);
+                let path = denormalize_path(path, path_mappings)?;
+                named.insert(path.clone());
+                paths.insert(path);
             }
         }
+        let native_only = paths.difference(&named).cloned().collect();
         let environment = self
             .environment
             .iter()
@@ -1169,7 +1182,10 @@ impl RustcInputPrediction {
                 Ok((name.clone(), value))
             })
             .collect::<Result<BTreeMap<_, _>, _>>()?;
-        DiscoveredInputs::from_paths(working_dir, paths, environment, digests)
+        Ok(
+            DiscoveredInputs::from_paths(working_dir, paths, environment, digests)?
+                .with_native_only(native_only),
+        )
     }
 }
 

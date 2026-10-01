@@ -1696,6 +1696,82 @@ fn a_workspace_crate_is_incremental_on_its_first_edit_and_mbx_clean_resets_it() 
     );
 }
 
+/// A native search directory the cache cannot describe, such as a system library
+/// directory whose symlinks lead into other trees, makes a compilation
+/// uncacheable. It says nothing about whether the crate's sources are being
+/// edited, so the edit still has to switch the crate to private incremental state.
+#[cfg(unix)]
+fn assert_incremental_on_first_edit_despite_native_dir(prepare: impl FnOnce(&Path, &Path)) {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    let native = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    prepare(native.path(), elsewhere.path());
+    std::fs::write(
+        project.path().join("build.rs"),
+        format!(
+            "fn main() {{\n    println!(\"cargo:rerun-if-changed=build.rs\");\n    println!(\"cargo:rustc-link-search=native={}\");\n}}\n",
+            native.path().display()
+        ),
+    )
+    .unwrap();
+
+    let cold = build(
+        project.path(),
+        store.path(),
+        &reports.path().join("cold.json"),
+    );
+    assert_eq!(
+        compiled_incrementally(&cold),
+        0,
+        "a first build has nothing to be incremental on: {cold}"
+    );
+
+    edit_project(project.path(), 1);
+    let stats = build(
+        project.path(),
+        store.path(),
+        &reports.path().join("edit-1.json"),
+    );
+
+    assert!(
+        compiled_incrementally(&stats) > 0,
+        "the edited crate should have compiled incrementally despite its search path: {stats}"
+    );
+    assert!(
+        learned_sessions(store.path()) > 0,
+        "it should have left incremental state behind: {stats}"
+    );
+    assert_eq!(
+        stats["stored_bytes"].as_u64(),
+        Some(0),
+        "an incremental artifact must never be published: {stats}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn a_crate_with_an_unshareable_native_search_path_is_incremental_on_its_first_edit() {
+    assert_incremental_on_first_edit_despite_native_dir(|native, elsewhere| {
+        std::fs::write(elsewhere.join("libextra.so.1"), b"not a library").unwrap();
+        std::os::unix::fs::symlink(elsewhere.join("libextra.so.1"), native.join("libextra.so"))
+            .unwrap();
+    });
+}
+
+/// rustc never reads a link it is not asked to resolve, so a dangling one in the
+/// search directory does not fail the build. It only keeps the directory from
+/// being scanned.
+#[cfg(unix)]
+#[test]
+fn a_dangling_link_in_a_native_search_path_does_not_stop_the_first_edit_going_incremental() {
+    assert_incremental_on_first_edit_despite_native_dir(|native, elsewhere| {
+        std::os::unix::fs::symlink(elsewhere.join("missing"), native.join("libgone.so")).unwrap();
+    });
+}
+
 /// The same evidence that turns it on turns it off: once the content stops
 /// moving, the unit compiles normally again and rejoins the shared cache.
 #[test]

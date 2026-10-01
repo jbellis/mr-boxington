@@ -144,6 +144,10 @@ pub struct DiscoveredInputs {
     /// compare against later. Lets `verify` confirm an input by stat instead of
     /// by reading it again.
     identities: Vec<Option<FileIdentity>>,
+    /// Inputs that entered only because they sit in a native search directory,
+    /// not because dep-info or the invocation named them. They belong in a
+    /// shared action key, but they are not the crate's own sources.
+    native_only: BTreeSet<PathBuf>,
 }
 
 impl DiscoveredInputs {
@@ -266,7 +270,19 @@ impl DiscoveredInputs {
             inputs,
             environment,
             identities,
+            native_only: BTreeSet::new(),
         })
+    }
+
+    /// Mark inputs that were found only by scanning native search directories.
+    pub(crate) fn with_native_only(mut self, native_only: BTreeSet<PathBuf>) -> Self {
+        self.native_only = native_only;
+        self
+    }
+
+    /// Whether `path` is an input only because a native search directory holds it.
+    pub fn is_native_only(&self, path: &Path) -> bool {
+        self.native_only.contains(path)
     }
 
     /// Reject inputs whose modification time overlaps the compiler invocation.
@@ -460,29 +476,61 @@ impl RustcInvocation {
         path_mappings: &[PathMapping],
         digests: &dyn FileDigestCache,
     ) -> Result<DiscoveredInputs, BypassReason> {
+        self.discover(dep_info, working_dir, Some(path_mappings), digests)
+    }
+
+    /// Hash dep-info sources and modeled compiler inputs, leaving native search
+    /// directories out.
+    ///
+    /// The result cannot key a shared action: the linker may read libraries it
+    /// does not list. It is enough to tell whether a crate's own sources changed,
+    /// which is all that private incremental state needs, so it works for a
+    /// compilation whose search paths [`Self::discover_inputs_with_mappings`]
+    /// refuses.
+    pub fn discover_source_inputs(
+        &self,
+        dep_info: &RustcDepInfo,
+        working_dir: &Path,
+        digests: &dyn FileDigestCache,
+    ) -> Result<DiscoveredInputs, BypassReason> {
+        self.discover(dep_info, working_dir, None, digests)
+    }
+
+    /// Native search directories are collected only when `path_mappings` is given.
+    fn discover(
+        &self,
+        dep_info: &RustcDepInfo,
+        working_dir: &Path,
+        path_mappings: Option<&[PathMapping]>,
+        digests: &dyn FileDigestCache,
+    ) -> Result<DiscoveredInputs, BypassReason> {
         if !working_dir.is_absolute() {
             return Err(BypassReason::RelativeWorkingDirectory(
                 working_dir.to_path_buf(),
             ));
         }
         let working_dir = normalize_components(working_dir);
-        let mut paths = dep_info
-            .files
-            .iter()
-            .chain(&self.required_inputs)
-            .map(|path| {
-                let absolute = if path.is_absolute() {
-                    path.to_path_buf()
-                } else {
-                    working_dir.join(path)
-                };
-                normalize_components(&absolute)
-            })
-            .collect::<BTreeSet<_>>();
-        let admitted_roots = native_input_roots(&working_dir, path_mappings);
+        let absolute = |path: &PathBuf| {
+            let absolute = if path.is_absolute() {
+                path.to_path_buf()
+            } else {
+                working_dir.join(path)
+            };
+            normalize_components(&absolute)
+        };
+        // What dep-info names is the crate's own. A required input also covers
+        // the crate root, `--extern` artifacts and target specifications, so it
+        // is a source unless a native search directory holds it: there it is a
+        // library resolved from that directory, which belongs in a shared key
+        // but is no more a source than the directory around it.
+        let sources = dep_info.files.iter().map(absolute).collect::<BTreeSet<_>>();
+        let mut paths = sources.clone();
+        paths.extend(self.required_inputs.iter().map(absolute));
+        let admitted_roots = native_input_roots(&working_dir, path_mappings.unwrap_or_default());
         let mut native_bytes = 0_u64;
         for argument in &self.arguments {
-            if let Argument::SearchPath { kind, path } = argument
+            if path_mappings.is_some()
+                && let Argument::SearchPath { kind, path } = argument
                 && kind == "native"
             {
                 let directory = if path.is_absolute() {
@@ -498,7 +546,26 @@ impl RustcInvocation {
                 )?;
             }
         }
-        DiscoveredInputs::from_paths(&working_dir, paths, dep_info.environment.clone(), digests)
+        let native_directories = self
+            .arguments
+            .iter()
+            .filter_map(|argument| match argument {
+                Argument::SearchPath { kind, path } if kind == "native" => Some(absolute(path)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let native_only = paths
+            .difference(&sources)
+            .filter(|path| native_directories.iter().any(|root| path.starts_with(root)))
+            .cloned()
+            .collect();
+        Ok(DiscoveredInputs::from_paths(
+            &working_dir,
+            paths,
+            dep_info.environment.clone(),
+            digests,
+        )?
+        .with_native_only(native_only))
     }
 }
 
