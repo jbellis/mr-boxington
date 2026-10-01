@@ -333,9 +333,11 @@ something else fills the disk. `gc.min_free_size` sets how much free space mbx
 tries to keep: by default 10% of the disk, from 5 GiB to 50 GiB. The cache disk
 and a custom `target.root` volume are each measured against their own size.
 
-While a disk has less free space than that, collection runs after a build as
-often as every 5 minutes instead of once per `gc.interval`, and it frees the
-shortfall from private state and shared cache data regardless of the budgets:
+While a disk has less free space than that, collection runs as often as every
+5 minutes instead of once per `gc.interval`. It does not wait for a build to
+finish: a compilation that misses the cache checks the disk when it is done
+and starts collection in the background. Collection frees the shortfall from
+private state and shared cache data regardless of the budgets:
 
 1. Learned incremental state and generated source trees, least recently used
    first.
