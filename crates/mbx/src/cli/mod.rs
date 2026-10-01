@@ -107,6 +107,8 @@ enum Commands {
     /// Read and change settings in the global configuration file.
     Settings(settings::SettingsArgs),
     /// Collect learned incremental state and managed targets, then evict cached objects to fit budgets.
+    /// When `gc.min_free_size` is short, private state and targets are collected
+    /// first and shared cache objects may go below `gc.max_size`.
     ///
     /// A missing cached object is rebuilt when it is needed again.
     Gc(gc::GcArgs),

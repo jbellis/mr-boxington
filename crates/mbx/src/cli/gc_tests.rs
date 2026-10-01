@@ -1,4 +1,5 @@
 use super::*;
+use mbx_cache_core::{CacheDigest, LocalCas};
 use std::time::Duration;
 
 #[test]
@@ -276,6 +277,63 @@ fn a_short_disk_collects_live_targets_past_their_budget() {
         "the report says why: {:?}",
         report.removals
     );
+}
+
+#[test]
+fn a_short_disk_reaches_the_store_after_private_collections() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = super::cargo_tests::managed_target_config(directory.path());
+    let store = config.store_dir();
+    let contents = b"an unrooted shared cache object";
+    let digest = CacheDigest::blake3(contents);
+    LocalCas::new(&store)
+        .store_bytes(&digest, contents)
+        .unwrap();
+    assert_eq!(
+        crate::store::stats(&store).unwrap().total_bytes(),
+        contents.len() as u64
+    );
+
+    gc::run(&config, config.gc.max_bytes, false, false, &always_short()).unwrap();
+
+    assert_eq!(
+        crate::store::stats(&store).unwrap().total_bytes(),
+        0,
+        "low-disk collection reaches the shared store after private tiers"
+    );
+}
+
+#[test]
+fn a_claim_error_still_runs_the_full_automatic_sweep() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = super::cargo_tests::managed_target_config(directory.path());
+    config.gc.auto = true;
+    config.gc.interval = Duration::ZERO;
+    let store = config.store_dir();
+    let contents = b"an unrooted shared cache object";
+    let digest = CacheDigest::blake3(contents);
+    LocalCas::new(&store)
+        .store_bytes(&digest, contents)
+        .unwrap();
+    let stamp = store.join("gc/v1/last-sweep");
+    std::fs::create_dir_all(&stamp).unwrap();
+
+    let sweep = sweep_store(&config, &always_short());
+
+    assert!(
+        sweep.delta.freed_store_bytes > 0,
+        "a failed stamp claim still reaches store collection"
+    );
+    assert!(
+        sweep.lines.iter().any(|line| {
+            line.contains("below gc.max_size")
+                && line.contains("under gc.min_free_size")
+                && line.contains("logical freed")
+        }),
+        "store relief explains why it went below its budget: {:?}",
+        sweep.lines
+    );
+    assert_eq!(crate::store::stats(&store).unwrap().total_bytes(), 0);
 }
 
 #[test]

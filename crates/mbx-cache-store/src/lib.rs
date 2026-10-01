@@ -1925,7 +1925,11 @@ pub fn sweep_if_due(store: &Path, max_bytes: u64, interval: Duration) -> Result<
     gc(store, max_bytes).map(Some)
 }
 
-/// Atomically stamp a due sweep before its callers perform coordinated GC.
+/// Stamp a due sweep before its callers perform coordinated GC.
+///
+/// The sweep lock serializes claims, so updating the existing marker in place
+/// is enough. In particular, it does not need a temporary file and rename:
+/// claiming a sweep must still work when the disk has no room for one.
 pub fn claim_sweep(store: &Path, interval: Duration) -> Result<bool> {
     let lock_path = store.join(SWEEP_LOCK);
     std::fs::create_dir_all(lock_path.parent().expect("sweep lock has a parent"))?;
@@ -1936,7 +1940,12 @@ pub fn claim_sweep(store: &Path, interval: Duration) -> Result<bool> {
     if sweep_stamp_is_fresh(&stamp, interval) {
         return Ok(false);
     }
-    write_atomic(&stamp, b"")?;
+    let stamp = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&stamp)?;
+    stamp.set_modified(SystemTime::now())?;
     Ok(true)
 }
 

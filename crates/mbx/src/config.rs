@@ -452,8 +452,9 @@ struct RawGc {
     #[usage(env = "MBX_GC_INCREMENTAL_MAX_AGE", default = "30d", ty = "duration")]
     incremental_max_age: String,
     /// Free space to keep on the disks holding the cache and managed targets,
-    /// or "none". Below it, sweeps run more often and collect learned
-    /// incremental state and managed targets past their budgets.
+    /// or "none". Below it, sweeps run more often and collect private state,
+    /// generated sources, managed targets, and shared action-store objects
+    /// past their budgets until the disk is no longer short.
     #[usage(
         env = "MBX_GC_MIN_FREE_SIZE",
         default_note = "10% of each disk, from 5GiB to 50GiB"
