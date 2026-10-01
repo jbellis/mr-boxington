@@ -366,6 +366,7 @@ fn cargo_with_settings_bypass_log_and_roots(
             config,
             cargo_jobs,
             settings.events_max_size,
+            settings.retention.min_free,
         )
             .await
         {

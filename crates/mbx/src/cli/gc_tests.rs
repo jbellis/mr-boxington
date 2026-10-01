@@ -239,6 +239,83 @@ fn a_short_disk_brings_the_next_sweep_forward() {
 }
 
 #[test]
+fn a_short_disk_claims_a_detached_collector_without_running_one_here() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = super::cargo_tests::managed_target_config(directory.path());
+    config.target.views = false;
+    config.gc.interval = Duration::from_secs(3600);
+    let spawned = std::cell::Cell::new(0);
+    let disk = |_path: &Path| {
+        Some(crate::util::DiskSpace {
+            total: 100,
+            available: 10,
+        })
+    };
+    let spawn = |_config: &Config| {
+        spawned.set(spawned.get() + 1);
+        Ok(())
+    };
+
+    schedule_low_disk_sweep(&config, crate::config::MinFree::Bytes(90), &disk, &spawn);
+
+    assert_eq!(spawned.get(), 1);
+}
+
+#[test]
+fn a_disk_with_room_does_not_start_a_collector() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = super::cargo_tests::managed_target_config(directory.path());
+    config.target.views = false;
+    let spawned = std::cell::Cell::new(0);
+    let disk = |_path: &Path| {
+        Some(crate::util::DiskSpace {
+            total: 100,
+            available: 100,
+        })
+    };
+    let spawn = |_config: &Config| {
+        spawned.set(spawned.get() + 1);
+        Ok(())
+    };
+
+    schedule_low_disk_sweep(&config, crate::config::MinFree::Bytes(90), &disk, &spawn);
+
+    assert_eq!(spawned.get(), 0);
+}
+
+#[test]
+fn low_disk_collection_respects_auto_off_and_the_sweep_stamp() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = super::cargo_tests::managed_target_config(directory.path());
+    config.target.views = false;
+    config.gc.interval = Duration::from_secs(3600);
+    let spawned = std::cell::Cell::new(0);
+    let disk = |_path: &Path| {
+        Some(crate::util::DiskSpace {
+            total: 100,
+            available: 10,
+        })
+    };
+    let spawn = |_config: &Config| {
+        spawned.set(spawned.get() + 1);
+        Ok(())
+    };
+
+    config.gc.auto = false;
+    schedule_low_disk_sweep(&config, crate::config::MinFree::Bytes(90), &disk, &spawn);
+    assert_eq!(
+        spawned.get(),
+        0,
+        "auto=false must avoid even the disk probe"
+    );
+
+    config.gc.auto = true;
+    assert!(crate::store::claim_sweep(&config.store_dir(), config.gc.interval).unwrap());
+    schedule_low_disk_sweep(&config, crate::config::MinFree::Bytes(90), &disk, &spawn);
+    assert_eq!(spawned.get(), 0, "a fresh sweep stamp is not due");
+}
+
+#[test]
 fn a_short_disk_collects_live_targets_past_their_budget() {
     let directory = tempfile::tempdir().unwrap();
     let config = super::cargo_tests::managed_target_config(directory.path());

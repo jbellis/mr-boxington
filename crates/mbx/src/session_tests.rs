@@ -6,6 +6,37 @@ use super::*;
 use crate::config::SummaryStyle;
 
 #[test]
+fn low_disk_session_settings_require_an_explicit_session_policy() {
+    let config = Config::for_test(Path::new("/cache"));
+    assert_eq!(
+        session_gc_environment(&config, Some(crate::config::MinFree::Bytes(90))),
+        vec![
+            (GC_AUTO_ENV.to_string(), "1".to_string()),
+            (GC_MIN_FREE_ENV.to_string(), "90".to_string()),
+        ]
+    );
+    assert_eq!(
+        low_disk_min_free_from_environment(None, Some("90")),
+        None,
+        "a persistent wrapper has no session setting"
+    );
+    assert_eq!(
+        low_disk_min_free_from_environment(Some("0"), Some("90")),
+        None,
+        "gc.auto=false is carried through the session"
+    );
+    assert_eq!(
+        low_disk_min_free_from_environment(Some("1"), None),
+        None,
+        "a missing floor leaves the hook disabled"
+    );
+    assert_eq!(
+        low_disk_min_free_from_environment(Some("1"), Some("share")),
+        Some(crate::config::MinFree::ShareOfDisk)
+    );
+}
+
+#[test]
 fn clippy_workspace_wrapper_is_peeled_before_rustc_parsing() {
     let arguments = vec![
         Path::new("toolchain")

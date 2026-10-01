@@ -2,7 +2,7 @@ use super::cache::{
     GcActionStoreReport, GcGeneratedReport, GcIncrementalReport, GcReport, GcTargetReport,
     print_json,
 };
-use crate::config::{Config, RetentionSettings};
+use crate::config::{Config, MinFree, RetentionSettings};
 use crate::{store, target};
 use bytesize::ByteSize;
 use eyre::{Context, Result};
@@ -654,7 +654,43 @@ pub(super) fn schedule_sweep(config: &Config, retention: &RetentionSettings) {
     }
 }
 
-fn spawn_collector(config: &Config) -> Result<()> {
+/// Start a detached collector after a real compiler miss finds a disk short.
+///
+/// The probes and spawner are parameters so the decision stays cheap to test;
+/// the shim supplies the real functions and swallows every failure at its
+/// boundary. The collector claims the sweep stamp again after it starts, so
+/// concurrent shims can race here without sweeping in the foreground.
+pub(crate) fn schedule_low_disk_sweep(
+    config: &Config,
+    min_free: MinFree,
+    disk_space: &dyn Fn(&Path) -> Option<crate::util::DiskSpace>,
+    spawn: &dyn Fn(&Config) -> Result<()>,
+) {
+    if !config.gc.auto {
+        return;
+    }
+
+    let is_short = |path: &Path| {
+        disk_space(path).is_some_and(|space| space.available < min_free.bytes(space.total))
+    };
+    let cache_short = is_short(&config.cache_dir);
+    let target_short = config.target.views
+        && !crate::util::same_disk(&config.cache_dir, &config.target.root)
+        && is_short(&config.target.root);
+    if !(cache_short || target_short) {
+        return;
+    }
+
+    let interval = config.gc.interval.min(LOW_DISK_INTERVAL);
+    if !store::sweep_is_due(&config.store_dir(), interval) {
+        return;
+    }
+    if let Err(error) = spawn(config) {
+        log::debug!("the low-disk collector could not be started: {error:#}");
+    }
+}
+
+pub(crate) fn spawn_collector(config: &Config) -> Result<()> {
     let executable = std::env::current_exe().wrap_err("failed to locate mbx")?;
     // The collector reads its configuration for itself, so the cache it was
     // started for is named absolutely: a relative `MBX_CACHE_DIR` would resolve
