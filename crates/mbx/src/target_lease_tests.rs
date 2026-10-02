@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::config::TargetSettings;
+use filetime::FileTime;
 use std::io::{BufRead, BufReader, Write};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
@@ -128,6 +129,71 @@ fn expired_view(root: &Path, config: &Config, name: &str) -> (PathBuf, PathBuf) 
 /// Collect with an age limit every view set up by [`expired_view`] exceeds.
 fn collect_expired(root: &Path) -> CollectionOutcome {
     collect(root, None, Some(Duration::from_secs(10)), false).unwrap()
+}
+
+/// Give a view an old Cargo layout whose executable still sits in `deps/`.
+fn aged_old_layout_units(view: &Path) -> PathBuf {
+    let profile = view.join("debug");
+    let fingerprint = profile.join(".fingerprint/suite_issues");
+    let binary = profile.join("deps/suite_issues-0123456789abcdef");
+    std::fs::create_dir_all(&fingerprint).unwrap();
+    std::fs::create_dir_all(binary.parent().unwrap()).unwrap();
+    std::fs::write(profile.join(".cargo-lock"), b"").unwrap();
+    std::fs::write(fingerprint.join("lib-suite_issues"), b"fingerprint").unwrap();
+    std::fs::write(&binary, b"test executable").unwrap();
+
+    let old = FileTime::from_system_time(
+        std::time::SystemTime::now() - Duration::from_secs(3 * 24 * 60 * 60),
+    );
+    for path in [
+        profile.as_path(),
+        profile.join(".cargo-lock").as_path(),
+        fingerprint.as_path(),
+        fingerprint.join("lib-suite_issues").as_path(),
+        binary.parent().unwrap(),
+        binary.as_path(),
+    ] {
+        filetime::set_file_times(path, old, old).unwrap();
+    }
+    binary
+}
+
+#[test]
+fn a_view_lease_keeps_units_until_command_finishes() {
+    if !in_own_process(
+        module_path!(),
+        "a_view_lease_keeps_units_until_command_finishes",
+    ) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = lease_test_config(directory.path(), true);
+    let (workspace, view) = expired_view(directory.path(), &config, "project");
+    age_lease_view(&config.target.root, &workspace, now_secs());
+    if !crate::target_units::access_times_tracked(&views_root(&config.target.root)) {
+        return;
+    }
+    let binary = aged_old_layout_units(&view);
+    let lease = ViewLease::acquire(&config.target.root, &workspace).unwrap();
+
+    let preview = collect(
+        &config.target.root,
+        None,
+        Some(Duration::from_secs(10)),
+        true,
+    )
+    .unwrap();
+    assert_eq!(preview.removed_units, 0);
+    assert!(binary.exists());
+
+    let outcome = collect_expired(&config.target.root);
+    assert_eq!(outcome.removed_units, 0);
+    assert!(binary.exists());
+
+    drop(lease);
+    let outcome = collect_expired(&config.target.root);
+    assert_eq!(outcome.removed_units, 1);
+    assert!(!binary.exists());
 }
 
 /// Compilation has finished, so Cargo holds no lock in the view, but the
