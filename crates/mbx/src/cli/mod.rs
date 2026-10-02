@@ -22,7 +22,7 @@ mod doctor;
 mod exec;
 mod explain;
 mod gc;
-pub(crate) use gc::{schedule_low_disk_sweep, spawn_collector};
+pub(crate) use gc::{schedule_low_disk_sweep, spawn_collector_from};
 pub mod launch;
 mod mascot;
 mod plain_progress;

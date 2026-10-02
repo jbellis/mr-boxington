@@ -105,6 +105,8 @@ pub(crate) const EAGER_INCREMENTAL_ENV: &str = "MBX_SESSION_EAGER_INCREMENTAL";
 pub(crate) const GC_AUTO_ENV: &str = "MBX_SESSION_GC_AUTO";
 pub(crate) const GC_MIN_FREE_ENV: &str = "MBX_SESSION_GC_MIN_FREE";
 pub(crate) const GC_CACHE_DIR_ENV: &str = "MBX_SESSION_GC_CACHE_DIR";
+pub(crate) const GC_TARGET_ROOT_ENV: &str = "MBX_SESSION_GC_TARGET_ROOT";
+pub(crate) const GC_EXECUTABLE_ENV: &str = "MBX_SESSION_GC_EXECUTABLE";
 pub(crate) const LEARNED_INCREMENTAL_ENV: &str = "MBX_LEARNED_INCREMENTAL";
 pub(crate) const LEARNED_INCREMENTAL_MAX_SIZE_ENV: &str = "MBX_LEARNED_INCREMENTAL_MAX_SIZE";
 pub(crate) const INCREMENTAL_ROOT_ENV: &str = "MBX_INCREMENTAL_ROOT";
@@ -136,13 +138,23 @@ fn session_gc_environment(config: &Config, min_free: Option<MinFree>) -> Vec<(St
     // would probe that crate's disk and could start a collector for a stray
     // cache there. Keep this session-only path separate from MBX_CACHE_DIR so
     // nested tools retain the environment they were given.
-    let cache_dir = std::path::absolute(&config.cache_dir)
+    let absolute = |path: &Path| {
+        std::path::absolute(path)
+            .ok()
+            .map_or_else(String::new, |path| path.to_string_lossy().into_owned())
+    };
+    // Inside a shim, `current_exe()` names the shim, and a process started
+    // from it would run as that shim instead of as `mbx gc`. The session's
+    // own binary is the one the collector must be started from.
+    let executable = std::env::current_exe()
         .ok()
-        .map_or_else(String::new, |path| path.to_string_lossy().into_owned());
+        .map_or_else(String::new, |path| absolute(&path));
     vec![
         (GC_AUTO_ENV.into(), u8::from(config.gc.auto).to_string()),
         (GC_MIN_FREE_ENV.into(), min_free),
-        (GC_CACHE_DIR_ENV.into(), cache_dir),
+        (GC_CACHE_DIR_ENV.into(), absolute(&config.cache_dir)),
+        (GC_TARGET_ROOT_ENV.into(), absolute(&config.target.root)),
+        (GC_EXECUTABLE_ENV.into(), executable),
     ]
 }
 
@@ -163,7 +175,12 @@ pub(crate) fn check_low_disk_after_compile() {
     let Some(min_free) = low_disk_min_free() else {
         return;
     };
-    let Some(cache_dir) = std::env::var_os(GC_CACHE_DIR_ENV).filter(|path| !path.is_empty()) else {
+    let session_path = |name: &str| std::env::var_os(name).filter(|path| !path.is_empty());
+    let (Some(cache_dir), Some(target_root), Some(executable)) = (
+        session_path(GC_CACHE_DIR_ENV),
+        session_path(GC_TARGET_ROOT_ENV),
+        session_path(GC_EXECUTABLE_ENV),
+    ) else {
         return;
     };
     let mut config = match Config::load() {
@@ -173,13 +190,13 @@ pub(crate) fn check_low_disk_after_compile() {
             return;
         }
     };
+    // The shim runs from the crate it is compiling, so a relative path loaded
+    // here would name that crate's disk instead of the session's.
     config.cache_dir = cache_dir.into();
-    crate::cli::schedule_low_disk_sweep(
-        &config,
-        min_free,
-        &crate::util::disk_space,
-        &crate::cli::spawn_collector,
-    );
+    config.target.root = target_root.into();
+    crate::cli::schedule_low_disk_sweep(&config, min_free, &crate::util::disk_space, &|config| {
+        crate::cli::spawn_collector_from(Path::new(&executable), config)
+    });
 }
 
 fn low_disk_min_free_from_environment(

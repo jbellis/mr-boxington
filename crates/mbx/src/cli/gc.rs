@@ -726,6 +726,14 @@ pub(crate) fn schedule_low_disk_sweep(
 
 pub(crate) fn spawn_collector(config: &Config) -> Result<()> {
     let executable = std::env::current_exe().wrap_err("failed to locate mbx")?;
+    spawn_collector_from(&executable, config)
+}
+
+/// Start the collector from `executable`, which must be the `mbx` binary
+/// itself. A compiler shim passes the session's binary because its own
+/// executable is the shim, and a shim started with `gc --automatic` would run
+/// as a shim and never sweep.
+pub(crate) fn spawn_collector_from(executable: &Path, config: &Config) -> Result<()> {
     // The collector reads its configuration for itself, so the cache it was
     // started for is named absolutely: a relative `MBX_CACHE_DIR` would resolve
     // against the collector's working directory, and that is not the
