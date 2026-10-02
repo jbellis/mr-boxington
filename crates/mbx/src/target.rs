@@ -1366,8 +1366,25 @@ fn collect_with(
             if !*live || *standing == Standing::Keep || expired(*updated, *standing) {
                 continue;
             }
-            // Held while units go, so a build that starts meanwhile waits
-            // rather than reading a fingerprint whose outputs are leaving.
+            // Cargo's lock ends with compilation, but a command can keep
+            // executing binaries from `deps/`. Hold the view lease for the
+            // whole pass too. A command starting meanwhile already waits on
+            // Cargo's lock while pruning, so this adds no new wait.
+            let _reservation = if dry_run {
+                // A preview must not create lock files. An unreadable lock is
+                // in use, just as it is for a real collection.
+                if view_in_use(directory) {
+                    continue;
+                }
+                None
+            } else {
+                let Some(reservation) = try_reserve_view(directory) else {
+                    continue;
+                };
+                Some(reservation)
+            };
+            // Cargo's locks keep a build that starts meanwhile from reading a
+            // fingerprint whose outputs are leaving.
             let _locks = if dry_run {
                 None
             } else {
