@@ -338,6 +338,16 @@ pub(crate) fn run() -> Result<ExitCode> {
             Ok(Some(restored)) => {
                 record_action_hit(&action, restored.stats, &stats_label());
                 replay_bytes(&restored.stdout, &restored.stderr)?;
+                // A grouped export follows this run's receipt rather than the
+                // cumulative manifest. Keep a restored script in that receipt
+                // so the next CI job can look it up too. Recording is only
+                // bookkeeping after its output reached Cargo: a failure must
+                // not run an already-restored script a second time.
+                if let Err(error) = record_prediction(invocation, action, &prediction) {
+                    session::report_shim_warning(&format!(
+                        "restored build-script prediction was not recorded: {error:#}"
+                    ));
+                }
                 return Ok(ExitCode::SUCCESS);
             }
             Ok(None) => {}
@@ -464,7 +474,7 @@ fn record_prediction(
     prediction: &Prediction,
 ) -> Result<()> {
     let task = std::env::var(session::BUILD_ENV)?;
-    let payload = String::from_utf8(canonical_json(prediction)?)?;
+    let payload = prediction_payload(prediction)?;
     let responses = session::request_agent(&[AgentRequest::RecordActionPrediction {
         task,
         prediction: ActionPrediction {
@@ -479,6 +489,22 @@ fn record_prediction(
         Some(AgentResponse::Error { message }) => bail!(message),
         _ => bail!("cache agent did not record the build-script prediction"),
     }
+}
+
+/// Serialize a prediction in the schema version that produced it.
+///
+/// A restored v1 prediction has no `default_package` field. Re-recording it
+/// with the current Rust type would add that false field, turning it into an
+/// invalid hybrid which the v1 decoder deliberately rejects on the next run.
+fn prediction_payload(prediction: &Prediction) -> Result<String> {
+    let mut payload = serde_json::to_value(prediction)?;
+    if prediction.version == 1 {
+        let object = payload
+            .as_object_mut()
+            .ok_or_else(|| eyre::eyre!("build-script prediction did not serialize to an object"))?;
+        object.remove("default_package");
+    }
+    Ok(String::from_utf8(canonical_json(&payload)?)?)
 }
 
 fn parse_prediction(stdout: &[u8]) -> Result<Option<Prediction>> {
@@ -1194,13 +1220,17 @@ mod tests {
 
     #[test]
     fn version_one_predictions_remain_usable() {
-        let parsed = decode_prediction(
-            r#"{"environment":["MODE"],"inputs":["input.h"],"portable_out_dir":true,"version":1}"#,
-        )
-        .unwrap();
+        let payload =
+            r#"{"environment":["MODE"],"inputs":["input.h"],"portable_out_dir":true,"version":1}"#;
+        let parsed = decode_prediction(payload).unwrap();
         assert!(!parsed.default_package);
         assert_eq!(parsed.inputs, ["input.h"]);
         assert_eq!(parsed.environment, ["MODE"]);
+        assert_eq!(
+            prediction_payload(&parsed).unwrap(),
+            payload,
+            "a restored v1 prediction must remain decodable after it is recorded again"
+        );
         assert!(
             decode_prediction(
                 r#"{"environment":[],"inputs":["input.h"],"portable_out_dir":true,"version":2}"#
