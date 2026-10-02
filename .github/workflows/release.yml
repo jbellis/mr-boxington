@@ -139,6 +139,7 @@ jobs:
           mkdir -p "$automation_dir"
           git show "$WORKFLOW_SHA:benchmarks/pgo.bash" > "$automation_dir/pgo.bash"
           git show "$WORKFLOW_SHA:benchmarks/train-pgo.bash" > "$automation_dir/train-pgo.bash"
+          git show "$WORKFLOW_SHA:.github/macos/entitlements.plist" > "$automation_dir/entitlements.plist"
           chmod +x "$automation_dir"/*.bash
 
       - name: Install Rust target
@@ -226,9 +227,22 @@ jobs:
           IDENTITY: "Developer ID Application: Jeffrey Dickey (4993Y37DX6)"
           BINARY: target/${{ matrix.target }}/release/${{ matrix.bin }}
         run: |
+          set -euo pipefail
+
+          # Hardened runtime makes dyld drop DYLD_* variables from the
+          # process environment. mbx spawns rustc tools such as rust-objcopy
+          # that locate libLLVM through the DYLD_* path cargo supplies, so the
+          # entitlement below lets those variables reach the processes it runs.
           codesign --force --sign "$IDENTITY" --options runtime --timestamp \
+            --entitlements "$RUNNER_TEMP/mbx-release-automation/entitlements.plist" \
             --prefix dev.jdx. "$BINARY"
           codesign --verify --verbose=2 "$BINARY"
+          value="$(codesign -d --entitlements - --xml "$BINARY" 2>/dev/null \
+            | plutil -extract 'com\.apple\.security\.cs\.allow-dyld-environment-variables' raw -o - - 2>/dev/null || true)"
+          if [ "$value" != "true" ]; then
+            echo "::error::signed binary is missing or has disabled the DYLD environment entitlement"
+            exit 1
+          fi
 
       # Signing alone is not enough for an archive a browser downloaded:
       # quarantine makes Gatekeeper demand a notarization ticket, and without
