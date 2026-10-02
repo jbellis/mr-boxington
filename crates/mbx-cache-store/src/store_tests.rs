@@ -2174,6 +2174,27 @@ fn concurrent_callers_claim_only_one_sweep() {
 }
 
 #[test]
+fn claiming_existing_stamp_updates_its_mtime() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path();
+    let stamp = store.join(SWEEP_STAMP);
+    std::fs::create_dir_all(stamp.parent().unwrap()).unwrap();
+    let file = std::fs::File::create(&stamp).unwrap();
+    file.set_modified(SystemTime::now() - Duration::from_secs(3600 * 2))
+        .unwrap();
+    let before = std::fs::metadata(&stamp).unwrap().modified().unwrap();
+
+    assert!(claim_sweep(store, Duration::from_secs(3600)).unwrap());
+
+    let after = std::fs::metadata(&stamp).unwrap().modified().unwrap();
+    assert!(after > before, "claiming a due stamp refreshes its mtime");
+    assert!(
+        !claim_sweep(store, Duration::from_secs(3600)).unwrap(),
+        "repeated claims inside the interval are throttled"
+    );
+}
+
+#[test]
 fn does_not_count_its_own_bookkeeping_against_the_budget() {
     let directory = tempfile::tempdir().unwrap();
     let store = directory.path().join("store");

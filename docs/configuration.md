@@ -175,7 +175,9 @@ lists the bounds and what collection removes.
 
 `gc.min_free_size` also scales: when less than 10% of a disk is free (bounded
 from 5 GiB to 50 GiB), collection runs sooner and removes learned incremental
-state and managed targets past their budgets. See
+state, generated sources, and managed targets past their budgets. If the cache
+disk is still short after those private tiers, it also evicts shared action-store
+objects below `gc.max_size`. See
 [when the disk runs low](/managed-targets#when-the-disk-runs-low).
 
 Setting an explicit budget overrides the scaling; `"none"` disables

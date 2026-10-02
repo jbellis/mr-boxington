@@ -1,7 +1,7 @@
 //! Build-session lifecycle: the cache agent, its transport, and the rustc shim
 //! that cargo invokes through `RUSTC_WRAPPER`.
 
-use crate::config::Config;
+use crate::config::{Config, MinFree};
 use crate::events::{ActionDetail, ActionOutcome, EventWriter};
 use crate::util::duration_ns;
 use eyre::Result;
@@ -102,6 +102,11 @@ pub(crate) const FORWARD_COMPILER_NOTIFICATIONS_ENV: &str = "MBX_FORWARD_COMPILE
 pub(crate) const BUILD_SCRIPT_SHIM_PATH_ENV: &str = "MBX_BUILD_SCRIPT_SHIM_PATH";
 pub(crate) const AR_DETERMINISM_ENV: &str = "MBX_AR_DETERMINISM";
 pub(crate) const EAGER_INCREMENTAL_ENV: &str = "MBX_SESSION_EAGER_INCREMENTAL";
+pub(crate) const GC_AUTO_ENV: &str = "MBX_SESSION_GC_AUTO";
+pub(crate) const GC_MIN_FREE_ENV: &str = "MBX_SESSION_GC_MIN_FREE";
+pub(crate) const GC_CACHE_DIR_ENV: &str = "MBX_SESSION_GC_CACHE_DIR";
+pub(crate) const GC_TARGET_ROOT_ENV: &str = "MBX_SESSION_GC_TARGET_ROOT";
+pub(crate) const GC_EXECUTABLE_ENV: &str = "MBX_SESSION_GC_EXECUTABLE";
 pub(crate) const LEARNED_INCREMENTAL_ENV: &str = "MBX_LEARNED_INCREMENTAL";
 pub(crate) const LEARNED_INCREMENTAL_MAX_SIZE_ENV: &str = "MBX_LEARNED_INCREMENTAL_MAX_SIZE";
 pub(crate) const INCREMENTAL_ROOT_ENV: &str = "MBX_INCREMENTAL_ROOT";
@@ -120,6 +125,91 @@ pub(crate) const BYPASS_LOG_ENV: &str = "MBX_BYPASS_LOG";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 #[cfg(unix)]
 static SHIM_STAGING_NONCE: AtomicU64 = AtomicU64::new(0);
+
+/// Encode only the resolved retention input the compiler shim needs. The
+/// share form is resolved against the disk being checked, so it cannot be
+/// turned into one byte value while the Cargo session is starting.
+fn session_gc_environment(config: &Config, min_free: Option<MinFree>) -> Vec<(String, String)> {
+    let min_free = min_free.map_or_else(String::new, |min_free| match min_free {
+        MinFree::ShareOfDisk => "share".into(),
+        MinFree::Bytes(bytes) => bytes.to_string(),
+    });
+    // The shim runs from the crate it is compiling, so a relative cache path
+    // would probe that crate's disk and could start a collector for a stray
+    // cache there. Keep this session-only path separate from MBX_CACHE_DIR so
+    // nested tools retain the environment they were given.
+    let absolute = |path: &Path| {
+        std::path::absolute(path)
+            .ok()
+            .map_or_else(String::new, |path| path.to_string_lossy().into_owned())
+    };
+    // Inside a shim, `current_exe()` names the shim, and a process started
+    // from it would run as that shim instead of as `mbx gc`. The session's
+    // own binary is the one the collector must be started from.
+    let executable = std::env::current_exe()
+        .ok()
+        .map_or_else(String::new, |path| absolute(&path));
+    vec![
+        (GC_AUTO_ENV.into(), u8::from(config.gc.auto).to_string()),
+        (GC_MIN_FREE_ENV.into(), min_free),
+        (GC_CACHE_DIR_ENV.into(), absolute(&config.cache_dir)),
+        (GC_TARGET_ROOT_ENV.into(), absolute(&config.target.root)),
+        (GC_EXECUTABLE_ENV.into(), executable),
+    ]
+}
+
+/// Resolve the session-only low-disk setting without consulting configuration.
+/// A missing or malformed value deliberately disables the shim hook.
+pub(crate) fn low_disk_min_free() -> Option<MinFree> {
+    low_disk_min_free_from_environment(
+        std::env::var(GC_AUTO_ENV).ok().as_deref(),
+        std::env::var(GC_MIN_FREE_ENV).ok().as_deref(),
+    )
+}
+
+/// Check the session's resolved cache disk after a real compiler invocation.
+///
+/// Persistent wrappers leave the session-only settings absent or empty, so
+/// they never load configuration just to decide whether to probe the disk.
+pub(crate) fn check_low_disk_after_compile() {
+    let Some(min_free) = low_disk_min_free() else {
+        return;
+    };
+    let session_path = |name: &str| std::env::var_os(name).filter(|path| !path.is_empty());
+    let (Some(cache_dir), Some(target_root), Some(executable)) = (
+        session_path(GC_CACHE_DIR_ENV),
+        session_path(GC_TARGET_ROOT_ENV),
+        session_path(GC_EXECUTABLE_ENV),
+    ) else {
+        return;
+    };
+    let mut config = match Config::load() {
+        Ok(config) => config,
+        Err(error) => {
+            log::debug!("the low-disk sweep check could not load configuration: {error:#}");
+            return;
+        }
+    };
+    // The shim runs from the crate it is compiling, so a relative path loaded
+    // here would name that crate's disk instead of the session's.
+    config.cache_dir = cache_dir.into();
+    config.target.root = target_root.into();
+    crate::cli::schedule_low_disk_sweep(&config, min_free, &crate::util::disk_space, &|config| {
+        crate::cli::spawn_collector_from(Path::new(&executable), config)
+    });
+}
+
+fn low_disk_min_free_from_environment(
+    auto: Option<&str>,
+    min_free: Option<&str>,
+) -> Option<MinFree> {
+    (auto == Some("1")).then_some(())?;
+    match min_free? {
+        "share" => Some(MinFree::ShareOfDisk),
+        value if !value.is_empty() => value.parse().ok().map(MinFree::Bytes),
+        _ => None,
+    }
+}
 
 /// A cache session: the agent, its listener, and the shim cargo will invoke.
 pub struct CacheSession {
@@ -145,6 +235,8 @@ pub struct CacheSession {
     events: Option<EventStream>,
     /// What the shims need to draw compile permits from the machine-wide pool.
     scheduler_env: Vec<(String, String)>,
+    /// The resolved automatic-collection policy for this session.
+    gc_env: Vec<(String, String)>,
     store: PathBuf,
     incremental_root: PathBuf,
     /// Where the shim keeps content-addressed copies of build-script output.
@@ -201,7 +293,17 @@ impl CacheSession {
         config: &Config,
         events_max_size: Option<u64>,
     ) -> Result<Self> {
-        Self::start_with_jobs(session_dir, config, None, events_max_size).await
+        Self::start_with_jobs(session_dir, config, None, events_max_size, None).await
+    }
+
+    /// Start a session with the resolved automatic-collection policy.
+    pub(crate) async fn start_with_events_limit_and_gc(
+        session_dir: &Path,
+        config: &Config,
+        events_max_size: Option<u64>,
+        min_free: Option<MinFree>,
+    ) -> Result<Self> {
+        Self::start_with_jobs(session_dir, config, None, events_max_size, min_free).await
     }
 
     /// Start a session whose Cargo jobserver limits compiler concurrency.
@@ -213,6 +315,7 @@ impl CacheSession {
         config: &Config,
         cargo_jobs: Option<u64>,
         events_max_size: Option<u64>,
+        min_free: Option<MinFree>,
     ) -> Result<Self> {
         let session_shims = install_session_shims(session_dir, &config.shims_dir)?;
         let (shim, rustdoc_shim) = (session_shims.rustc, session_shims.rustdoc);
@@ -291,6 +394,7 @@ impl CacheSession {
             agent,
             events,
             scheduler_env: crate::scheduler::session_environment_with_jobs(config, cargo_jobs),
+            gc_env: session_gc_environment(config, min_free),
             store,
             incremental_root: config.cache_dir.join("incremental"),
             out_dir_root: config.cache_dir.join(crate::out_dir::ROOT),
@@ -467,6 +571,9 @@ impl CacheSession {
             .into(),
         );
         for (name, value) in &self.scheduler_env {
+            environment.insert(name.clone(), value.clone());
+        }
+        for (name, value) in &self.gc_env {
             environment.insert(name.clone(), value.clone());
         }
         if let Some(previous) = environment.insert("RUSTC_WRAPPER".into(), shim.clone())
@@ -660,6 +767,9 @@ impl CacheSession {
             .into(),
         );
         for (name, value) in &self.scheduler_env {
+            environment.insert(name.clone(), value.clone());
+        }
+        for (name, value) in &self.gc_env {
             environment.insert(name.clone(), value.clone());
         }
         let Some(shims) = shims else {

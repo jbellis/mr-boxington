@@ -722,6 +722,7 @@ pub(crate) fn compile(
             }
         }
     }
+    session::check_low_disk_after_compile();
     session::record_compiler_invocation_with_diagnostic(
         recorded_outcome,
         Some(&timing.crate_name),
@@ -987,6 +988,7 @@ fn compile_execution_only_build_script(
             if !forwarded {
                 let _ = replay_bytes(&[], &output.stderr);
             }
+            session::check_low_disk_after_compile();
             return Ok(ExitCode::FAILURE);
         }
         session::report_shim_warning(&format!(
@@ -1048,6 +1050,7 @@ fn compile_execution_only_build_script(
             ));
         }
     }
+    session::check_low_disk_after_compile();
     if !forwarded {
         let _ = replay_output(&output);
     }

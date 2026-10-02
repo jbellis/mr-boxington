@@ -333,31 +333,39 @@ something else fills the disk. `gc.min_free_size` sets how much free space mbx
 tries to keep: by default 10% of the disk, from 5 GiB to 50 GiB. The cache disk
 and a custom `target.root` volume are each measured against their own size.
 
-While a disk has less free space than that, collection runs after a build as
-often as every 5 minutes instead of once per `gc.interval`, and it frees the
-shortfall from per-checkout state regardless of the budgets:
+While a disk has less free space than that, collection runs as often as every
+5 minutes instead of once per `gc.interval`. It does not wait for a build to
+finish: a compilation that misses the cache checks the disk when it is done
+and starts collection in the background. Collection frees the shortfall from
+private state and shared cache data regardless of the budgets:
 
 1. Learned incremental state and generated source trees, least recently used
    first.
 2. Managed target directories, least recently used first, with
    `target.evict_first` checkouts ahead of the rest and `target.keep` checkouts
    left alone.
+3. Shared action-store objects on the cache disk, after the private state and
+   managed targets stop freeing bytes.
 
 The most recently used target directory, and anything a running mbx command
-is using, is kept as usual. The action store stays at `gc.max_size`, because
-every checkout rebuilds from it. If collection cannot free enough, mbx logs a
-warning and leaves the rest to you. The next build reports what was removed
-and why:
+is using, is kept as usual. The shared action store can go below `gc.max_size`
+when the cache disk is short, because keeping the build machine usable takes
+precedence over retaining every shared result. If collection cannot free
+enough, mbx logs a warning and leaves the rest to you. The next build reports
+what was removed and why:
 
 ```text
-mbx[gc]: 3.1 GiB free on the disk holding /home/me/.cache/mbx, under the 25.0 GiB minimum; collecting learned incremental state and managed targets past their budgets
+mbx[gc]: 3.1 GiB free on the disk holding /home/me/.cache/mbx, under the 25.0 GiB minimum; collecting private state and managed targets past their budgets, then shared cache objects if the cache disk is short
 mbx[gc]: removed 4 target directories (18.2 GiB logical, 0 abandoned and 4 live); 6.0 GiB logical remain
+mbx[gc]: evicted 12 shared cache objects and 3 action results below gc.max_size because the disk was under gc.min_free_size (2.0 GiB logical freed)
 ```
 
 Restored outputs that share blocks with the cache through reflinks free less
 disk than their logical size, so collection measures the disk again before
-each step rather than trusting the logical total. Set `gc.min_free_size` to a
-size such as `"20GiB"`, or to `"none"` to collect by the budgets alone.
+each step rather than trusting the logical total. The low-disk loop is bounded
+so unrelated files filling the disk cannot make a sweep run forever. Set
+`gc.min_free_size` to a size such as `"20GiB"`, or to `"none"` to collect by
+the budgets alone.
 `mbx gc --dry-run` shows the most a low disk could remove: it cannot measure
 what each step would free, so a real run may remove fewer target directories.
 

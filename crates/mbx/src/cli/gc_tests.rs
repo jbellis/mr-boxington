@@ -1,4 +1,5 @@
 use super::*;
+use mbx_cache_core::{CacheDigest, LocalCas};
 use std::time::Duration;
 
 #[test]
@@ -238,6 +239,83 @@ fn a_short_disk_brings_the_next_sweep_forward() {
 }
 
 #[test]
+fn a_short_disk_claims_a_detached_collector_without_running_one_here() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = super::cargo_tests::managed_target_config(directory.path());
+    config.target.views = false;
+    config.gc.interval = Duration::from_secs(3600);
+    let spawned = std::cell::Cell::new(0);
+    let disk = |_path: &Path| {
+        Some(crate::util::DiskSpace {
+            total: 100,
+            available: 10,
+        })
+    };
+    let spawn = |_config: &Config| {
+        spawned.set(spawned.get() + 1);
+        Ok(())
+    };
+
+    schedule_low_disk_sweep(&config, crate::config::MinFree::Bytes(90), &disk, &spawn);
+
+    assert_eq!(spawned.get(), 1);
+}
+
+#[test]
+fn a_disk_with_room_does_not_start_a_collector() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = super::cargo_tests::managed_target_config(directory.path());
+    config.target.views = false;
+    let spawned = std::cell::Cell::new(0);
+    let disk = |_path: &Path| {
+        Some(crate::util::DiskSpace {
+            total: 100,
+            available: 100,
+        })
+    };
+    let spawn = |_config: &Config| {
+        spawned.set(spawned.get() + 1);
+        Ok(())
+    };
+
+    schedule_low_disk_sweep(&config, crate::config::MinFree::Bytes(90), &disk, &spawn);
+
+    assert_eq!(spawned.get(), 0);
+}
+
+#[test]
+fn low_disk_collection_respects_auto_off_and_the_sweep_stamp() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = super::cargo_tests::managed_target_config(directory.path());
+    config.target.views = false;
+    config.gc.interval = Duration::from_secs(3600);
+    let spawned = std::cell::Cell::new(0);
+    let disk = |_path: &Path| {
+        Some(crate::util::DiskSpace {
+            total: 100,
+            available: 10,
+        })
+    };
+    let spawn = |_config: &Config| {
+        spawned.set(spawned.get() + 1);
+        Ok(())
+    };
+
+    config.gc.auto = false;
+    schedule_low_disk_sweep(&config, crate::config::MinFree::Bytes(90), &disk, &spawn);
+    assert_eq!(
+        spawned.get(),
+        0,
+        "auto=false must avoid even the disk probe"
+    );
+
+    config.gc.auto = true;
+    assert!(crate::store::claim_sweep(&config.store_dir(), config.gc.interval).unwrap());
+    schedule_low_disk_sweep(&config, crate::config::MinFree::Bytes(90), &disk, &spawn);
+    assert_eq!(spawned.get(), 0, "a fresh sweep stamp is not due");
+}
+
+#[test]
 fn a_short_disk_collects_live_targets_past_their_budget() {
     let directory = tempfile::tempdir().unwrap();
     let config = super::cargo_tests::managed_target_config(directory.path());
@@ -276,6 +354,94 @@ fn a_short_disk_collects_live_targets_past_their_budget() {
         "the report says why: {:?}",
         report.removals
     );
+}
+
+#[test]
+fn json_report_includes_low_disk_target_removals() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = super::cargo_tests::managed_target_config(directory.path());
+    let mut views = Vec::new();
+    for (name, updated_secs) in [("older", 1), ("newer", 2)] {
+        let workspace = directory.path().join(name);
+        std::fs::create_dir_all(&workspace).unwrap();
+        let view = crate::target::place(&config, &workspace, &workspace.join("target"), false)
+            .expect("the target is managed");
+        std::fs::write(view.join("artifact"), vec![0_u8; 64]).unwrap();
+        let record = view.with_extension("json");
+        let mut fields: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&record).unwrap()).unwrap();
+        fields["updated_secs"] = updated_secs.into();
+        std::fs::write(&record, serde_json::to_vec(&fields).unwrap()).unwrap();
+        views.push(view);
+    }
+
+    let retention = always_short();
+    let low_disk = collect_low_disk(&config, &retention);
+    assert!(
+        !views[0].exists(),
+        "low-disk collection removed the older target"
+    );
+
+    let report = low_disk.target_report(&Default::default());
+    assert!(report.removed_directories > 0);
+    assert!(report.removed_bytes > 0);
+}
+
+#[test]
+fn a_short_disk_reaches_the_store_after_private_collections() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = super::cargo_tests::managed_target_config(directory.path());
+    let store = config.store_dir();
+    let contents = b"an unrooted shared cache object";
+    let digest = CacheDigest::blake3(contents);
+    LocalCas::new(&store)
+        .store_bytes(&digest, contents)
+        .unwrap();
+    assert_eq!(
+        crate::store::stats(&store).unwrap().total_bytes(),
+        contents.len() as u64
+    );
+
+    gc::run(&config, config.gc.max_bytes, false, false, &always_short()).unwrap();
+
+    assert_eq!(
+        crate::store::stats(&store).unwrap().total_bytes(),
+        0,
+        "low-disk collection reaches the shared store after private tiers"
+    );
+}
+
+#[test]
+fn a_claim_error_still_runs_the_full_automatic_sweep() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut config = super::cargo_tests::managed_target_config(directory.path());
+    config.gc.auto = true;
+    config.gc.interval = Duration::ZERO;
+    let store = config.store_dir();
+    let contents = b"an unrooted shared cache object";
+    let digest = CacheDigest::blake3(contents);
+    LocalCas::new(&store)
+        .store_bytes(&digest, contents)
+        .unwrap();
+    let stamp = store.join("gc/v1/last-sweep");
+    std::fs::create_dir_all(&stamp).unwrap();
+
+    let sweep = sweep_store(&config, &always_short());
+
+    assert!(
+        sweep.delta.freed_store_bytes > 0,
+        "a failed stamp claim still reaches store collection"
+    );
+    assert!(
+        sweep.lines.iter().any(|line| {
+            line.contains("below gc.max_size")
+                && line.contains("under gc.min_free_size")
+                && line.contains("logical freed")
+        }),
+        "store relief explains why it went below its budget: {:?}",
+        sweep.lines
+    );
+    assert_eq!(crate::store::stats(&store).unwrap().total_bytes(), 0);
 }
 
 #[test]

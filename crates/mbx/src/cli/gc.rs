@@ -2,7 +2,7 @@ use super::cache::{
     GcActionStoreReport, GcGeneratedReport, GcIncrementalReport, GcReport, GcTargetReport,
     print_json,
 };
-use crate::config::{Config, RetentionSettings};
+use crate::config::{Config, MinFree, RetentionSettings};
 use crate::{store, target};
 use bytesize::ByteSize;
 use eyre::{Context, Result};
@@ -31,6 +31,13 @@ const COLLECTOR_LOCK: &str = "gc/v1/collector.lock";
 /// usual hour, and a sweep that finds nothing left to free costs a walk in a
 /// detached process, not time on a build.
 pub(super) const LOW_DISK_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// A low-disk sweep may need several passes over one tier, because links and
+/// reflinks can make the physical space recovered smaller than the bytes
+/// removed from a tree. The bound is per tier, so a tier that frees a little
+/// on every pass cannot use up the rounds the shared store needs, and a disk
+/// filled by unrelated data cannot make collection unbounded.
+const LOW_DISK_ROUNDS_PER_TIER: usize = 4;
 
 #[derive(usage::Args)]
 pub(super) struct GcArgs {
@@ -174,10 +181,25 @@ pub(super) fn run(
                     log::warn!("target directories were not collected: {prune_error}");
                 }
             }
-            record_collection(&store, 0, freed_bytes, dry_run);
+            let low_disk = if dry_run {
+                // A dry run keeps the one-shot preview: it cannot measure the
+                // physical bytes each hypothetical removal would return.
+                LowDiskCollection::default()
+            } else {
+                collect_low_disk(config, retention)
+            };
+            let low_store_bytes = low_disk
+                .store
+                .as_ref()
+                .map_or(0, |outcome| outcome.removed_bytes);
+            freed_bytes = freed_bytes.saturating_add(low_disk.freed_target_bytes);
+            record_collection(&store, low_store_bytes, freed_bytes, dry_run);
             if !json {
                 print_incremental_removals(&incremental, dry_run);
                 print_generated_removals(&generated, dry_run);
+                for line in low_disk.lines {
+                    println!("{line}");
+                }
             }
             if !dry_run {
                 warn_if_still_low(config, retention);
@@ -185,19 +207,35 @@ pub(super) fn run(
             return Err(error);
         }
     };
+    let mut low_disk = if dry_run {
+        // A dry run keeps the one-shot preview: it cannot measure the
+        // physical bytes each hypothetical removal would return.
+        LowDiskCollection::default()
+    } else {
+        collect_low_disk(config, retention)
+    };
+    let low_disk_freed = low_disk.freed_bytes();
+    let mut report_outcome = outcome;
+    if let Some(low_store) = low_disk.store.take() {
+        add_gc_outcome(&mut report_outcome, low_store);
+    }
+    let target_freed_bytes = pruned
+        .as_ref()
+        .map_or(0, target::CollectionOutcome::freed_bytes)
+        .saturating_add(incremental.removed_bytes)
+        .saturating_add(generated.removed_bytes)
+        .saturating_add(low_disk.freed_target_bytes);
     record_collection(
         &store,
-        outcome.removed_bytes,
-        pruned
-            .as_ref()
-            .map_or(0, target::CollectionOutcome::freed_bytes)
-            + incremental.removed_bytes
-            + generated.removed_bytes,
+        report_outcome.removed_bytes,
+        target_freed_bytes,
         dry_run,
     );
+    let final_non_store_bytes =
+        remeasured_non_store_bytes(config, retention, non_store_bytes, low_disk_freed);
     if let Some(warning) = total_budget_warning(
         retention,
-        non_store_bytes.map(|bytes| outcome.remaining_bytes.saturating_add(bytes)),
+        final_non_store_bytes.map(|bytes| report_outcome.remaining_bytes.saturating_add(bytes)),
         dry_run,
     ) {
         log::warn!("{warning}");
@@ -213,39 +251,19 @@ pub(super) fn run(
             incremental_max_bytes: retention.incremental_max_bytes,
             dry_run,
             action_store: GcActionStoreReport {
-                removed_objects: outcome.removed_objects,
-                removed_action_results: outcome.removed_action_results,
-                removed_checkout_records: outcome.removed_checkout_records,
-                removed_session_streams: outcome.removed_session_streams,
-                removed_bytes: outcome.removed_bytes,
-                remaining_bytes: outcome.remaining_bytes,
+                removed_objects: report_outcome.removed_objects,
+                removed_action_results: report_outcome.removed_action_results,
+                removed_checkout_records: report_outcome.removed_checkout_records,
+                removed_session_streams: report_outcome.removed_session_streams,
+                removed_bytes: report_outcome.removed_bytes,
+                remaining_bytes: report_outcome.remaining_bytes,
             },
-            targets: GcTargetReport {
-                removed_directories: pruned.removed_views,
-                removed_bytes: pruned.removed_bytes,
-                removed_units: pruned.removed_units,
-                removed_unit_bytes: pruned.removed_unit_bytes,
-                remaining_directories: pruned.remaining_views,
-                remaining_bytes: pruned.remaining_bytes,
-                kept_active_directories: pruned.kept_active_views,
-            },
-            incremental: GcIncrementalReport {
-                removed_directories: incremental.removed_directories,
-                removed_bytes: incremental.removed_bytes,
-                remaining_directories: incremental.remaining_directories,
-                remaining_bytes: incremental.remaining_bytes,
-                skipped_active_directories: incremental.skipped_active_directories,
-                untracked_directories: incremental.untracked_directories,
-            },
-            generated: GcGeneratedReport {
-                removed_directories: generated.removed_directories,
-                removed_bytes: generated.removed_bytes,
-                remaining_directories: generated.remaining_directories,
-                remaining_bytes: generated.remaining_bytes,
-            },
+            targets: low_disk.target_report(&pruned),
+            incremental: merged_incremental_report(&incremental, low_disk.incremental.as_ref()),
+            generated: merged_generated_report(&generated, low_disk.generated.as_ref()),
         })?;
     } else {
-        print_gc_store_outcome(&outcome, dry_run);
+        print_gc_store_outcome(&report_outcome, dry_run);
         // This collection is independent of the managed-target walk below,
         // so report it even if that walk failed.
         print_incremental_removals(&incremental, dry_run);
@@ -254,11 +272,74 @@ pub(super) fn run(
         for line in target_removals(&pruned, dry_run) {
             println!("{line}");
         }
+        for line in low_disk.lines {
+            println!("{line}");
+        }
     }
     if !dry_run {
         warn_if_still_low(config, retention);
     }
     Ok(())
+}
+
+fn merged_incremental_report(
+    initial: &crate::incremental::PruneOutcome,
+    low_disk: Option<&crate::incremental::PruneOutcome>,
+) -> GcIncrementalReport {
+    let last = low_disk.unwrap_or(initial);
+    GcIncrementalReport {
+        removed_directories: initial
+            .removed_directories
+            .saturating_add(low_disk.map_or(0, |outcome| outcome.removed_directories)),
+        removed_bytes: initial
+            .removed_bytes
+            .saturating_add(low_disk.map_or(0, |outcome| outcome.removed_bytes)),
+        remaining_directories: last.remaining_directories,
+        remaining_bytes: last.remaining_bytes,
+        skipped_active_directories: last.skipped_active_directories,
+        untracked_directories: last.untracked_directories,
+    }
+}
+
+fn merged_generated_report(
+    initial: &crate::out_dir::PruneOutcome,
+    low_disk: Option<&crate::out_dir::PruneOutcome>,
+) -> GcGeneratedReport {
+    let last = low_disk.unwrap_or(initial);
+    GcGeneratedReport {
+        removed_directories: initial
+            .removed_directories
+            .saturating_add(low_disk.map_or(0, |outcome| outcome.removed_directories)),
+        removed_bytes: initial
+            .removed_bytes
+            .saturating_add(low_disk.map_or(0, |outcome| outcome.removed_bytes)),
+        remaining_directories: last.remaining_directories,
+        remaining_bytes: last.remaining_bytes,
+    }
+}
+
+fn merged_target_report(
+    initial: &target::CollectionOutcome,
+    low_disk: Option<&target::CollectionOutcome>,
+) -> GcTargetReport {
+    let last = low_disk.unwrap_or(initial);
+    GcTargetReport {
+        removed_directories: initial
+            .removed_views
+            .saturating_add(low_disk.map_or(0, |outcome| outcome.removed_views)),
+        removed_bytes: initial
+            .removed_bytes
+            .saturating_add(low_disk.map_or(0, |outcome| outcome.removed_bytes)),
+        removed_units: initial
+            .removed_units
+            .saturating_add(low_disk.map_or(0, |outcome| outcome.removed_units)),
+        removed_unit_bytes: initial
+            .removed_unit_bytes
+            .saturating_add(low_disk.map_or(0, |outcome| outcome.removed_unit_bytes)),
+        remaining_directories: last.remaining_views,
+        remaining_bytes: last.remaining_bytes,
+        kept_active_directories: last.kept_active_views,
+    }
 }
 
 /// Collect the stable copies of build-script output nothing has used lately.
@@ -301,48 +382,68 @@ fn collect_generated(
 }
 
 fn print_generated_removals(outcome: &crate::out_dir::PruneOutcome, dry_run: bool) {
-    if outcome.removed_directories > 0 {
-        println!("{}", generated_removals(outcome, dry_run));
+    for line in generated_removal_lines(outcome, dry_run) {
+        println!("{line}");
     }
 }
 
 /// One line describing the generated source trees a sweep freed.
-fn generated_removals(outcome: &crate::out_dir::PruneOutcome, dry_run: bool) -> String {
+fn generated_removal_lines(outcome: &crate::out_dir::PruneOutcome, dry_run: bool) -> Vec<String> {
+    if outcome.removed_directories == 0 {
+        return Vec::new();
+    }
     let verb = if dry_run { "would remove" } else { "removed" };
-    format!(
+    vec![format!(
         "{verb} {} generated source trees ({} logical); {} logical remain",
         outcome.removed_directories,
         ByteSize::b(outcome.removed_bytes).display().iec(),
         ByteSize::b(outcome.remaining_bytes).display().iec(),
-    )
+    )]
+}
+
+fn generated_removals(outcome: &crate::out_dir::PruneOutcome, dry_run: bool) -> String {
+    generated_removal_lines(outcome, dry_run)
+        .into_iter()
+        .next()
+        .unwrap_or_default()
 }
 
 fn print_incremental_removals(outcome: &crate::incremental::PruneOutcome, dry_run: bool) {
+    for line in incremental_removal_lines(outcome, dry_run) {
+        println!("{line}");
+    }
+}
+
+fn incremental_removal_lines(
+    outcome: &crate::incremental::PruneOutcome,
+    dry_run: bool,
+) -> Vec<String> {
     if outcome.removed_directories == 0
         && outcome.skipped_active_directories == 0
         && outcome.untracked_directories == 0
     {
-        return;
+        return Vec::new();
     }
     let verb = if dry_run { "would remove" } else { "removed" };
-    println!(
+    let mut lines = vec![format!(
         "{verb} {} learned incremental directories ({} logical); {} logical remain",
         outcome.removed_directories,
         ByteSize::b(outcome.removed_bytes).display().iec(),
         ByteSize::b(outcome.remaining_bytes).display().iec(),
-    );
+    )];
     if outcome.skipped_active_directories > 0 {
-        println!(
+        lines.push(format!(
             "kept {} learned incremental directories used by active builds",
             outcome.skipped_active_directories
-        );
+        ));
     }
     if outcome.untracked_directories > 0 {
-        println!(
+        lines.push(format!(
             "kept {} learned incremental directories with unreadable checkout records",
             outcome.untracked_directories
-        );
+        ));
     }
+    lines
 }
 
 /// Add what a collection reclaimed to this machine's lifetime totals.
@@ -456,66 +557,91 @@ pub(super) struct Sweep {
 /// is already over, and its exit status is the build's answer, not the
 /// collector's. What it freed is returned so the lifetime totals can count it.
 pub(super) fn sweep_store(config: &Config, retention: &RetentionSettings) -> Sweep {
-    let mut sweep = Sweep::default();
     if !config.gc.auto {
-        return sweep;
+        return Sweep::default();
     }
     match store::claim_sweep(&config.store_dir(), sweep_interval(config, retention)) {
-        Ok(false) => {}
+        Ok(false) => Sweep::default(),
         Ok(true) => {
             start_sweep_log(&config.store_dir());
-            let pruned = prune_targets(config, retention, config.gc.max_bytes);
-            sweep.delta.freed_target_bytes = pruned.freed_bytes;
-            sweep.lines.extend(pruned.removals);
-            let non_store_bytes = pruned.remaining_bytes.or_else(|| {
-                let target_bytes = target::stats(&config.target.root).ok()?.bytes;
-                let incremental_bytes =
-                    crate::incremental::stats(&config.cache_dir.join("incremental"))
-                        .ok()?
-                        .bytes;
-                let generated_bytes =
-                    crate::out_dir::stats(&config.cache_dir.join(crate::out_dir::ROOT))?
-                        .remaining_bytes;
-                Some(
-                    target_bytes
-                        .saturating_add(incremental_bytes)
-                        .saturating_add(generated_bytes),
-                )
-            });
-            let store_budget = store_budget(retention, config.gc.max_bytes, non_store_bytes);
-            crate::scheduler::prune_flights(&config.cache_dir);
-            let outcome = match store::gc(&config.store_dir(), store_budget) {
-                Ok(outcome) => outcome,
-                Err(error) => {
-                    log::warn!("the store was not swept: {error}");
-                    warn_if_still_low(config, retention);
-                    return sweep;
-                }
-            };
-            sweep.delta.freed_store_bytes = outcome.removed_bytes;
-            if outcome.removed_bytes > 0 {
-                sweep.lines.push(evictions(&outcome));
-            }
-            if let Some(warning) = total_budget_warning(
-                retention,
-                non_store_bytes.map(|bytes| outcome.remaining_bytes.saturating_add(bytes)),
-                false,
-            ) {
-                log::warn!("{warning}");
-                sweep.lines.push(warning);
-            }
-            // After the store's own sweep, which can free space on the cache
-            // disk too.
-            warn_if_still_low(config, retention);
+            run_sweep_body(config, retention)
         }
         Err(error) => {
             log::warn!("the store was not swept: {error}");
-            let pruned = prune_targets(config, retention, config.gc.max_bytes);
-            sweep.delta.freed_target_bytes = pruned.freed_bytes;
-            sweep.lines.extend(pruned.removals);
-            warn_if_still_low(config, retention);
+            // The stamp only throttles automatic work. The collector lock is
+            // the mutual exclusion, so a failed claim must still run the
+            // complete sweep while the disk is already under pressure.
+            start_sweep_log(&config.store_dir());
+            run_sweep_body(config, retention)
         }
     }
+}
+
+/// Run every collection belonging to one automatic sweep.
+fn run_sweep_body(config: &Config, retention: &RetentionSettings) -> Sweep {
+    let mut sweep = Sweep::default();
+    let pruned = prune_targets(config, retention, config.gc.max_bytes);
+    sweep.delta.freed_target_bytes = pruned.freed_bytes;
+    sweep.lines.extend(pruned.removals);
+    let non_store_bytes = pruned.remaining_bytes.or_else(|| {
+        let target_bytes = target::stats(&config.target.root).ok()?.bytes;
+        let incremental_bytes = crate::incremental::stats(&config.cache_dir.join("incremental"))
+            .ok()?
+            .bytes;
+        let generated_bytes =
+            crate::out_dir::stats(&config.cache_dir.join(crate::out_dir::ROOT))?.remaining_bytes;
+        Some(
+            target_bytes
+                .saturating_add(incremental_bytes)
+                .saturating_add(generated_bytes),
+        )
+    });
+    let store_budget = store_budget(retention, config.gc.max_bytes, non_store_bytes);
+    crate::scheduler::prune_flights(&config.cache_dir);
+    let outcome = match store::gc(&config.store_dir(), store_budget) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            log::warn!("the store was not swept: {error}");
+            store::GcOutcome::default()
+        }
+    };
+    sweep.delta.freed_store_bytes = outcome.removed_bytes;
+    if outcome.removed_bytes > 0 {
+        sweep.lines.push(evictions(&outcome));
+    }
+
+    // Budget-driven collection above is only an estimate of physical relief.
+    // The loop measures the disk after every logical pass and reaches the
+    // shared store only after private state and targets stop freeing bytes.
+    let low_disk = collect_low_disk(config, retention);
+    let low_disk_freed = low_disk.freed_bytes();
+    let low_store_freed = low_disk
+        .store
+        .as_ref()
+        .map_or(0, |outcome| outcome.removed_bytes);
+    let mut report_outcome = outcome;
+    if let Some(low_store) = low_disk.store {
+        add_gc_outcome(&mut report_outcome, low_store);
+    }
+    sweep.delta.freed_target_bytes = sweep
+        .delta
+        .freed_target_bytes
+        .saturating_add(low_disk.freed_target_bytes);
+    sweep.delta.freed_store_bytes = sweep
+        .delta
+        .freed_store_bytes
+        .saturating_add(low_store_freed);
+    sweep.lines.extend(low_disk.lines);
+
+    let non_store_bytes =
+        remeasured_non_store_bytes(config, retention, non_store_bytes, low_disk_freed);
+    let warning_remaining =
+        non_store_bytes.map(|bytes| report_outcome.remaining_bytes.saturating_add(bytes));
+    if let Some(warning) = total_budget_warning(retention, warning_remaining, false) {
+        log::warn!("{warning}");
+        sweep.lines.push(warning);
+    }
+    warn_if_still_low(config, retention);
     sweep
 }
 
@@ -562,8 +688,52 @@ pub(super) fn schedule_sweep(config: &Config, retention: &RetentionSettings) {
     }
 }
 
-fn spawn_collector(config: &Config) -> Result<()> {
+/// Start a detached collector after a real compiler miss finds a disk short.
+///
+/// The probes and spawner are parameters so the decision stays cheap to test;
+/// the shim supplies the real functions and swallows every failure at its
+/// boundary. The collector claims the sweep stamp again after it starts, so
+/// concurrent shims can race here without sweeping in the foreground.
+pub(crate) fn schedule_low_disk_sweep(
+    config: &Config,
+    min_free: MinFree,
+    disk_space: &dyn Fn(&Path) -> Option<crate::util::DiskSpace>,
+    spawn: &dyn Fn(&Config) -> Result<()>,
+) {
+    if !config.gc.auto {
+        return;
+    }
+
+    let is_short = |path: &Path| {
+        disk_space(path).is_some_and(|space| space.available < min_free.bytes(space.total))
+    };
+    let cache_short = is_short(&config.cache_dir);
+    let target_short = config.target.views
+        && !crate::util::same_disk(&config.cache_dir, &config.target.root)
+        && is_short(&config.target.root);
+    if !(cache_short || target_short) {
+        return;
+    }
+
+    let interval = config.gc.interval.min(LOW_DISK_INTERVAL);
+    if !store::sweep_is_due(&config.store_dir(), interval) {
+        return;
+    }
+    if let Err(error) = spawn(config) {
+        log::debug!("the low-disk collector could not be started: {error:#}");
+    }
+}
+
+pub(crate) fn spawn_collector(config: &Config) -> Result<()> {
     let executable = std::env::current_exe().wrap_err("failed to locate mbx")?;
+    spawn_collector_from(&executable, config)
+}
+
+/// Start the collector from `executable`, which must be the `mbx` binary
+/// itself. A compiler shim passes the session's binary because its own
+/// executable is the shim, and a shim started with `gc --automatic` would run
+/// as a shim and never sweep.
+pub(crate) fn spawn_collector_from(executable: &Path, config: &Config) -> Result<()> {
     // The collector reads its configuration for itself, so the cache it was
     // started for is named absolutely: a relative `MBX_CACHE_DIR` would resolve
     // against the collector's working directory, and that is not the
@@ -574,14 +744,38 @@ fn spawn_collector(config: &Config) -> Result<()> {
         std::path::absolute(&config.cache_dir).wrap_err("failed to resolve the cache directory")?;
     let store = cache_dir.join("actions");
     let log_path = store.join(SWEEP_LOG);
-    std::fs::create_dir_all(log_path.parent().expect("the sweep log has a parent"))?;
-    // Appended, not truncated: a collector that loses the claim must not erase
-    // what the one that swept had to say. The winner starts the log afresh.
-    let log = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&log_path)
-        .wrap_err_with(|| format!("failed to open {}", log_path.display()))?;
+    // A full disk can prevent the first sweep log from being created. The
+    // collector still needs to run to free the space that caused the failure.
+    // Its stderr is discarded when creating or opening the log fails.
+    let stderr =
+        match std::fs::create_dir_all(log_path.parent().expect("the sweep log has a parent")) {
+            Ok(()) => {
+                // Appended, not truncated: a collector that loses the claim must
+                // not erase what the one that swept had to say. The winner starts
+                // the log afresh.
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&log_path)
+                {
+                    Ok(log) => Stdio::from(log),
+                    Err(error) => {
+                        log::debug!("failed to open {}: {error}", log_path.display());
+                        Stdio::null()
+                    }
+                }
+            }
+            Err(error) => {
+                log::debug!(
+                    "failed to create {}: {error}",
+                    log_path
+                        .parent()
+                        .expect("the sweep log has a parent")
+                        .display()
+                );
+                Stdio::null()
+            }
+        };
     let mut command = Command::new(executable);
     command
         .args(["gc", "--automatic"])
@@ -594,7 +788,7 @@ fn spawn_collector(config: &Config) -> Result<()> {
         .env_remove("MBX_CARGO_SHIM_PATH")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(log);
+        .stderr(stderr);
     detach(&mut command);
     command.spawn().wrap_err("failed to start the collector")?;
     Ok(())
@@ -803,6 +997,325 @@ pub(super) fn prune_targets(
     report
 }
 
+#[derive(Debug, Default)]
+pub(super) struct LowDiskCollection {
+    incremental: Option<crate::incremental::PruneOutcome>,
+    generated: Option<crate::out_dir::PruneOutcome>,
+    targets: Option<target::CollectionOutcome>,
+    store: Option<store::GcOutcome>,
+    freed_target_bytes: u64,
+    lines: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+enum LowDiskTier {
+    Incremental,
+    Generated,
+    Targets,
+    Store,
+}
+
+/// Keep collecting the next private tier until it stops making progress.
+///
+/// The disk probe is deliberately between every round. A target restored by
+/// reflink or hardlink can lose a large logical tree while returning only a
+/// few physical blocks, so one logical budget adjustment cannot stand in for
+/// the disk measurement. The shared store is last because every checkout pays
+/// for a miss there.
+pub(super) fn collect_low_disk(
+    config: &Config,
+    retention: &RetentionSettings,
+) -> LowDiskCollection {
+    let mut collection = LowDiskCollection::default();
+    for tier in [
+        LowDiskTier::Incremental,
+        LowDiskTier::Generated,
+        LowDiskTier::Targets,
+        LowDiskTier::Store,
+    ] {
+        collect_low_disk_tier(config, retention, tier, &mut collection);
+    }
+    collection
+}
+
+fn collect_low_disk_tier(
+    config: &Config,
+    retention: &RetentionSettings,
+    tier: LowDiskTier,
+    collection: &mut LowDiskCollection,
+) {
+    for _ in 0..LOW_DISK_ROUNDS_PER_TIER {
+        let Some(shortfall) =
+            low_disk_for_tier(config, retention, tier).map(|disk| disk.shortfall())
+        else {
+            return;
+        };
+        let freed = match tier {
+            LowDiskTier::Incremental => {
+                collect_low_disk_incremental(config, retention, shortfall, collection)
+            }
+            LowDiskTier::Generated => {
+                collect_low_disk_generated(config, retention, shortfall, collection)
+            }
+            LowDiskTier::Targets => {
+                collect_low_disk_targets(config, retention, shortfall, collection)
+            }
+            LowDiskTier::Store => collect_low_disk_store(config, shortfall, collection),
+        };
+        if freed == 0 {
+            return;
+        }
+    }
+}
+
+fn low_disk_for_tier(
+    config: &Config,
+    retention: &RetentionSettings,
+    tier: LowDiskTier,
+) -> Option<LowDisk> {
+    match tier {
+        LowDiskTier::Incremental | LowDiskTier::Generated | LowDiskTier::Store => {
+            low_disk(retention, &config.cache_dir)
+        }
+        LowDiskTier::Targets => low_disk(retention, &config.target.root),
+    }
+}
+
+fn collect_low_disk_incremental(
+    config: &Config,
+    retention: &RetentionSettings,
+    shortfall: u64,
+    collection: &mut LowDiskCollection,
+) -> u64 {
+    let root = config.cache_dir.join("incremental");
+    let Some(usage) = crate::incremental::stats(&root)
+        .ok()
+        .map(|stats| stats.bytes)
+    else {
+        log::warn!("learned incremental state could not be measured during low-disk collection");
+        return 0;
+    };
+    let limit = usage.saturating_sub(shortfall);
+    let outcome =
+        match crate::incremental::collect(&root, Some(limit), retention.incremental_max_age, false)
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                log::warn!("learned incremental state was not collected: {error}");
+                return 0;
+            }
+        };
+    let freed = outcome.removed_bytes;
+    collection.freed_target_bytes = collection.freed_target_bytes.saturating_add(freed);
+    collection
+        .lines
+        .extend(incremental_removal_lines(&outcome, false));
+    collection.add_incremental(outcome);
+    freed
+}
+
+fn collect_low_disk_generated(
+    config: &Config,
+    retention: &RetentionSettings,
+    shortfall: u64,
+    collection: &mut LowDiskCollection,
+) -> u64 {
+    let root = config.cache_dir.join(crate::out_dir::ROOT);
+    let Some(usage) = crate::out_dir::stats(&root).map(|stats| stats.remaining_bytes) else {
+        log::warn!("generated source trees could not be measured during low-disk collection");
+        return 0;
+    };
+    let limit = usage.saturating_sub(shortfall);
+    let outcome = match crate::out_dir::collect(&root, Some(limit), retention.target_max_age, false)
+    {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            log::warn!("generated source trees were not collected: {error}");
+            return 0;
+        }
+    };
+    let freed = outcome.removed_bytes;
+    collection.freed_target_bytes = collection.freed_target_bytes.saturating_add(freed);
+    collection
+        .lines
+        .extend(generated_removal_lines(&outcome, false));
+    collection.add_generated(outcome);
+    freed
+}
+
+fn collect_low_disk_targets(
+    config: &Config,
+    retention: &RetentionSettings,
+    shortfall: u64,
+    collection: &mut LowDiskCollection,
+) -> u64 {
+    let Some(usage) = target::stats(&config.target.root)
+        .ok()
+        .map(|stats| stats.bytes)
+    else {
+        log::warn!("managed target directories could not be measured during low-disk collection");
+        return 0;
+    };
+    let limit = usage.saturating_sub(shortfall);
+    let outcome = match target::collect_by(
+        &config.target.root,
+        Some(limit),
+        retention.target_max_age,
+        &retention.target_precedence,
+        false,
+    ) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            log::warn!("target directories were not collected: {error}");
+            return 0;
+        }
+    };
+    let freed = outcome.freed_bytes();
+    collection.freed_target_bytes = collection.freed_target_bytes.saturating_add(freed);
+    collection.lines.extend(target_removals(&outcome, false));
+    collection.add_targets(outcome);
+    freed
+}
+
+fn collect_low_disk_store(
+    config: &Config,
+    shortfall: u64,
+    collection: &mut LowDiskCollection,
+) -> u64 {
+    let store = config.store_dir();
+    let Some(usage) = store::stats(&store).ok().map(|stats| stats.total_bytes()) else {
+        log::warn!("the shared store could not be measured during low-disk collection");
+        return 0;
+    };
+    let limit = usage.saturating_sub(shortfall);
+    let outcome = match store::gc(&store, limit) {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            log::warn!("the store was not swept: {error}");
+            return 0;
+        }
+    };
+    let freed = outcome.removed_bytes;
+    let removed_objects = outcome.removed_objects;
+    let removed_action_results = outcome.removed_action_results;
+    if let Some(total) = &mut collection.store {
+        add_gc_outcome(total, outcome);
+    } else {
+        collection.store = Some(outcome);
+    }
+    if freed > 0 {
+        collection.lines.push(format!(
+            "evicted {} shared cache objects and {} action results below gc.max_size because the disk was under gc.min_free_size ({} logical freed)",
+            removed_objects,
+            removed_action_results,
+            ByteSize::b(freed).display().iec(),
+        ));
+    }
+    freed
+}
+
+fn add_gc_outcome(total: &mut store::GcOutcome, outcome: store::GcOutcome) {
+    total.removed_objects = total
+        .removed_objects
+        .saturating_add(outcome.removed_objects);
+    total.removed_action_results = total
+        .removed_action_results
+        .saturating_add(outcome.removed_action_results);
+    total.removed_checkout_records = total
+        .removed_checkout_records
+        .saturating_add(outcome.removed_checkout_records);
+    total.removed_session_streams = total
+        .removed_session_streams
+        .saturating_add(outcome.removed_session_streams);
+    total.removed_bytes = total.removed_bytes.saturating_add(outcome.removed_bytes);
+    total.remaining_bytes = outcome.remaining_bytes;
+}
+
+impl LowDiskCollection {
+    pub(super) fn target_report(&self, initial: &target::CollectionOutcome) -> GcTargetReport {
+        merged_target_report(initial, self.targets.as_ref())
+    }
+
+    fn add_incremental(&mut self, outcome: crate::incremental::PruneOutcome) {
+        let mut total = self.incremental.take().unwrap_or_default();
+        total.removed_directories = total
+            .removed_directories
+            .saturating_add(outcome.removed_directories);
+        total.removed_bytes = total.removed_bytes.saturating_add(outcome.removed_bytes);
+        total.remaining_directories = outcome.remaining_directories;
+        total.remaining_bytes = outcome.remaining_bytes;
+        total.skipped_active_directories = outcome.skipped_active_directories;
+        total.untracked_directories = outcome.untracked_directories;
+        self.incremental = Some(total);
+    }
+
+    fn add_generated(&mut self, outcome: crate::out_dir::PruneOutcome) {
+        let mut total = self.generated.take().unwrap_or_default();
+        total.removed_directories = total
+            .removed_directories
+            .saturating_add(outcome.removed_directories);
+        total.removed_bytes = total.removed_bytes.saturating_add(outcome.removed_bytes);
+        total.remaining_directories = outcome.remaining_directories;
+        total.remaining_bytes = outcome.remaining_bytes;
+        self.generated = Some(total);
+    }
+
+    fn add_targets(&mut self, outcome: target::CollectionOutcome) {
+        let mut total = self.targets.take().unwrap_or_default();
+        total.removed_views = total.removed_views.saturating_add(outcome.removed_views);
+        total.removed_bytes = total.removed_bytes.saturating_add(outcome.removed_bytes);
+        total.removed_stale_views = total
+            .removed_stale_views
+            .saturating_add(outcome.removed_stale_views);
+        total.removed_live_views = total
+            .removed_live_views
+            .saturating_add(outcome.removed_live_views);
+        total.kept_active_views = outcome.kept_active_views;
+        total.removed_units = total.removed_units.saturating_add(outcome.removed_units);
+        total.removed_unit_bytes = total
+            .removed_unit_bytes
+            .saturating_add(outcome.removed_unit_bytes);
+        total.remaining_bytes = outcome.remaining_bytes;
+        total.remaining_views = outcome.remaining_views;
+        self.targets = Some(total);
+    }
+
+    fn freed_bytes(&self) -> u64 {
+        self.store
+            .as_ref()
+            .map_or(0, |outcome| outcome.removed_bytes)
+            .saturating_add(self.freed_target_bytes)
+    }
+}
+
+/// What the managed data outside the store occupies after collection.
+///
+/// Measured again only when the low-disk loop removed something. Otherwise
+/// the measurement taken before the store sweep is still right, and walking
+/// every target and learned incremental tree again would cost every sweep
+/// for a warning that only `gc.max_total_size` asks for.
+fn remeasured_non_store_bytes(
+    config: &Config,
+    retention: &RetentionSettings,
+    before: Option<u64>,
+    low_disk_freed: u64,
+) -> Option<u64> {
+    if retention.max_total_bytes.is_none() || low_disk_freed == 0 {
+        return before;
+    }
+    current_non_store_bytes(config).or(before)
+}
+
+fn current_non_store_bytes(config: &Config) -> Option<u64> {
+    let target = target::stats(&config.target.root).ok()?.bytes;
+    let incremental = crate::incremental::stats(&config.cache_dir.join("incremental"))
+        .ok()?
+        .bytes;
+    let generated =
+        crate::out_dir::stats(&config.cache_dir.join(crate::out_dir::ROOT))?.remaining_bytes;
+    Some(target.saturating_add(incremental).saturating_add(generated))
+}
+
 /// A disk found with less free space than `gc.min_free_size` asks for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct LowDisk {
@@ -823,7 +1336,7 @@ impl LowDisk {
             "collecting"
         };
         format!(
-            "{} free on the disk holding {}, under the {} minimum; {verb} learned incremental state and managed targets past their budgets",
+            "{} free on the disk holding {}, under the {} minimum; {verb} private state and managed targets past their budgets, then shared cache objects if the cache disk is short",
             ByteSize::b(self.available).display().iec(),
             self.path.display(),
             ByteSize::b(self.min_free).display().iec(),
@@ -923,9 +1436,9 @@ fn target_limit(
 
 /// Say when collection could not bring a disk back above its minimum.
 ///
-/// The shared store keeps its own budget and the most recently used target
-/// directory is never collected, so a disk filled by something else stays
-/// short, and only the person who owns it can decide what to remove.
+/// Active and most-recently-used state is protected, so a disk filled by
+/// something else can stay short after collection has removed everything it
+/// is allowed to remove.
 fn warn_if_still_low(config: &Config, retention: &RetentionSettings) {
     let cache = low_disk(retention, &config.cache_dir);
     // The target root is its own disk only when it is not the cache's, and
@@ -935,7 +1448,7 @@ fn warn_if_still_low(config: &Config, retention: &RetentionSettings) {
         .flatten();
     for disk in cache.into_iter().chain(target) {
         log::warn!(
-            "the disk holding {} still has {} free after collection, under the {} minimum; the shared cache keeps its gc.max_size budget",
+            "the disk holding {} still has {} free after collection, under the {} minimum; collection removed everything it is allowed to remove (active or most-recently-used state is kept), so something else may be using the disk",
             disk.path.display(),
             ByteSize::b(disk.available).display().iec(),
             ByteSize::b(disk.min_free).display().iec(),

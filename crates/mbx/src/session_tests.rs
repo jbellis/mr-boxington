@@ -6,6 +6,83 @@ use super::*;
 use crate::config::SummaryStyle;
 
 #[test]
+fn low_disk_session_settings_require_an_explicit_session_policy() {
+    let config = Config::for_test(Path::new("/cache"));
+    let absolute = |path: &Path| {
+        std::path::absolute(path)
+            .unwrap()
+            .to_string_lossy()
+            .into_owned()
+    };
+    assert_eq!(
+        session_gc_environment(&config, Some(crate::config::MinFree::Bytes(90))),
+        vec![
+            (GC_AUTO_ENV.to_string(), "1".to_string()),
+            (GC_MIN_FREE_ENV.to_string(), "90".to_string()),
+            (GC_CACHE_DIR_ENV.to_string(), absolute(Path::new("/cache"))),
+            (
+                GC_TARGET_ROOT_ENV.to_string(),
+                absolute(&config.target.root)
+            ),
+            (
+                GC_EXECUTABLE_ENV.to_string(),
+                absolute(&std::env::current_exe().unwrap()),
+            ),
+        ]
+    );
+    assert_eq!(
+        low_disk_min_free_from_environment(None, Some("90")),
+        None,
+        "a persistent wrapper has no session setting"
+    );
+    assert_eq!(
+        low_disk_min_free_from_environment(Some("0"), Some("90")),
+        None,
+        "gc.auto=false is carried through the session"
+    );
+    assert_eq!(
+        low_disk_min_free_from_environment(Some("1"), None),
+        None,
+        "a missing floor leaves the hook disabled"
+    );
+    assert_eq!(
+        low_disk_min_free_from_environment(Some("1"), Some("share")),
+        Some(crate::config::MinFree::ShareOfDisk)
+    );
+}
+
+#[test]
+fn low_disk_session_cache_dir_is_absolute_for_shims() {
+    let config = Config::for_test(Path::new("relative-cache"));
+    let environment = session_gc_environment(&config, None);
+    let cache_dir = environment
+        .iter()
+        .find_map(|(name, value)| (name == GC_CACHE_DIR_ENV).then_some(value));
+    let expected = std::path::absolute("relative-cache")
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    assert_eq!(cache_dir, Some(&expected));
+}
+
+#[test]
+fn low_disk_session_target_root_is_absolute_for_shims() {
+    let mut config = Config::for_test(Path::new("cache"));
+    config.target.root = PathBuf::from("relative-targets");
+    let environment = session_gc_environment(&config, None);
+    let target_root = environment
+        .iter()
+        .find_map(|(name, value)| (name == GC_TARGET_ROOT_ENV).then_some(value));
+    let expected = std::path::absolute("relative-targets")
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+
+    assert_eq!(target_root, Some(&expected));
+}
+
+#[test]
 fn clippy_workspace_wrapper_is_peeled_before_rustc_parsing() {
     let arguments = vec![
         Path::new("toolchain")
