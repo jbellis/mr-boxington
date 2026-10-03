@@ -56,8 +56,13 @@ pub(crate) fn now_ms() -> u64 {
 /// counters and memory limits from identical paths. Subtracting one
 /// container's counter from another's produces stalls that never happened,
 /// and mixing their samples breaks hysteresis in both. The device and inode of
-/// each directory the probes read do tell domains apart: a cgroup's inode is
-/// its kernel-wide id, and each proc mount has its own device.
+/// each memory cgroup directory do tell domains apart: a cgroup's inode is its
+/// kernel-wide id, whichever namespace or mount shows it.
+///
+/// `/proc/pressure/memory` is left out. It reports the whole machine in every
+/// container, and its identity changes with each proc mount, so including it
+/// would split one cgroup's state between processes with different proc
+/// mounts and let both skip the recovery spacing meant for that cgroup.
 ///
 /// Computed once: a process does not change domain while it compiles.
 pub(crate) fn domain() -> &'static str {
@@ -69,9 +74,7 @@ pub(crate) fn domain() -> &'static str {
             use std::os::unix::fs::MetadataExt;
             let mut hasher = sha2::Sha256::new();
             let mut identified = false;
-            for path in std::iter::once(PathBuf::from("/proc/pressure/memory"))
-                .chain(crate::cgroup::memory_directories())
-            {
+            for path in crate::cgroup::memory_directories() {
                 if let Ok(metadata) = std::fs::metadata(&path) {
                     hasher.update(format!("{}:{}\n", metadata.dev(), metadata.ino()));
                     identified = true;
@@ -81,7 +84,7 @@ pub(crate) fn domain() -> &'static str {
                 return hex::encode(&hasher.finalize()[..8]);
             }
         }
-        // Without cgroups or PSI the probes read only machine-wide figures,
+        // Without a visible cgroup the probes read only machine-wide figures,
         // which every process on the machine shares.
         "host".into()
     })
