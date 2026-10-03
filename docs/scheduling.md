@@ -66,7 +66,9 @@ while memory headroom is low or Linux memory-stall measurements show sustained
 pressure. macOS uses available-memory headroom; it has no Linux PSI signal.
 At least one compilation can run when the pool is idle. After five healthy
 seconds, admissions resume gradually for five seconds. Running processes are
-not suspended by this setting.
+not suspended by this setting. Containers that share a cache directory share
+permits, but each container's pressure is measured from its own memory
+readings and pauses only that container's admissions.
 
 Set `scheduler.pressure = false` (`MBX_SCHEDULER_PRESSURE=0`) to retain the
 existing estimate-based admission policy. Disabling the scheduler or setting

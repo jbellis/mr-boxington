@@ -221,22 +221,24 @@ def suspension(mbx, root):
         unhealthy = threading.Event()
         unhealthy.set()
         def readings(registry):
-            def publish(directory, pressured):
+            def publish(target, pressured):
                 now = int(time.time() * 1000)
                 value = {"version": 1, "sampled_ms": now,
                     "reading": {"total": 100, "available": 0 if pressured else 50, "stalls": {}},
                     "bad_samples": 2, "healthy_since": None, "pressured": pressured,
                     "valid": True, "recovered_ms": None, "last_admission_ms": None}
-                scratch = directory / "pressure.tmp"
+                target.parent.mkdir(exist_ok=True)
+                scratch = target.with_suffix(".tmp")
                 scratch.write_text(json.dumps(value))
-                scratch.replace(directory / "pressure.json")
+                scratch.replace(target)
             while not stop.is_set():
                 with (pool / "pool.lock").open("w") as lock:
                     fcntl.flock(lock, fcntl.LOCK_EX)
-                    # Shims sample the pool from outside the delegated tree;
-                    # the controller must judge only its own readings.
-                    publish(pool, False)
-                    publish(registry, unhealthy.is_set())
+                    # Shims sample the pool from outside the delegated tree,
+                    # one file per memory domain; the controller must judge
+                    # only its own readings.
+                    publish(pool / "pressure" / "shim.json", False)
+                    publish(registry / "pressure.json", unhealthy.is_set())
                 stop.wait(0.05)
         sampler = None
         try:
