@@ -60,6 +60,12 @@ measures compiler memory on Unix only, so on Windows, compilations keep these
 starting weights. Set `scheduler.memory = "none"` to use CPU permits without
 memory weighting.
 
+When a compilation cannot fit, it queues before newer requests. New requests
+stop filling the capacity it needs, so a large compilation can run even while
+other builds keep submitting small ones. Cancelling a waiter or killing its
+process releases its queue position. A request waiting for its own build or
+container to drain does not hold up unrelated builds or containers.
+
 Cache hits do not need compiler permits. If a process dies, the kernel
 releases its permits. For the weighting and recovery details, see
 [Machine-wide scheduling](/how-it-works#machine-wide-scheduling).
@@ -85,6 +91,26 @@ container's pressure from its own memory readings and pauses only that
 container's admissions. Suspended work is the exception: while compiler
 supervision in any container has frozen a compilation, every container sharing
 the cache waits for it to resume.
+
+When containers share a cache directory, configure `scheduler.cpus` and
+`scheduler.memory` in their shared configuration using the host's budget.
+Otherwise each container defaults the shared pool to its own limits. For
+example, a host budget of 64 CPUs and 256 GiB is:
+
+```toml
+[scheduler]
+cpus = 64
+memory = "256GiB"
+```
+
+mbx also enforces a separate ceiling for each container, based on its available
+CPUs and 85% of its memory limit. All builds in that container share the ceiling;
+other containers draw from their own ceilings and the common host pool. Pressure
+control remains local to each container. During an upgrade, older compiler
+leases without a container identity count against every container until they
+finish. Patched wrappers also account for the permit units of builds started
+before a budget change, conservatively preserving their CPU charges. Upgrade
+all wrappers sharing the pool to get ordered admission.
 
 Set `scheduler.pressure = false` (`MBX_SCHEDULER_PRESSURE=0`) to admit
 compilations on permits and memory estimates alone. Disabling the scheduler or

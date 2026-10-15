@@ -64,6 +64,7 @@ use std::time::{Duration, Instant};
 const SCHEDULER_DIR: &str = "scheduler";
 /// Subdirectory holding one locked lease file per admitted compilation.
 const LEASES_DIR: &str = "leases";
+const WAITERS_DIR: &str = "waiters";
 /// Subdirectory holding one locked flight file per compiling invocation.
 const INFLIGHT_DIR: &str = "inflight";
 /// Registrar lock serializing admission scans.
@@ -350,6 +351,74 @@ struct Lease {
     priority: String,
     #[serde(default)]
     build_id: Option<String>,
+    #[serde(default)]
+    domain: Option<String>,
+    #[serde(default)]
+    bytes_per_permit: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+struct Waiting {
+    ticket: u64,
+    weight: u64,
+    priority: String,
+    domain: String,
+    domain_capacity: u64,
+    bytes_per_permit: u64,
+    build: Option<(String, u64)>,
+}
+
+struct QueueEntry {
+    ticket: u64,
+    _guard: Permit,
+}
+
+fn fits(used: u64, weight: u64, capacity: u64) -> bool {
+    used == 0 || used.saturating_add(weight) <= capacity
+}
+
+// Sessions keep their original permit units across a configuration change.
+// Never charge a larger memory permit as one of a smaller pool's permits.
+// Keep the original weight as a CPU floor: reservations and tests may have
+// requested that many cores, even when their memory fits fewer new permits.
+fn lease_weight(lease: &Lease, bytes_per_permit: u64) -> u64 {
+    if bytes_per_permit == 0 {
+        lease.weight
+    } else {
+        lease.weight.max(
+            lease
+                .weight
+                .saturating_mul(lease.bytes_per_permit)
+                .div_ceil(bytes_per_permit),
+        )
+    }
+}
+
+fn domain_used(live: &[Lease], domain: &str, bytes_per_permit: u64) -> u64 {
+    live.iter()
+        // Old wrappers do not identify their domain. Charge them locally too
+        // until they finish, rather than over-admitting during an upgrade.
+        .filter(|lease| lease.domain.as_deref().is_none_or(|id| id == domain))
+        .map(|lease| lease_weight(lease, bytes_per_permit))
+        .sum()
+}
+
+fn build_fits(
+    live: &[Lease],
+    build: &Option<(String, u64)>,
+    weight: u64,
+    bytes_per_permit: u64,
+) -> bool {
+    build.as_ref().is_none_or(|(id, capacity)| {
+        fits(
+            live.iter()
+                .filter(|lease| lease.build_id.as_ref() == Some(id))
+                .map(|lease| lease_weight(lease, bytes_per_permit))
+                .sum(),
+            weight,
+            *capacity,
+        )
+    })
 }
 
 /// What one finished compilation leaves in its flight file: the prediction
@@ -641,6 +710,7 @@ struct TestHistoryRecord {
 pub(crate) struct Pool {
     pub(crate) dir: PathBuf,
     capacity: u64,
+    domain_capacity: u64,
     /// A per-Cargo-build ceiling, separate from the machine-wide capacity.
     build: Option<(String, u64)>,
     /// Memory one permit stands for. Zero turns memory weighting and the
@@ -852,6 +922,19 @@ pub(crate) fn average_cores(cpu: Duration, wall: Duration) -> u64 {
     (cpu.as_secs_f64() / wall.as_secs_f64()).round().max(1.0) as u64
 }
 
+// Explicit shared-pool budgets describe the host. Keep the process's own
+// CPU/cgroup budget as a second ceiling across every build in its domain.
+fn domain_capacity(capacity: u64, bytes_per_permit: u64) -> u64 {
+    let cpus = default_capacity();
+    let memory = if bytes_per_permit == 0 {
+        capacity
+    } else {
+        crate::util::memory_total_bytes()
+            .map_or(capacity, |bytes| (bytes / 100 * 85) / bytes_per_permit)
+    };
+    capacity.min(cpus).min(memory).max(1)
+}
+
 impl Pool {
     fn new(
         dir: PathBuf,
@@ -862,6 +945,7 @@ impl Pool {
         Self {
             dir,
             capacity: capacity.max(1),
+            domain_capacity: domain_capacity(capacity, bytes_per_permit),
             build: None,
             bytes_per_permit,
             priority,
@@ -898,13 +982,14 @@ impl Pool {
         let (weight, predicted) = self.plan(demand);
         let started = Instant::now();
         let mut delay = POLL_INITIAL;
+        let mut queued = None;
         let mut stamped: Option<Instant> = None;
         let mut complained = false;
         loop {
             // The gate stops applying at its deadline so a machine that stays
             // short of memory delays this compilation rather than starving it.
             let gate = predicted.filter(|_| started.elapsed() < GATE_DEADLINE);
-            match self.try_admit(weight, gate) {
+            match self.try_admit_queued(weight, gate, &mut queued) {
                 Ok(Some(permit)) => return Some(permit),
                 Ok(None) => {}
                 Err(error) => {
@@ -964,12 +1049,13 @@ impl Pool {
 
         let started = Instant::now();
         let mut delay = POLL_INITIAL;
+        let mut queued = None;
         let mut stamped: Option<Instant> = None;
         loop {
             // Like compiler admission, a persistently low available-memory
             // reading must not turn an advisory gate into permanent starvation.
             let gate = memory_bytes.filter(|_| started.elapsed() < GATE_DEADLINE);
-            if let Some(permit) = self.try_admit(weight, gate)? {
+            if let Some(permit) = self.try_admit_queued(weight, gate, &mut queued)? {
                 return Ok(permit);
             }
             if self.priority == SchedulerPriority::Normal
@@ -1089,7 +1175,17 @@ impl Pool {
     }
 
     /// One admission attempt under the registrar lock.
+    #[cfg(test)]
     fn try_admit(&self, weight: u64, predicted: Option<u64>) -> Result<Option<Permit>> {
+        self.try_admit_queued(weight, predicted, &mut None)
+    }
+
+    fn try_admit_queued(
+        &self,
+        weight: u64,
+        predicted: Option<u64>,
+        queued: &mut Option<QueueEntry>,
+    ) -> Result<Option<Permit>> {
         let leases = self.dir.join(LEASES_DIR);
         std::fs::create_dir_all(&leases)
             .wrap_err_with(|| format!("failed to create {}", leases.display()))?;
@@ -1109,6 +1205,7 @@ impl Pool {
             && !live.is_empty()
             && crate::supervision::resumes_pending(&self.dir, now)
         {
+            *queued = None;
             return Ok(None);
         }
         if !live.is_empty()
@@ -1120,28 +1217,14 @@ impl Pool {
                         now.saturating_sub(last) < crate::pressure::INTERVAL_MS
                     })))
         {
+            *queued = None;
             return Ok(None);
         }
         let capacity = self.capacity - self.reserved();
-        let used: u64 = live.iter().map(|lease| lease.weight).sum();
-        if let Some((build_id, build_capacity)) = &self.build {
-            let build_used = live
-                .iter()
-                .filter(|lease| lease.build_id.as_ref() == Some(build_id))
-                .map(|lease| lease.weight)
-                .sum::<u64>();
-            // Like an oversized machine-wide demand, a single compilation
-            // heavier than this build's ceiling must still be able to run.
-            if build_used > 0 && build_used.saturating_add(weight) > *build_capacity {
-                return Ok(None);
-            }
-        }
-        // An oversized demand must still run alone, including when priority
-        // reserves reduce capacity. Every grant uses the common path below so
-        // other pools observe its recovery-ramp admission timestamp.
-        if used > 0 && used.saturating_add(weight) > capacity {
-            return Ok(None);
-        }
+        let used: u64 = live
+            .iter()
+            .map(|lease| lease_weight(lease, self.bytes_per_permit))
+            .sum();
         // The permit arithmetic bounds what history predicted; this bounds it
         // against the machine as it is right now, catching pressure the
         // ledger cannot see -- unmeasured crates already running, or memory
@@ -1156,9 +1239,70 @@ impl Pool {
             && let Some(available) = (self.available_memory)()
             && available < needed
         {
+            *queued = None;
+            return Ok(None);
+        }
+        let waiters = self.dir.join(WAITERS_DIR);
+        std::fs::create_dir_all(&waiters)?;
+        let waiting = scan_waiters(&waiters)?;
+        let ticket = queued.as_ref().map_or(u64::MAX, |entry| entry.ticket);
+        let overtaking = waiting.iter().any(|older| {
+            if older.ticket >= ticket
+                || (older.priority == "low" && self.priority == SchedulerPriority::Normal)
+            {
+                return false;
+            }
+            // A request waiting for its own build/domain to drain must not
+            // block unrelated containers. Within that scope, stop refilling
+            // the slots it needs. Otherwise reserve its place in the host pool.
+            if !build_fits(&live, &older.build, older.weight, older.bytes_per_permit) {
+                return older.build.as_ref().map(|(id, _)| id)
+                    == self.build.as_ref().map(|(id, _)| id);
+            }
+            if !fits(
+                domain_used(&live, &older.domain, older.bytes_per_permit),
+                older.weight,
+                older.domain_capacity,
+            ) {
+                return older.domain == self.pressure_domain;
+            }
+            true
+        });
+        if overtaking
+            || !build_fits(&live, &self.build, weight, self.bytes_per_permit)
+            || !fits(
+                domain_used(&live, self.pressure_domain, self.bytes_per_permit),
+                weight,
+                self.domain_capacity,
+            )
+            || !fits(used, weight, capacity)
+        {
+            if queued.is_none() {
+                let ticket = waiting
+                    .iter()
+                    .map(|entry| entry.ticket)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| eyre::eyre!("scheduler queue exhausted"))?;
+                let record = Waiting {
+                    ticket,
+                    weight,
+                    priority: self.priority.as_str().into(),
+                    domain: self.pressure_domain.into(),
+                    domain_capacity: self.domain_capacity,
+                    bytes_per_permit: self.bytes_per_permit,
+                    build: self.build.clone(),
+                };
+                *queued = Some(QueueEntry {
+                    ticket,
+                    _guard: self.lock_record(&waiters, &serde_json::to_vec(&record)?)?,
+                });
+            }
             return Ok(None);
         }
         let permit = self.grant(&leases, weight)?;
+        *queued = None;
         if let Some((path, state)) = pressure_state.as_ref().zip(pressure.as_mut()) {
             state.last_admission_ms = Some(now);
             let _ = crate::pressure::save(path, state);
@@ -1183,7 +1327,13 @@ impl Pool {
             weight,
             priority: self.priority.as_str().into(),
             build_id: self.build.as_ref().map(|(id, _)| id.clone()),
+            domain: Some(self.pressure_domain.into()),
+            bytes_per_permit: self.bytes_per_permit,
         })?;
+        self.lock_record(leases, &lease)
+    }
+
+    fn lock_record(&self, leases: &Path, record: &[u8]) -> Result<Permit> {
         let mut last = None;
         for _ in 0..LEASE_NAME_ATTEMPTS {
             let path = leases.join(format!(
@@ -1198,7 +1348,7 @@ impl Pool {
                 .open(&path)
             {
                 Ok(mut file) => {
-                    std::io::Write::write_all(&mut file, &lease)
+                    std::io::Write::write_all(&mut file, record)
                         .wrap_err_with(|| format!("failed to write {}", path.display()))?;
                     drop(file);
                     let mut lock = fslock::LockFile::open(&path)?;
@@ -1770,6 +1920,25 @@ fn raise_measurement(current: TestMeasurement, incoming: TestMeasurement) -> Tes
     }
 }
 
+/// Queue entries have the same kernel-owned lifetime as leases. A crashed or
+/// cancelled waiter cannot leave a permanent head-of-line blocker.
+fn scan_waiters(directory: &Path) -> Result<Vec<Waiting>> {
+    let mut waiting = Vec::new();
+    for entry in std::fs::read_dir(directory)? {
+        let path = entry?.path();
+        let mut lock = fslock::LockFile::open(&path)?;
+        if lock.try_lock()? {
+            drop(lock);
+            let _ = std::fs::remove_file(&path);
+        } else {
+            // Do not guess a queue position for an unreadable live record.
+            // Propagate the error through the scheduler's usual fail-open path.
+            waiting.push(serde_json::from_slice(&std::fs::read(path)?)?);
+        }
+    }
+    Ok(waiting)
+}
+
 /// The live lease weights, reclaiming any lease whose holder has died.
 fn scan_leases(leases: &Path) -> Result<Vec<Lease>> {
     let mut live = Vec::new();
@@ -1795,6 +1964,8 @@ fn scan_leases(leases: &Path) -> Result<Vec<Lease>> {
                     weight: 1,
                     priority: SchedulerPriority::Normal.as_str().into(),
                     build_id: None,
+                    domain: None,
+                    bytes_per_permit: 0,
                 },
                 |mut lease| {
                     lease.weight = lease.weight.max(1);

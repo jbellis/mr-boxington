@@ -9,6 +9,7 @@ fn pool_at(dir: &Path, capacity: u64, bytes_per_permit: u64) -> Pool {
     );
     // Tests must not depend on how much memory the machine running them has
     // free; anything that wants the gate closed injects its own probe.
+    pool.domain_capacity = capacity;
     pool.available_memory = || None;
     pool.pressure = false;
     pool
@@ -229,6 +230,8 @@ fn a_dead_holders_lease_is_reclaimed() {
             weight: 1,
             priority: "normal".into(),
             build_id: None,
+            domain: None,
+            bytes_per_permit: 0,
         })
         .unwrap(),
     )
@@ -1538,5 +1541,168 @@ fn a_test_that_raises_nothing_records_without_the_history_lock() {
             peak: Some(80),
             cores: Some(2)
         })
+    );
+}
+
+// Regression: S40's eight-permit analysis compile waited over an hour while
+// newer small compiles repeatedly refilled the shared pool.
+#[test]
+fn a_heavy_waiter_drains_the_pool_before_new_small_compilations() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 4, 0);
+    let first = pool.try_admit(2, None).unwrap().unwrap();
+    let second = pool.try_admit(1, None).unwrap().unwrap();
+    let mut heavy = None;
+    assert!(
+        pool.try_admit_queued(4, None, &mut heavy)
+            .unwrap()
+            .is_none()
+    );
+    for _ in 0..10 {
+        assert!(pool.try_admit(1, None).unwrap().is_none());
+    }
+    drop(first);
+    assert!(pool.try_admit(1, None).unwrap().is_none());
+    assert!(
+        pool.try_admit_queued(4, None, &mut heavy)
+            .unwrap()
+            .is_none()
+    );
+    drop(second);
+    let admitted = pool.try_admit_queued(4, None, &mut heavy).unwrap().unwrap();
+    assert!(heavy.is_none());
+    drop(admitted);
+    assert!(pool.try_admit(1, None).unwrap().is_some());
+}
+
+#[test]
+fn cancelled_and_crashed_waiters_release_their_queue_positions() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 4, 0);
+    let held = pool.try_admit(3, None).unwrap().unwrap();
+    let mut queued = None;
+    assert!(
+        pool.try_admit_queued(2, None, &mut queued)
+            .unwrap()
+            .is_none()
+    );
+    assert!(pool.try_admit(1, None).unwrap().is_none());
+    drop(queued.take());
+    assert!(pool.try_admit(1, None).unwrap().is_some());
+    assert!(
+        pool.try_admit_queued(2, None, &mut queued)
+            .unwrap()
+            .is_none()
+    );
+    // Leave the file behind with its lock released, as after process death.
+    let mut crashed = queued.take().unwrap();
+    drop(crashed._guard.lock.take());
+    assert!(pool.try_admit(1, None).unwrap().is_some());
+    drop(held);
+}
+
+#[test]
+fn container_limits_cover_separate_builds_without_blocking_other_containers() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut a = pool_at(directory.path(), 8, 0);
+    a.pressure_domain = "container-a";
+    a.domain_capacity = 3;
+    a.build = Some(("build-a1".into(), 8));
+    let mut a2 = pool_at(directory.path(), 8, 0);
+    a2.pressure_domain = "container-a";
+    a2.domain_capacity = 3;
+    a2.build = Some(("build-a2".into(), 8));
+    let mut b = pool_at(directory.path(), 8, 0);
+    b.pressure_domain = "container-b";
+    b.domain_capacity = 3;
+    let held = a.try_admit(2, None).unwrap().unwrap();
+    let mut queued = None;
+    assert!(a2.try_admit_queued(3, None, &mut queued).unwrap().is_none());
+    // Do not refill a's last slot; let its oldest request run. b can progress.
+    assert!(a.try_admit(1, None).unwrap().is_none());
+    let other = b.try_admit(3, None).unwrap().unwrap();
+    assert!(b.try_admit(1, None).unwrap().is_none());
+    drop(held);
+    assert!(a2.try_admit_queued(3, None, &mut queued).unwrap().is_some());
+    drop(other);
+}
+
+#[test]
+fn a_build_ceiling_does_not_reserve_the_host_for_that_build() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut a = pool_at(directory.path(), 8, 0);
+    a.build = Some(("a".into(), 3));
+    let b = pool_at(directory.path(), 8, 0);
+    let held = a.try_admit(2, None).unwrap().unwrap();
+    let mut queued = None;
+    assert!(a.try_admit_queued(3, None, &mut queued).unwrap().is_none());
+    assert!(a.try_admit(1, None).unwrap().is_none());
+    assert!(b.try_admit(3, None).unwrap().is_some());
+    drop(held);
+    assert!(a.try_admit_queued(3, None, &mut queued).unwrap().is_some());
+}
+
+#[test]
+fn an_available_memory_gate_releases_the_waiters_place() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut pool = pool_at(directory.path(), 4, 1024);
+    let held = pool.try_admit(3, None).unwrap().unwrap();
+    let mut queued = None;
+    assert!(
+        pool.try_admit_queued(2, None, &mut queued)
+            .unwrap()
+            .is_none()
+    );
+    pool.available_memory = || Some(0);
+    assert!(
+        pool.try_admit_queued(2, Some(2048), &mut queued)
+            .unwrap()
+            .is_none()
+    );
+    assert!(queued.is_none());
+    assert!(pool.try_admit(1, None).unwrap().is_some());
+    drop(held);
+}
+
+#[test]
+fn a_budget_change_preserves_the_memory_and_cpu_charges_of_live_leases() {
+    let directory = tempfile::tempdir().unwrap();
+    let old = pool_at(directory.path(), 4, 1024);
+    let new = pool_at(directory.path(), 16, 4096);
+    let large_unit = new.try_admit(1, None).unwrap().unwrap();
+    // One new permit consumes all four old permits, not just one.
+    assert!(old.try_admit(1, None).unwrap().is_none());
+    drop(large_unit);
+    let cores = old.try_admit(4, None).unwrap().unwrap();
+    // Conversely, a four-core reservation cannot shrink to one core merely
+    // because the memory budget per permit grew.
+    assert!(new.try_admit(13, None).unwrap().is_none());
+    drop(cores);
+    assert!(new.try_admit(13, None).unwrap().is_some());
+}
+
+#[test]
+fn queued_domain_limits_use_the_waiters_original_permit_units() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut old = pool_at(directory.path(), 4, 1024);
+    old.pressure_domain = "a";
+    let mut new = pool_at(directory.path(), 16, 4096);
+    new.pressure_domain = "a";
+    let held = new.try_admit(1, None).unwrap().unwrap();
+    let mut queued = None;
+    assert!(
+        old.try_admit_queued(2, None, &mut queued)
+            .unwrap()
+            .is_none()
+    );
+    assert!(new.try_admit(1, None).unwrap().is_none());
+    // The old request is waiting for container a, not for the host pool.
+    new.pressure_domain = "b";
+    assert!(new.try_admit(1, None).unwrap().is_some());
+    drop(held);
+    assert!(
+        old.try_admit_queued(2, None, &mut queued)
+            .unwrap()
+            .is_some()
     );
 }
