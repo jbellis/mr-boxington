@@ -925,12 +925,21 @@ pub(crate) fn average_cores(cpu: Duration, wall: Duration) -> u64 {
 // Explicit shared-pool budgets describe the host. Keep the process's own
 // CPU/cgroup budget as a second ceiling across every build in its domain.
 fn domain_capacity(capacity: u64, bytes_per_permit: u64) -> u64 {
-    let cpus = default_capacity();
+    local_ceiling(
+        capacity,
+        bytes_per_permit,
+        default_capacity(),
+        crate::util::memory_total_bytes(),
+    )
+}
+
+/// The arithmetic half of `domain_capacity`, separated so it can be tested
+/// without depending on the CPUs and memory of the machine running it.
+fn local_ceiling(capacity: u64, bytes_per_permit: u64, cpus: u64, memory: Option<u64>) -> u64 {
     let memory = if bytes_per_permit == 0 {
         capacity
     } else {
-        crate::util::memory_total_bytes()
-            .map_or(capacity, |bytes| (bytes / 100 * 85) / bytes_per_permit)
+        memory.map_or(capacity, |bytes| (bytes / 100 * 85) / bytes_per_permit)
     };
     capacity.min(cpus).min(memory).max(1)
 }
@@ -1930,13 +1939,26 @@ fn scan_waiters(directory: &Path) -> Result<Vec<Waiting>> {
         if lock.try_lock()? {
             drop(lock);
             let _ = std::fs::remove_file(&path);
-        } else {
-            // Do not guess a queue position for an unreadable live record.
-            // Propagate the error through the scheduler's usual fail-open path.
-            waiting.push(serde_json::from_slice(&std::fs::read(path)?)?);
+        } else if let Some(record) = read_waiter(&path)? {
+            waiting.push(record);
         }
     }
     Ok(waiting)
+}
+
+/// A live waiter's record, or `None` when it vanished after its lock check.
+///
+/// `Permit::drop` takes no registrar lock: it unlocks and then removes the
+/// file. A scan can see the lock still held and then find no file, which
+/// means that waiter has left the queue. Do not guess a queue position for a
+/// record that is present but unreadable; propagate that error through the
+/// scheduler's usual fail-open path.
+fn read_waiter(path: &Path) -> Result<Option<Waiting>> {
+    match std::fs::read(path) {
+        Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// The live lease weights, reclaiming any lease whose holder has died.

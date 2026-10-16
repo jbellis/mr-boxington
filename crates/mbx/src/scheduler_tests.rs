@@ -1706,3 +1706,38 @@ fn queued_domain_limits_use_the_waiters_original_permit_units() {
             .is_some()
     );
 }
+
+#[test]
+fn a_waiter_removed_after_its_lock_check_has_left_the_queue() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("released");
+    assert!(read_waiter(&path).unwrap().is_none());
+    std::fs::write(&path, b"{").unwrap();
+    assert!(
+        read_waiter(&path).is_err(),
+        "a record that is present but unreadable must not be skipped"
+    );
+}
+
+const GIB: u64 = 1 << 30;
+
+#[test]
+fn a_cpu_only_local_ceiling_ignores_memory() {
+    assert_eq!(local_ceiling(16, 0, 4, Some(GIB)), 4);
+    assert_eq!(local_ceiling(16, 0, 32, Some(GIB)), 16);
+}
+
+#[test]
+fn the_local_ceiling_is_the_smallest_of_pool_cpus_and_memory() {
+    // 85% of 20GiB holds four 4GiB permits.
+    assert_eq!(local_ceiling(16, 4 * GIB, 8, Some(20 * GIB)), 4);
+    assert_eq!(local_ceiling(16, GIB, 2, Some(64 * GIB)), 2);
+    assert_eq!(local_ceiling(3, GIB, 8, Some(64 * GIB)), 3);
+    // Unknown memory leaves the pool and CPU limits in place.
+    assert_eq!(local_ceiling(16, GIB, 8, None), 8);
+}
+
+#[test]
+fn a_container_smaller_than_one_memory_permit_still_admits_one_compilation() {
+    assert_eq!(local_ceiling(16, 8 * GIB, 8, Some(4 * GIB)), 1);
+}
