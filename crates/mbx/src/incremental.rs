@@ -218,6 +218,7 @@ pub(crate) fn collect(
             continue;
         }
         let Some(_locks) = unit_locks(&unit.directory, dry_run)? else {
+            active.insert(index);
             outcome.skipped_active_units += 1;
             continue;
         };
@@ -1274,10 +1275,12 @@ mod tests {
         let preview = collect(cache.path(), Some(0), None, true).unwrap();
         assert_eq!(preview.removed_units, 2);
         assert_eq!(preview.skipped_active_units, 0);
+        assert_eq!(preview.skipped_active_directories, 0);
         assert!(inactive.exists());
         let outcome = collect(cache.path(), Some(0), None, false).unwrap();
         assert_eq!(outcome.removed_units, 1);
         assert_eq!(outcome.skipped_active_units, 1);
+        assert_eq!(outcome.skipped_active_directories, 1);
         assert_eq!(outcome.remaining_units, 1);
         assert!(outcome.remaining_bytes > 0);
         assert!(active.exists());
