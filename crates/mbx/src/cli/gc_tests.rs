@@ -598,3 +598,27 @@ fn unavailable_component_sizes_do_not_leave_room_in_a_combined_budget() {
         }
     }
 }
+
+#[test]
+fn incremental_report_merges_unit_counts_and_serializes_additively() {
+    let initial = crate::incremental::PruneOutcome {
+        removed_units: 2,
+        removed_directories: 1,
+        removed_bytes: 20,
+        remaining_units: 5,
+        ..Default::default()
+    };
+    let later = crate::incremental::PruneOutcome {
+        removed_units: 3,
+        removed_bytes: 30,
+        remaining_units: 2,
+        skipped_active_units: 1,
+        ..Default::default()
+    };
+    let report = serde_json::to_value(merged_incremental_report(&initial, Some(&later))).unwrap();
+    assert_eq!(report["removed_units"], 5);
+    assert_eq!(report["remaining_units"], 2);
+    assert_eq!(report["skipped_active_units"], 1);
+    assert_eq!(report["removed_directories"], 1);
+    assert_eq!(report["removed_bytes"], 50);
+}

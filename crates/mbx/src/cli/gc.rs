@@ -45,6 +45,8 @@ pub(super) struct GcArgs {
     ///
     /// Defaults to `gc.max_size`. Managed targets, learned incremental state,
     /// and generated source trees are still collected to their own budgets.
+    /// Incremental units expire individually and are evicted least recently
+    /// used first; active builds and held rustc session locks protect them.
     /// With `gc.max_total_size` set, incremental state and generated source
     /// trees default to a cap of 10% of the total, at least 10 GiB but never
     /// above the total; managed targets use what remains after them and the
@@ -104,6 +106,7 @@ pub(super) fn run(
                 });
             crate::incremental::PruneOutcome {
                 remaining_directories: stats.directories,
+                remaining_units: stats.units,
                 remaining_bytes: stats.bytes,
                 untracked_directories: stats.untracked_directories,
                 ..crate::incremental::PruneOutcome::default()
@@ -295,12 +298,17 @@ pub(super) fn run(
     Ok(())
 }
 
-fn merged_incremental_report(
+pub(super) fn merged_incremental_report(
     initial: &crate::incremental::PruneOutcome,
     low_disk: Option<&crate::incremental::PruneOutcome>,
 ) -> GcIncrementalReport {
     let last = low_disk.unwrap_or(initial);
     GcIncrementalReport {
+        removed_units: initial
+            .removed_units
+            .saturating_add(low_disk.map_or(0, |outcome| outcome.removed_units)),
+        remaining_units: last.remaining_units,
+        skipped_active_units: last.skipped_active_units,
         removed_directories: initial
             .removed_directories
             .saturating_add(low_disk.map_or(0, |outcome| outcome.removed_directories)),
@@ -432,6 +440,8 @@ fn incremental_removal_lines(
     dry_run: bool,
 ) -> Vec<String> {
     if outcome.removed_directories == 0
+        && outcome.removed_units == 0
+        && outcome.skipped_active_units == 0
         && outcome.skipped_active_directories == 0
         && outcome.untracked_directories == 0
     {
@@ -439,15 +449,17 @@ fn incremental_removal_lines(
     }
     let verb = if dry_run { "would remove" } else { "removed" };
     let mut lines = vec![format!(
-        "{verb} {} learned incremental directories ({} logical); {} logical remain",
+        "{verb} {} learned incremental units and {} checkout directories ({} logical); {} units ({} logical) remain",
+        outcome.removed_units,
         outcome.removed_directories,
         ByteSize::b(outcome.removed_bytes).display().iec(),
+        outcome.remaining_units,
         ByteSize::b(outcome.remaining_bytes).display().iec(),
     )];
-    if outcome.skipped_active_directories > 0 {
+    if outcome.skipped_active_units > 0 || outcome.skipped_active_directories > 0 {
         lines.push(format!(
-            "kept {} learned incremental directories used by active builds",
-            outcome.skipped_active_directories
+            "kept {} learned incremental units used by active builds ({} active checkouts)",
+            outcome.skipped_active_units, outcome.skipped_active_directories
         ));
     }
     if outcome.untracked_directories > 0 {
@@ -1256,6 +1268,9 @@ impl LowDiskCollection {
             .removed_directories
             .saturating_add(outcome.removed_directories);
         total.removed_bytes = total.removed_bytes.saturating_add(outcome.removed_bytes);
+        total.removed_units = total.removed_units.saturating_add(outcome.removed_units);
+        total.remaining_units = outcome.remaining_units;
+        total.skipped_active_units = outcome.skipped_active_units;
         total.remaining_directories = outcome.remaining_directories;
         total.remaining_bytes = outcome.remaining_bytes;
         total.skipped_active_directories = outcome.skipped_active_directories;

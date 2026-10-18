@@ -633,8 +633,8 @@ struct RawGc {
     /// Shared budget for learned incremental state and generated source trees,
     /// or `"none"`.
     ///
-    /// Over budget, mbx collects the incremental state of inactive checkouts
-    /// least recently used first and keeps the most recently used checkout's.
+    /// Over budget, mbx collects inactive incremental units least recently
+    /// used first, using rustc session directory modification times.
     /// Generated source trees get whatever budget incremental state leaves.
     /// With `gc.max_total_size`, defaults to 10% of that total, at least
     /// 10 GiB but never above the total.
@@ -643,7 +643,7 @@ struct RawGc {
         default_note = "5% of the cache disk, from 10 GiB to 100 GiB; with `gc.max_total_size`, 10% of the total, at least 10 GiB but never above the total"
     )]
     incremental_max_size: Option<String>,
-    /// Collect learned incremental state unused this long, or `"none"`.
+    /// Collect learned incremental units unused this long, or `"none"`.
     #[usage(env = "MBX_GC_INCREMENTAL_MAX_AGE", default = "30d", ty = "duration")]
     incremental_max_age: String,
     /// Free space to keep on the disks that hold the cache directory and

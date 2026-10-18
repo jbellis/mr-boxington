@@ -23,6 +23,7 @@ struct CheckoutRecord {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct Stats {
     pub directories: u64,
+    pub units: u64,
     pub bytes: u64,
     pub live_checkouts: u64,
     pub stale_checkouts: u64,
@@ -31,6 +32,9 @@ pub(crate) struct Stats {
 
 #[derive(Debug, Default)]
 pub(crate) struct PruneOutcome {
+    pub removed_units: u64,
+    pub remaining_units: u64,
+    pub skipped_active_units: u64,
     pub removed_directories: u64,
     pub removed_bytes: u64,
     pub remaining_directories: u64,
@@ -90,6 +94,7 @@ pub(crate) fn stats(root: &Path) -> Result<Stats> {
     let mut stats = Stats::default();
     for entry in entries(root)? {
         stats.directories += 1;
+        stats.units += entry.units.len() as u64;
         stats.bytes = stats.bytes.saturating_add(entry.bytes);
         match entry.live {
             Some(true) => stats.live_checkouts += 1,
@@ -120,11 +125,7 @@ pub(crate) fn workspaces(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(workspaces)
 }
 
-/// Collect expired and least-recently-used checkout state.
-///
-/// A deleted checkout's state is kept like any other until it expires or the
-/// budget needs the room: it is what the next new checkout starts from (see
-/// [`seed`]), and worktrees are usually removed as soon as their work merges.
+/// Collect gone checkouts, then expired and least-recently-used units.
 pub(crate) fn collect(
     root: &Path,
     max_bytes: Option<u64>,
@@ -132,86 +133,192 @@ pub(crate) fn collect(
     dry_run: bool,
 ) -> Result<PruneOutcome> {
     let now = now_secs();
-    let mut entries = entries(root)?;
-    let initial_directories = entries.len() as u64;
-    let untracked_directories = entries.iter().filter(|entry| entry.live.is_none()).count() as u64;
-    let mut required = HashSet::new();
-    let mut remaining_bytes = entries
+    let entries = entries(root)?;
+    let mut outcome = PruneOutcome {
+        remaining_directories: entries.len() as u64,
+        remaining_units: entries.iter().map(|entry| entry.units.len() as u64).sum(),
+        remaining_bytes: entries
+            .iter()
+            .map(|entry| entry.bytes)
+            .fold(0, u64::saturating_add),
+        untracked_directories: entries.iter().filter(|entry| entry.live.is_none()).count() as u64,
+        ..PruneOutcome::default()
+    };
+    let mut removed = HashSet::new();
+    let mut active = HashSet::new();
+    // Gone checkouts include bookkeeping, private artifacts, and churn records.
+    for (index, entry) in entries
         .iter()
-        .map(|entry| entry.bytes)
-        .fold(0_u64, u64::saturating_add);
-    for entry in &entries {
-        let Some(updated_secs) = entry.updated_secs else {
+        .enumerate()
+        .filter(|(_, entry)| entry.live == Some(false))
+    {
+        let guard = deletion_guard(root, &entry.key, !dry_run)?;
+        if guard.active {
+            active.insert(index);
+            outcome.skipped_active_units += entry.units.len() as u64;
             continue;
-        };
-        let expired = max_age.is_some_and(|age| now.saturating_sub(updated_secs) > age.as_secs());
-        if expired {
-            required.insert(entry.key.clone());
+        }
+        let locks = entry
+            .units
+            .iter()
+            .map(|unit| unit_locks(&unit.directory))
+            .collect::<Result<Vec<_>>>()?;
+        if locks.iter().any(Option::is_none) {
+            continue;
+        }
+        if remove_tree(&entry.directory, dry_run) {
+            removed.insert(index);
+            outcome.removed_directories += 1;
+            outcome.removed_units += entry.units.len() as u64;
+            outcome.removed_bytes = outcome.removed_bytes.saturating_add(entry.bytes);
+            outcome.remaining_bytes = outcome.remaining_bytes.saturating_sub(entry.bytes);
+            if !dry_run {
+                guard.cleanup();
+            }
         }
     }
-    entries.sort_by_key(|entry| entry.updated_secs.unwrap_or(u64::MAX));
-    let mut candidates = entries
+    let mut units = entries
         .iter()
         .enumerate()
-        .filter(|(_, entry)| entry.updated_secs.is_some() && !required.contains(&entry.key))
-        .map(|(index, _)| index)
+        .filter(|(index, entry)| {
+            entry.live.is_some() && !removed.contains(index) && !active.contains(index)
+        })
+        .flat_map(|(index, entry)| entry.units.iter().map(move |unit| (index, unit)))
         .collect::<Vec<_>>();
-    // Keep one recently used checkout. A budget smaller than the active edit
-    // loop cannot be met sustainably by deleting it after every build.
-    candidates.pop();
-    let mut planned = entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| required.contains(&entry.key))
-        .map(|(index, _)| index)
-        .collect::<Vec<_>>();
-    planned.extend(candidates);
-
-    let mut outcome = PruneOutcome::default();
-    for index in planned {
+    units.sort_by_key(|(index, unit)| {
+        let required = entries[*index].live == Some(false)
+            || max_age.is_some_and(|age| now.saturating_sub(unit.last_used) > age.as_secs());
+        (!required, unit.last_used, &unit.directory)
+    });
+    for (index, unit) in units {
         let entry = &entries[index];
-        if !required.contains(&entry.key)
-            && max_bytes.is_none_or(|max_bytes| remaining_bytes <= max_bytes)
-        {
+        let required = entry.live == Some(false)
+            || max_age.is_some_and(|age| now.saturating_sub(unit.last_used) > age.as_secs());
+        if !required && max_bytes.is_none_or(|budget| outcome.remaining_bytes <= budget) {
             break;
         }
         let guard = deletion_guard(root, &entry.key, !dry_run)?;
         if guard.active {
-            outcome.skipped_active_directories += 1;
+            active.insert(index);
+            outcome.skipped_active_units += 1;
             continue;
         }
-        if !dry_run {
-            match std::fs::remove_dir_all(&entry.directory) {
-                Ok(()) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    log::warn!(
-                        "could not remove incremental state {}: {error}",
-                        entry.directory.display()
-                    );
-                    continue;
-                }
-            }
-            guard.cleanup();
+        let Some(_locks) = unit_locks(&unit.directory)? else {
+            outcome.skipped_active_units += 1;
+            continue;
+        };
+        if remove_tree(&unit.directory, dry_run) {
+            outcome.removed_units += 1;
+            outcome.removed_bytes = outcome.removed_bytes.saturating_add(unit.bytes);
+            outcome.remaining_bytes = outcome.remaining_bytes.saturating_sub(unit.bytes);
         }
-        outcome.removed_directories += 1;
-        outcome.removed_bytes = outcome.removed_bytes.saturating_add(entry.bytes);
-        remaining_bytes = remaining_bytes.saturating_sub(entry.bytes);
-        drop(guard);
     }
-    outcome.remaining_directories = initial_directories.saturating_sub(outcome.removed_directories);
-    outcome.remaining_bytes = remaining_bytes;
-    outcome.untracked_directories = untracked_directories;
+    outcome.skipped_active_directories = active.len() as u64;
+    outcome.remaining_directories -= outcome.removed_directories;
+    outcome.remaining_units -= outcome.removed_units;
     if let Some(max_bytes) = max_bytes
-        && remaining_bytes > max_bytes
+        && outcome.remaining_bytes > max_bytes
     {
         log::warn!(
-            "learned incremental state still holds {} after collection, over the {} budget; active, most-recently-used, and untracked directories are kept",
-            bytesize::ByteSize::b(remaining_bytes).display().iec(),
+            "learned incremental state still holds {} after collection, over the {} budget; active units, untracked checkouts, and checkout bookkeeping are kept",
+            bytesize::ByteSize::b(outcome.remaining_bytes)
+                .display()
+                .iec(),
             bytesize::ByteSize::b(max_bytes).display().iec(),
         );
     }
     Ok(outcome)
+}
+
+fn remove_tree(directory: &Path, dry_run: bool) -> bool {
+    if dry_run {
+        return true;
+    }
+    match std::fs::remove_dir_all(directory) {
+        Ok(()) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
+        Err(error) => {
+            log::warn!(
+                "could not remove incremental state {}: {error}",
+                directory.display()
+            );
+            false
+        }
+    }
+}
+
+struct Unit {
+    directory: PathBuf,
+    bytes: u64,
+    last_used: u64,
+}
+
+fn units(directory: &Path) -> Result<Vec<Unit>> {
+    let root = directory.join("blake3");
+    let listing = match std::fs::read_dir(root) {
+        Ok(listing) => listing,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut units = Vec::new();
+    for entry in listing {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let directory = entry.path();
+        let last_used = std::fs::read_dir(&directory)?
+            .flatten()
+            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+            .filter_map(|entry| std::fs::read_dir(entry.path()).ok())
+            .flatten()
+            .flatten()
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with("s-"))
+            .filter_map(|entry| {
+                entry
+                    .metadata()
+                    .ok()
+                    .filter(|metadata| metadata.is_dir())?
+                    .modified()
+                    .ok()
+            })
+            .max()
+            .or_else(|| entry.metadata().ok()?.modified().ok())
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map_or(0, |age| age.as_secs());
+        units.push(Unit {
+            bytes: tree_bytes(&directory),
+            directory,
+            last_used,
+        });
+    }
+    Ok(units)
+}
+
+/// Hold all existing rustc session locks through deletion; a held lock means
+/// the unit is in use. Never wait for a compiler while collecting.
+fn unit_locks(directory: &Path) -> Result<Option<Vec<fslock::LockFile>>> {
+    let mut locks = Vec::new();
+    let mut pending = vec![directory.to_path_buf()];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory)? {
+            let entry = entry?;
+            let kind = entry.file_type()?;
+            if kind.is_dir() {
+                pending.push(entry.path());
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if kind.is_file() && name.starts_with("s-") && name.ends_with(".lock") {
+                let mut lock = fslock::LockFile::open(&entry.path())?;
+                if !lock.try_lock()? {
+                    return Ok(None);
+                }
+                locks.push(lock);
+            }
+        }
+    }
+    Ok(Some(locks))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -252,7 +359,7 @@ pub(crate) fn remove_workspace(root: &Path, workspace_root: &Path) -> Result<Rem
 struct Entry {
     key: String,
     directory: PathBuf,
-    updated_secs: Option<u64>,
+    units: Vec<Unit>,
     bytes: u64,
     live: Option<bool>,
 }
@@ -277,7 +384,13 @@ fn entries(root: &Path) -> Result<Vec<Entry>> {
             live: record
                 .as_ref()
                 .map(|record| crate::store::checkout_is_live_on(root, &record.workspace_root)),
-            updated_secs: record.as_ref().map(|record| record.updated_secs),
+            units: if record.is_some() {
+                units(&directory)?
+            } else {
+                // Untracked checkouts remain untouched even if their layout
+                // cannot be read, but count recognizable units when possible.
+                units(&directory).unwrap_or_default()
+            },
             directory,
         });
     }
@@ -836,52 +949,126 @@ mod tests {
         assert!(state.directory.exists());
     }
 
+    fn unit(checkout: &Path, name: &str, used: u64) -> PathBuf {
+        let unit = checkout.join("blake3").join(name);
+        let session = unit.join("crate-id/s-session");
+        std::fs::create_dir_all(&session).unwrap();
+        std::fs::write(session.join("dep-graph.bin"), vec![0; 32]).unwrap();
+        let file = std::fs::File::open(&session).unwrap();
+        file.set_modified(UNIX_EPOCH + Duration::from_secs(used))
+            .unwrap();
+        unit
+    }
+
     #[test]
-    fn aggregate_budget_keeps_the_most_recent_checkout() {
+    fn unit_lru_ignores_checkout_recency_and_keeps_empty_live_checkouts() {
         let cache = tempfile::tempdir().unwrap();
         let first = tempfile::tempdir().unwrap();
         let second = tempfile::tempdir().unwrap();
         let first_state = touch(cache.path(), first.path()).unwrap();
-        std::fs::write(first_state.directory.join("state"), vec![0; 32]).unwrap();
+        let recent = unit(&first_state.directory, "recent", now_secs());
         drop(first_state.lease);
-        std::thread::sleep(Duration::from_secs(1));
         let second_state = touch(cache.path(), second.path()).unwrap();
-        std::fs::write(second_state.directory.join("state"), vec![0; 32]).unwrap();
+        let old = unit(&second_state.directory, "old", 1);
+        let older = unit(&second_state.directory, "older", 0);
         drop(second_state.lease);
-
-        let outcome = collect(cache.path(), Some(1), None, false).unwrap();
-        assert_eq!(outcome.removed_directories, 1);
-        assert!(!first_state.directory.exists());
-        assert!(second_state.directory.exists());
+        let before = stats(cache.path()).unwrap();
+        let outcome = collect(cache.path(), Some(before.bytes - 64), None, false).unwrap();
+        assert_eq!(outcome.removed_units, 2);
+        assert_eq!(outcome.remaining_units, 1);
+        assert_eq!(outcome.removed_directories, 0);
+        assert_eq!(outcome.remaining_bytes, before.bytes - 64);
+        assert!(recent.exists());
+        assert!(!old.exists());
+        assert!(!older.exists());
+        assert!(second_state.directory.join(RECORD_FILE).exists());
     }
 
     #[test]
-    fn an_active_old_checkout_does_not_hide_an_inactive_candidate() {
+    fn unit_age_ignores_a_checkout_touched_today() {
         let cache = tempfile::tempdir().unwrap();
-        let active = tempfile::tempdir().unwrap();
-        let inactive = tempfile::tempdir().unwrap();
-        let newest = tempfile::tempdir().unwrap();
-        let active_state = touch(cache.path(), active.path()).unwrap();
-        std::fs::write(active_state.directory.join("state"), vec![0; 32]).unwrap();
-        std::thread::sleep(Duration::from_secs(1));
-        let inactive_state = touch(cache.path(), inactive.path()).unwrap();
-        std::fs::write(inactive_state.directory.join("state"), vec![0; 32]).unwrap();
-        drop(inactive_state.lease);
-        std::thread::sleep(Duration::from_secs(1));
-        let newest_state = touch(cache.path(), newest.path()).unwrap();
-        std::fs::write(newest_state.directory.join("state"), vec![0; 32]).unwrap();
-        drop(newest_state.lease);
+        let workspace = tempfile::tempdir().unwrap();
+        let state = touch(cache.path(), workspace.path()).unwrap();
+        let old = unit(&state.directory, "old", 0);
+        let recent = unit(&state.directory, "recent", now_secs());
+        drop(state.lease);
+        let outcome = collect(cache.path(), None, Some(Duration::from_secs(60)), false).unwrap();
+        assert_eq!(outcome.removed_units, 1);
+        assert!(!old.exists());
+        assert!(recent.exists());
+        assert!(state.directory.exists());
+    }
 
-        let budget =
-            tree_bytes(&active_state.directory).saturating_add(tree_bytes(&newest_state.directory));
-        let outcome = collect(cache.path(), Some(budget), None, false).unwrap();
+    #[test]
+    fn newest_session_wins_and_units_without_sessions_use_their_own_mtime() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = touch(cache.path(), workspace.path()).unwrap();
+        let old = unit(&state.directory, "old", 0);
+        let recent_session = old.join("crate-id/s-new");
+        std::fs::create_dir_all(&recent_session).unwrap();
+        let fallback = state.directory.join("blake3/fallback");
+        std::fs::create_dir_all(&fallback).unwrap();
+        std::fs::write(fallback.join("state"), b"no session yet").unwrap();
+        drop(state.lease);
+        let outcome = collect(cache.path(), None, Some(Duration::from_secs(60)), false).unwrap();
+        assert_eq!(outcome.removed_units, 0);
+        assert_eq!(outcome.remaining_units, 2);
+        assert!(fallback.exists());
+        assert!(old.exists());
+    }
 
-        assert_eq!(outcome.removed_directories, 1);
+    #[test]
+    fn held_session_lock_protects_only_its_unit_even_when_over_budget() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = touch(cache.path(), workspace.path()).unwrap();
+        let active = unit(&state.directory, "active", 0);
+        let inactive = unit(&state.directory, "inactive", 1);
+        let mut lock = fslock::LockFile::open(&active.join("crate-id/s-session.lock")).unwrap();
+        lock.lock().unwrap();
+        drop(state.lease);
+        let preview = collect(cache.path(), Some(0), None, true).unwrap();
+        assert_eq!(preview.removed_units, 1);
+        assert!(inactive.exists());
+        let outcome = collect(cache.path(), Some(0), None, false).unwrap();
+        assert_eq!(outcome.removed_units, 1);
+        assert_eq!(outcome.skipped_active_units, 1);
+        assert_eq!(outcome.remaining_units, 1);
+        assert!(outcome.remaining_bytes > 0);
+        assert!(active.exists());
+        assert!(!inactive.exists());
+    }
+
+    #[test]
+    fn active_checkout_lease_protects_all_units() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = touch(cache.path(), workspace.path()).unwrap();
+        unit(&state.directory, "first", 0);
+        unit(&state.directory, "second", 1);
+        let outcome = collect(cache.path(), Some(0), None, false).unwrap();
+        assert_eq!(outcome.removed_units, 0);
+        assert_eq!(outcome.skipped_active_units, 2);
         assert_eq!(outcome.skipped_active_directories, 1);
-        assert!(active_state.directory.exists());
-        assert!(!inactive_state.directory.exists());
-        assert!(newest_state.directory.exists());
-        assert!(outcome.remaining_bytes <= budget);
+    }
+
+    #[test]
+    fn gone_checkout_removes_units_and_bookkeeping() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = touch(cache.path(), workspace.path()).unwrap();
+        unit(&state.directory, "unit", now_secs());
+        std::fs::write(state.directory.join("file-digests.json"), b"bookkeeping").unwrap();
+        drop(state.lease);
+        workspace.close().unwrap();
+        let before = stats(cache.path()).unwrap();
+        let outcome = collect(cache.path(), None, None, false).unwrap();
+        assert_eq!(outcome.removed_units, 1);
+        assert_eq!(outcome.removed_directories, 1);
+        assert_eq!(outcome.removed_bytes, before.bytes);
+        assert_eq!(outcome.remaining_bytes, 0);
+        assert!(!state.directory.exists());
     }
 
     #[test]
@@ -890,14 +1077,18 @@ mod tests {
         let directory = cache.path().join("untracked");
         std::fs::create_dir(&directory).unwrap();
         std::fs::write(directory.join("state"), vec![0; 32]).unwrap();
+        let untracked_unit = unit(&directory, "unit", 0);
 
         let stats = stats(cache.path()).unwrap();
         assert_eq!(stats.directories, 1);
         assert_eq!(stats.untracked_directories, 1);
-        assert_eq!(stats.bytes, 32);
+        assert_eq!(stats.bytes, 64);
+        assert_eq!(stats.units, 1);
         let outcome = collect(cache.path(), Some(0), None, false).unwrap();
         assert_eq!(outcome.untracked_directories, 1);
-        assert_eq!(outcome.remaining_bytes, 32);
+        assert_eq!(outcome.remaining_bytes, 64);
+        assert_eq!(outcome.remaining_units, 1);
+        assert!(untracked_unit.exists());
         assert!(directory.exists());
     }
 

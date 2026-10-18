@@ -282,6 +282,7 @@ pub(super) fn cache_stats(config: &Config, json: bool) -> Result<()> {
             target_directories: views.views,
             target_bytes: views.bytes,
             incremental_directories: incremental.directories,
+            incremental_units: incremental.units,
             incremental_bytes: incremental.bytes,
             incremental_live_checkouts: incremental.live_checkouts,
             incremental_stale_checkouts: incremental.stale_checkouts,
@@ -316,8 +317,9 @@ pub(super) fn cache_stats(config: &Config, json: bool) -> Result<()> {
         ByteSize::b(views.bytes).display().iec()
     );
     println!(
-        "learned incremental: {} directories ({}, {} live, {} stale, and {} untracked)",
+        "learned incremental: {} checkouts, {} units ({}, {} live, {} stale, and {} untracked)",
         incremental.directories,
+        incremental.units,
         ByteSize::b(incremental.bytes).display().iec(),
         incremental.live_checkouts,
         incremental.stale_checkouts,
@@ -356,6 +358,7 @@ pub(super) struct CacheStatsReport {
     target_directories: u64,
     target_bytes: u64,
     incremental_directories: u64,
+    incremental_units: u64,
     incremental_bytes: u64,
     incremental_live_checkouts: u64,
     incremental_stale_checkouts: u64,
@@ -417,6 +420,9 @@ pub(super) struct GcTargetReport {
 
 #[derive(serde::Serialize)]
 pub(super) struct GcIncrementalReport {
+    pub removed_units: u64,
+    pub remaining_units: u64,
+    pub skipped_active_units: u64,
     pub(super) removed_directories: u64,
     pub(super) removed_bytes: u64,
     pub(super) remaining_directories: u64,

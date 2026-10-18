@@ -5646,7 +5646,7 @@ mod target_views {
             "successful target collection should still be reported"
         );
         assert!(
-            stdout.contains("removed 1 learned incremental directories"),
+            stdout.contains("learned incremental units and 1 checkout directories"),
             "successful incremental collection should still be reported: {stdout}"
         );
         assert!(
