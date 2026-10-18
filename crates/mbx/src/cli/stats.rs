@@ -10,7 +10,8 @@ pub(super) struct StatsArgs {
 }
 
 pub(super) fn run(config: &Config, args: StatsArgs, style: SavingsStyle) -> Result<ExitCode> {
-    let report = crate::stats::collect(&config.store_dir(), &config.target.root)?;
+    let mut report = crate::stats::collect(&config.store_dir(), &config.target.root)?;
+    report.scheduler = Some(crate::scheduler::scheduler_report(config));
     if args.json {
         super::cache::print_json(&report)?;
     } else {

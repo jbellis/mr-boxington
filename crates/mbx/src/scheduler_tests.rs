@@ -226,6 +226,8 @@ fn a_dead_holders_lease_is_reclaimed() {
     std::fs::write(
         &stale,
         serde_json::to_vec(&Lease {
+            name: None,
+            mode_key: None,
             version: LEASE_VERSION,
             weight: 1,
             priority: "normal".into(),
@@ -1740,4 +1742,330 @@ fn the_local_ceiling_is_the_smallest_of_pool_cpus_and_memory() {
 #[test]
 fn a_container_smaller_than_one_memory_permit_still_admits_one_compilation() {
     assert_eq!(local_ceiling(16, 8 * GIB, 8, Some(4 * GIB)), 1);
+}
+
+fn compile_demand(name: &str, arguments: &[&str]) -> Demand {
+    Demand::new(name, false).with_link_profile(
+        &arguments
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>(),
+    )
+}
+
+#[test]
+fn compile_mode_keys_cover_effective_rustc_settings() {
+    let mode = |args: &[&str]| compile_demand("crate", args).compile_mode.unwrap();
+    assert_eq!(
+        mode(&[]),
+        "crate [compile codegen opt0 lto-default cgu- debug0 incremental-off]"
+    );
+    assert_eq!(
+        mode(&["--emit=dep-info,metadata"]),
+        "crate [compile metadata opt0 lto-default cgu- debug0 incremental-off]"
+    );
+    assert!(mode(&["--emit", "metadata=out,dep-info=dep"]).contains("compile metadata"));
+    assert!(mode(&["--emit=metadata,llvm-ir"]).contains("compile codegen"));
+    assert_eq!(
+        mode(&[
+            "--emit=metadata",
+            "--emit=link",
+            "--emit",
+            "metadata",
+            "--test",
+            "-O",
+            "-Copt-level=1",
+            "--codegen=opt-level=2",
+            "-C",
+            "opt-level=0",
+            "-Clto=fat",
+            "--codegen",
+            "lto=off",
+            "-Ccodegen-units=16",
+            "-Ccodegen-units=1",
+            "-g",
+            "-Cdebuginfo=line-tables-only",
+            "-Cincremental=first",
+            "--codegen=incremental=",
+            "-Zthreads=8",
+            "-Z",
+            "threads=2"
+        ]),
+        "crate [compile metadata test opt0 lto-off cgu1 debugline-tables-only incremental-off threads=2]"
+    );
+    assert!(mode(&["-C", "incremental=second"]).contains("incremental-on"));
+    for args in [
+        vec!["--emit=link"],
+        vec!["--test"],
+        vec!["-Copt-level=3"],
+        vec!["-Clto"],
+        vec!["-Ccodegen-units=2"],
+        vec!["-g"],
+        vec!["-Cincremental=dir"],
+        vec!["-Zthreads=4"],
+    ] {
+        let baseline = if args == ["--emit=link"] {
+            mode(&["--emit=metadata"])
+        } else {
+            mode(&[])
+        };
+        assert_ne!(mode(&args), baseline, "{args:?}");
+    }
+}
+
+#[test]
+fn compile_keys_do_not_collide_with_existing_workloads() {
+    let demand = compile_demand("crate", &["--test", "--emit=metadata"]);
+    let key = demand.compile_mode.unwrap();
+    let link = Demand::new("crate", true).with_link_profile(&[]);
+    for old in [
+        ledger_key("crate", false),
+        ledger_key("crate", true),
+        ledger_key(&link.name, true),
+        Demand::test("crate", None).name,
+        Demand::test("crate", Some(2)).name,
+    ] {
+        assert_ne!(key, old);
+    }
+    assert!(link.compile_mode.is_none());
+    assert!(Demand::test("crate", None).compile_mode.is_none());
+}
+
+#[test]
+fn compile_modes_fall_back_until_three_successful_samples() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 100, 100);
+    let demand = compile_demand("heavy", &["--emit=metadata"]);
+    pool.record_peak("heavy", 1000, false).unwrap();
+    assert_eq!(pool.plan(&demand), (10, Some(1000)));
+    for count in 1..=4 {
+        pool.record_compile(&demand, 81, false, true).unwrap();
+        let expected = if count < 3 {
+            (10, Some(1000))
+        } else {
+            (2, Some(122))
+        };
+        assert_eq!(pool.plan(&demand), expected);
+        let ledger = read_ledger(&pool.ledger_path());
+        assert_eq!(
+            ledger.compile_samples[demand.compile_mode.as_ref().unwrap()],
+            count.min(3)
+        );
+        assert_eq!(ledger.crates["heavy"], 1000);
+    }
+}
+
+#[test]
+fn compile_headroom_is_capped_and_handles_a_missing_bare_peak() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 100, 100);
+    let demand = compile_demand("heavy", &[]);
+    for _ in 0..3 {
+        pool.record_compile(&demand, 401, false, true).unwrap();
+    }
+    assert_eq!(pool.plan(&demand), (5, Some(401)));
+    let key = demand.compile_mode.as_ref().unwrap();
+    let mut ledger = read_ledger(&pool.ledger_path());
+    ledger.crates.remove("heavy");
+    std::fs::write(pool.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
+    assert_eq!(pool.plan(&demand), (7, Some(602)));
+    ledger.crates.insert(key.clone(), u64::MAX);
+    assert_eq!(
+        compile_prediction(&ledger, "heavy", key),
+        (Some(u64::MAX), true)
+    );
+}
+
+#[test]
+fn recreating_a_missing_fallback_covers_all_retained_modes() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 100, 100);
+    let old = compile_demand("heavy", &["--emit=metadata"]);
+    for _ in 0..3 {
+        pool.record_compile(&old, 1000, false, true).unwrap();
+    }
+    let mut ledger = read_ledger(&pool.ledger_path());
+    ledger.crates.remove("heavy");
+    std::fs::write(pool.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let new = compile_demand("heavy", &[]);
+    pool.record_compile(&new, 200, false, true).unwrap();
+    assert_eq!(read_ledger(&pool.ledger_path()).crates["heavy"], 1000);
+    assert_eq!(pool.plan(&old), (10, Some(1000)));
+}
+
+#[test]
+fn compile_failures_and_oom_raise_peaks_without_successful_samples() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 100, 100);
+    let demand = compile_demand("heavy", &[]);
+    let key = demand.compile_mode.as_ref().unwrap();
+    pool.record_compile(&demand, 200, false, false).unwrap();
+    let ledger = read_ledger(&pool.ledger_path());
+    assert_eq!(ledger.crates["heavy"], 200);
+    assert_eq!(ledger.crates[key], 200);
+    assert!(!ledger.compile_samples.contains_key(key));
+    pool.record_compile(&demand, 301, true, false).unwrap();
+    let ledger = read_ledger(&pool.ledger_path());
+    assert_eq!(ledger.crates["heavy"], 602);
+    assert_eq!(ledger.crates[key], 602);
+    assert!(!ledger.compile_samples.contains_key(key));
+    pool.record_compile(&demand, 1, true, false).unwrap();
+    assert_eq!(read_ledger(&pool.ledger_path()).crates[key], 602);
+    assert_eq!(pool.plan(&demand), (7, Some(602)));
+}
+
+#[test]
+fn light_crates_stay_unrecorded_and_cpu_only_compiles_do_not_learn() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 100, 100);
+    let demand = compile_demand("light", &[]);
+    for _ in 0..3 {
+        pool.record_compile(&demand, 99, false, true).unwrap();
+    }
+    assert!(read_ledger(&pool.ledger_path()).crates.is_empty());
+    assert!(!directory.path().join(LEDGER_LOCK).exists());
+    assert_eq!(pool.plan(&demand), (1, None));
+    let cpu = pool_at(directory.path(), 100, 0);
+    cpu.record_compile(&demand, 999, false, true).unwrap();
+    assert!(read_ledger(&pool.ledger_path()).crates.is_empty());
+}
+
+#[test]
+fn old_ledgers_drop_compile_trust_but_keep_the_fallback() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 100, 100);
+    let demand = compile_demand("heavy", &[]);
+    let key = demand.compile_mode.as_ref().unwrap();
+    std::fs::write(
+        pool.ledger_path(),
+        serde_json::to_vec(&serde_json::json!({
+            "version": LEDGER_VERSION, "crates": {"heavy": 1000, key: 200}, "link_peaks": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(pool.plan(&demand), (10, Some(1000)));
+}
+
+#[test]
+fn evicted_compile_peaks_cannot_reuse_old_sample_counts() {
+    let mut ledger = MemoryLedger::default();
+    let key = "heavy [compile metadata opt0 lto-default cgu- debug0 incremental-off]";
+    ledger.crates.insert("heavy".into(), 1000);
+    ledger.crates.insert(key.into(), 200);
+    ledger.compile_samples.insert(key.into(), 3);
+    for n in 0..MAX_LEDGER_ENTRIES {
+        ledger.crates.insert(format!("other{n}"), 2000);
+    }
+    trim_compile_ledger(&mut ledger);
+    assert!(!ledger.crates.contains_key(key));
+    assert!(!ledger.compile_samples.contains_key(key));
+    assert!(!ledger.crates.contains_key("heavy"));
+    ledger.crates.insert("heavy".into(), 1000);
+    ledger.crates.insert(key.into(), 1);
+    assert_eq!(
+        compile_prediction(&ledger, "heavy", key),
+        (Some(1000), false)
+    );
+}
+
+#[test]
+fn scheduler_stats_read_old_records_without_locking_or_reclaiming_them() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 100, 100);
+    let demand = compile_demand("heavy", &["--emit=metadata"]);
+    pool.record_peak("heavy", 1000, false).unwrap();
+    for _ in 0..3 {
+        pool.record_compile(&demand, 81, false, true).unwrap();
+    }
+    let leases = directory.path().join(LEASES_DIR);
+    let waiters = directory.path().join(WAITERS_DIR);
+    std::fs::create_dir_all(&leases).unwrap();
+    std::fs::create_dir_all(&waiters).unwrap();
+    let old_lease = br#"{"version":1,"weight":2,"priority":"normal"}"#;
+    let old_waiter = br#"{"ticket":1,"weight":3,"priority":"normal","domain":"old-domain","domain_capacity":10,"bytes_per_permit":100,"build":null}"#;
+    assert!(
+        serde_json::from_slice::<Lease>(old_lease)
+            .unwrap()
+            .name
+            .is_none()
+    );
+    assert!(
+        serde_json::from_slice::<Waiting>(old_waiter)
+            .unwrap()
+            .name
+            .is_none()
+    );
+    std::fs::write(leases.join("stale"), old_lease).unwrap();
+    std::fs::write(waiters.join("stale"), old_waiter).unwrap();
+    let held = pool
+        .try_admit_named(2, None, &mut None, Some(&demand))
+        .unwrap()
+        .unwrap();
+    // Admission reclaimed the deliberately stale records; restore them before
+    // reading stats to prove the read-only path leaves them in place.
+    std::fs::write(leases.join("stale"), old_lease).unwrap();
+    std::fs::write(waiters.join("stale"), old_waiter).unwrap();
+    let mut queued = None;
+    assert!(
+        pool.try_admit_named(100, None, &mut queued, Some(&demand))
+            .unwrap()
+            .is_none()
+    );
+    // Queue admission also reclaims stale records. Restore once more so the
+    // stats reader sees both old and current records of each kind.
+    std::fs::write(leases.join("stale"), old_lease).unwrap();
+    std::fs::write(waiters.join("stale"), old_waiter).unwrap();
+    let snapshot = scheduler_snapshot(directory.path(), 100, 100, true);
+    let text = snapshot.text();
+    assert!(
+        text.contains("samples=3, charge=122 bytes / 2 permits (mode)"),
+        "{text}"
+    );
+    assert!(text.contains("lease unknown: mode=unknown, build=unknown, domain=unknown"));
+    assert!(text.contains("waiter unknown: mode=unknown, build=unknown, domain=old-domain"));
+    assert!(text.contains("lease heavy: mode=heavy [compile metadata"));
+    assert!(text.contains("waiter heavy: mode=heavy [compile metadata"));
+    assert!(text.contains("age="));
+    assert!(leases.join("stale").exists());
+    assert!(waiters.join("stale").exists());
+    let mut lock = fslock::LockFile::open(&held.path).unwrap();
+    assert!(
+        !lock.try_lock().unwrap(),
+        "stats must leave held locks alone"
+    );
+    let json = serde_json::to_value(&snapshot).unwrap();
+    assert_eq!(json["entries"][1]["source"], "mode");
+    assert_eq!(json["activity"].as_array().unwrap().len(), 4);
+    let cpu = scheduler_snapshot(directory.path(), 100, 0, true);
+    assert_eq!(cpu.entries[1].charge_permits, 1);
+    assert_eq!(cpu.entries[1].charge_bytes, None);
+    let mut ledger = read_ledger(&pool.ledger_path());
+    ledger.compile_samples.clear();
+    std::fs::write(pool.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let fallback = scheduler_snapshot(directory.path(), 100, 100, true);
+    assert!(
+        fallback
+            .text()
+            .contains("charge=1000 bytes / 10 permits (crate-wide fallback)")
+    );
+}
+
+#[test]
+fn scheduler_stats_preserve_link_and_test_cpu_weights() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 10, 100);
+    pool.record_peak("crate [link]", 200, true).unwrap();
+    pool.record_peak("crate [test]", 200, false).unwrap();
+    pool.record_peak("crate [test, 3 threads]", 200, false)
+        .unwrap();
+    pool.record_cpu("crate [test]", 4).unwrap();
+    let cpu = scheduler_snapshot(directory.path(), 10, 0, true);
+    for (entry, weight) in cpu.entries.iter().zip([2, 3, 4]) {
+        assert_eq!(entry.charge_permits, weight, "{}", entry.key);
+    }
+    let memory = scheduler_snapshot(directory.path(), 10, 100, true);
+    for (entry, weight) in memory.entries.iter().zip([2, 3, 4]) {
+        assert_eq!(entry.charge_permits, weight, "{}", entry.key);
+    }
 }

@@ -60,6 +60,24 @@ measures compiler memory on Unix only, so on Windows, compilations keep these
 starting weights. Set `scheduler.memory = "none"` to use CPU permits without
 memory weighting.
 
+For non-link compiles of a crate already measured above one memory permit,
+mbx learns separate peaks for metadata-only checks and code generation. The
+mode also includes test compilation, optimization, LTO, codegen units, debug
+info, incremental compilation, and explicit compiler thread settings. After
+three successful samples of a mode (the stored count is capped at three), its
+estimate is the mode's highest peak plus 50% headroom, capped at the crate-wide
+highest peak. Until then, mbx uses the crate-wide peak. Peaks never decrease;
+failed compiles do not count as
+successful samples, and OOM kills raise both peaks. An older shim that drops
+sample counts makes modes return to the crate-wide fallback.
+
+`mbx stats` shows scheduler peaks, successful sample counts, estimated charges
+in bytes and permits, and whether each mode uses its own estimate or the
+crate-wide fallback. Its JSON report includes the same scheduler section.
+The read-only activity snapshot shows lease and waiter names, mode keys,
+build IDs, pressure domains, charges, and ages. Older records show unknown
+names; abandoned records can remain visible until an admission reclaims them.
+
 When a compilation cannot fit, it queues before newer requests. New requests
 stop filling the capacity it needs, so a large compilation can run even while
 other builds keep submitting small ones. Cancelling a waiter or killing its

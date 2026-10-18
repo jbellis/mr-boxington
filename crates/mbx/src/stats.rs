@@ -46,6 +46,8 @@ pub(crate) struct Report {
     pub savings: Lifetime,
     pub cache: Cache,
     pub sharing: SharingEstimate,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub scheduler: Option<crate::scheduler::SchedulerReport>,
 }
 
 #[derive(Serialize)]
@@ -87,6 +89,7 @@ pub(crate) fn collect(store: &Path, target_root: &Path) -> Result<Report> {
     let live_cache_bytes =
         sharing.map_err(|_| eyre::eyre!("sizing the cache store panicked"))??;
     Ok(Report {
+        scheduler: None,
         version: 1,
         store: store.display().to_string(),
         savings: Lifetime::from(&tally),
@@ -240,6 +243,9 @@ impl Report {
         if cheeky && let Some(quip) = self.savings.quip() {
             lines.extend([String::new(), quip]);
         }
+        if let Some(scheduler) = &self.scheduler {
+            lines.extend([String::new(), scheduler.text()]);
+        }
         lines.join("\n")
     }
 }
@@ -293,6 +299,29 @@ mod tests {
             "not tracked yet"
         );
         assert_eq!(report.since(), "since 2023-11-14");
+    }
+
+    #[test]
+    fn scheduler_section_is_in_text_and_json_without_creating_files() {
+        let root = tempfile::tempdir().unwrap();
+        let mut config = crate::config::Config::for_test(root.path());
+        config.scheduler.enabled = true;
+        config.scheduler.cpus = 4;
+        config.scheduler.reserve_cpus = 0;
+        config.scheduler.memory_bytes = Some(4000);
+        let mut report = collect(&config.store_dir(), &config.target.root).unwrap();
+        report.scheduler = Some(crate::scheduler::scheduler_report(&config));
+        let text = report.text(false);
+        assert!(
+            text.contains("Scheduler: enabled (4 permits, 1000 bytes/permit)"),
+            "{text}"
+        );
+        assert!(text.contains("No recorded memory peaks."));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["scheduler"]["bytes_per_permit"], 1000);
+        assert_eq!(json["scheduler"]["capacity"], 4);
+        assert_eq!(json["scheduler"]["entries"], serde_json::json!([]));
+        assert!(!root.path().join("scheduler").exists());
     }
 
     #[test]
