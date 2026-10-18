@@ -94,6 +94,9 @@ and nextest tests append estimate-accuracy observations to
 this log (on by default); `events = false` disables observations too. Each line
 pairs the prediction and its source with the admitted permits, bytes per permit,
 measured child peak RSS (or null), outcome, wrapper status, and wait/run times.
+Observations include build identity and applicable build and domain capacities.
+`mbx reserve` records each reservation's weight, wait and run times, and command
+outcome; reservations have no peak measurement.
 Peak RSS has the same child-process measurement limitations as the memory ledger.
 Lines are smaller than 1 KiB; exceptionally long names, keys, or pressure domains
 are shortened with a hash suffix to preserve distinct identities.

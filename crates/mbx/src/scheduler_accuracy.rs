@@ -8,7 +8,7 @@ const LOCK: &str = "observations.lock";
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 
 #[derive(Clone, Copy)]
-pub(super) struct Admission {
+pub(crate) struct Admission {
     pub weight: u64,
     pub predicted: Option<u64>,
     pub source: &'static str,
@@ -25,6 +25,12 @@ struct Observation {
     kind: String,
     name: String,
     key: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    build_capacity: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    domain_capacity: Option<u64>,
     source: String,
     predicted_bytes: Option<u64>,
     charged_permits: u64,
@@ -66,6 +72,9 @@ impl Pool {
             kind: kind.into(),
             name: demand.name.clone(),
             key,
+            build_id: self.build.as_ref().map(|(id, _)| id.clone()),
+            build_capacity: self.build.as_ref().map(|(_, capacity)| *capacity),
+            domain_capacity: Some(self.domain_capacity),
             source: admission.source.into(),
             predicted_bytes: admission.predicted,
             charged_permits: admission.weight,
@@ -83,6 +92,69 @@ impl Pool {
         };
         if let Err(error) = append(&self.dir, observation) {
             debug!("scheduler observation was not recorded: {error:#}");
+        }
+    }
+
+    pub(crate) fn reserve_observed(
+        &self,
+        cpus: Option<u64>,
+        memory_bytes: Option<u64>,
+    ) -> Result<(super::Permit, Admission)> {
+        let requested_at = Instant::now();
+        let permit = self.reserve(cpus, memory_bytes)?;
+        let wait_ms = requested_at
+            .elapsed()
+            .as_millis()
+            .try_into()
+            .unwrap_or(u64::MAX);
+        let cpu_weight = cpus.unwrap_or(0);
+        let memory_weight = memory_bytes
+            .map(|memory| memory.div_ceil(self.bytes_per_permit))
+            .unwrap_or(0);
+        Ok((
+            permit,
+            Admission {
+                weight: cpu_weight.max(memory_weight),
+                predicted: None,
+                source: "reservation",
+                wait_ms,
+                started: Instant::now(),
+            },
+        ))
+    }
+
+    pub(crate) fn observe_reservation(&self, admission: Admission, status: Option<&ExitStatus>) {
+        if !self.events || self.bytes_per_permit == 0 {
+            return;
+        }
+        let observation = Observation {
+            v: 1,
+            ts_ms: (self.clock)(),
+            mbx_version: env!("CARGO_PKG_VERSION").into(),
+            pressure_domain: self.pressure_domain.into(),
+            kind: "reservation".into(),
+            name: "mbx reserve".into(),
+            key: "reservation".into(),
+            build_id: self.build.as_ref().map(|(id, _)| id.clone()),
+            build_capacity: self.build.as_ref().map(|(_, capacity)| *capacity),
+            domain_capacity: Some(self.domain_capacity),
+            source: admission.source.into(),
+            predicted_bytes: None,
+            charged_permits: admission.weight,
+            bytes_per_permit: self.bytes_per_permit,
+            peak_bytes: None,
+            outcome: status.map_or_else(|| "unknown".into(), outcome),
+            wrapped: false,
+            admission_wait_ms: admission.wait_ms,
+            run_ms: admission
+                .started
+                .elapsed()
+                .as_millis()
+                .try_into()
+                .unwrap_or(u64::MAX),
+        };
+        if let Err(error) = append(&self.dir, observation) {
+            debug!("scheduler reservation observation was not recorded: {error:#}");
         }
     }
 }
@@ -416,6 +488,9 @@ mod tests {
             kind: "compile".into(),
             name: "crate".into(),
             key: "crate [compile fixture]".into(),
+            build_id: None,
+            build_capacity: None,
+            domain_capacity: None,
             source: "mode".into(),
             predicted_bytes: Some(100),
             charged_permits: 2,
@@ -444,7 +519,8 @@ mod tests {
     #[test]
     fn kinds_schema_size_and_admitted_charge() {
         let dir = tempfile::tempdir().unwrap();
-        let pool = pool(dir.path(), 100);
+        let mut pool = pool(dir.path(), 100);
+        pool.build = Some(("build-123".into(), 7));
         let demands = [
             (
                 Demand::new("crate", false).with_link_profile(&[]),
@@ -483,6 +559,9 @@ mod tests {
             assert_eq!(value["charged_permits"], admission.weight);
             assert_eq!(value["bytes_per_permit"], 100);
             assert_eq!(value["pressure_domain"], "fixture-domain");
+            assert_eq!(value["build_id"], "build-123");
+            assert_eq!(value["build_capacity"], 7);
+            assert_eq!(value["domain_capacity"], 16);
             assert_eq!(value["peak_bytes"], 150);
             assert_eq!(value["outcome"], "success");
             assert_eq!(value["wrapped"], false);
@@ -508,6 +587,62 @@ mod tests {
         for line in bytes.split(|b| *b == b'\n').filter(|line| !line.is_empty()) {
             assert!(line.len() < 1023);
             serde_json::from_slice::<Observation>(line).unwrap();
+        }
+    }
+
+    #[test]
+    fn old_observation_lines_parse_without_optional_capacities() {
+        let mut value = serde_json::to_value(observation(Some(10), "success", 1000)).unwrap();
+        value.as_object_mut().unwrap().remove("build_id");
+        value.as_object_mut().unwrap().remove("build_capacity");
+        value.as_object_mut().unwrap().remove("domain_capacity");
+        let parsed: Observation = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.build_id, None);
+        assert_eq!(parsed.build_capacity, None);
+        assert_eq!(parsed.domain_capacity, None);
+
+        let encoded = serde_json::to_value(observation(Some(10), "success", 1000)).unwrap();
+        assert!(encoded.get("build_id").is_none());
+        assert!(encoded.get("build_capacity").is_none());
+        assert!(encoded.get("domain_capacity").is_none());
+        let dir = tempfile::tempdir().unwrap();
+        append(dir.path(), observation(Some(10), "success", 1000)).unwrap();
+        let summary = Summary::read(dir.path());
+        assert_eq!(summary.overall.n, 1);
+        assert_eq!(summary.overall.exceeded, 0);
+    }
+
+    #[test]
+    fn reservation_observation_records_weight_and_respects_gates() {
+        let dir = tempfile::tempdir().unwrap();
+        let observed_pool = pool(dir.path(), 100);
+        let (permit, admission) = observed_pool.reserve_observed(Some(3), None).unwrap();
+        drop(permit);
+        observed_pool.observe_reservation(admission, Some(&status(0)));
+        let line = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
+        let value: serde_json::Value = serde_json::from_str(line.lines().next().unwrap()).unwrap();
+        assert_eq!(value["kind"], "reservation");
+        assert_eq!(value["key"], "reservation");
+        assert_eq!(value["charged_permits"], 3);
+        assert_eq!(value["bytes_per_permit"], 100);
+        assert_eq!(value["peak_bytes"], serde_json::Value::Null);
+        assert_eq!(value["outcome"], "success");
+        let summary = Summary::read(dir.path());
+        assert_eq!(summary.overall.n, 1);
+        assert_eq!(summary.overall.exceeded, 0);
+        assert_eq!(summary.overall.measured, 0);
+        assert_eq!(summary.keys.len(), 1);
+        assert_eq!(summary.keys[0].key, "reservation");
+        assert_eq!(summary.keys[0].counts.n, 1);
+
+        for (events, bytes) in [(false, 100), (true, 0)] {
+            let gated_dir = tempfile::tempdir().unwrap();
+            let mut gated_pool = pool(gated_dir.path(), bytes);
+            gated_pool.events = events;
+            let (permit, admission) = gated_pool.reserve_observed(Some(1), None).unwrap();
+            drop(permit);
+            gated_pool.observe_reservation(admission, Some(&status(0)));
+            assert!(!gated_dir.path().join(FILE).exists());
         }
     }
 
