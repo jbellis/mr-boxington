@@ -81,12 +81,12 @@ that drops sample counts makes modes return to the crate-wide fallback.
 compile charges in readable sizes and permits, with their mode or crate-wide
 fallback source. Link and test-run entries show recorded peaks and defer
 charges to admission. Add `--json` for raw byte counts. Without `--scheduler`,
-the stats output omits this section. Charges use the scheduler settings of
-the nearest `.mbx.toml` above the current directory, if there is one, and the
-report names the settings it used. The read-only activity snapshot shows
-lease and waiter names, mode keys, build IDs, pressure domains, charges, and
-ages. Older records show unknown names; abandoned records can remain visible
-until an admission reclaims them.
+the stats output omits this section. Its charges use the global scheduler
+settings; a workspace `.mbx.toml` can change them for that workspace's builds.
+The read-only activity snapshot shows each lease and waiter with its name, mode
+key, build ID, pressure domain, age, and the charge it was really admitted or
+queued with. Older records show unknown names; abandoned records can remain
+visible until an admission reclaims them.
 
 When a compilation cannot fit, it queues before newer requests. New requests
 stop filling the capacity it needs, so a large compilation can run even while

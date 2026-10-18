@@ -1959,9 +1959,6 @@ fn trim_compile_ledger(ledger: &mut MemoryLedger) {
 #[derive(Debug, Serialize)]
 pub(crate) struct SchedulerReport {
     enabled: bool,
-    /// The workspace `.mbx.toml` applied to these settings; `None` means the
-    /// global configuration alone.
-    settings: Option<String>,
     capacity: u64,
     bytes_per_permit: u64,
     entries: Vec<SchedulerEntry>,
@@ -1990,16 +1987,17 @@ struct SchedulerActivity {
     age_secs: Option<u64>,
 }
 
-pub(crate) fn scheduler_report(config: &Config, settings: Option<&Path>) -> SchedulerReport {
+/// Charges under the global scheduler settings. A workspace `.mbx.toml` can
+/// change them for its own builds, and only `mbx cargo` resolves which
+/// workspace that is; lease and waiter records keep what was really charged.
+pub(crate) fn scheduler_report(config: &Config) -> SchedulerReport {
     let capacity = config.scheduler.permits();
-    let mut report = scheduler_snapshot(
+    scheduler_snapshot(
         &config.cache_dir.join(SCHEDULER_DIR),
         capacity,
         bytes_per_permit(config.scheduler.memory_bytes, capacity),
         config.scheduler.enabled,
-    );
-    report.settings = settings.map(|path| path.display().to_string());
-    report
+    )
 }
 
 fn scheduler_snapshot(
@@ -2098,7 +2096,6 @@ fn scheduler_snapshot(
     }
     SchedulerReport {
         enabled,
-        settings: None,
         capacity,
         bytes_per_permit,
         entries,
@@ -2109,11 +2106,10 @@ fn scheduler_snapshot(
 impl SchedulerReport {
     pub(crate) fn text(&self) -> String {
         let mut lines = vec![format!(
-            "Scheduler: {} ({} permits, {}/permit; settings: {})",
+            "Scheduler: {} ({} permits, {}/permit, from the global settings)",
             if self.enabled { "enabled" } else { "disabled" },
             self.capacity,
-            crate::stats::size(self.bytes_per_permit),
-            self.settings.as_deref().unwrap_or("global configuration")
+            crate::stats::size(self.bytes_per_permit)
         )];
         for e in &self.entries {
             let charge = e.charge_bytes.zip(e.charge_permits).map_or_else(
