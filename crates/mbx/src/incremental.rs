@@ -210,6 +210,29 @@ pub(crate) fn collect(
             continue;
         };
         if remove_tree(&unit.directory, dry_run) {
+            if !dry_run {
+                match std::fs::remove_file(&unit.churn_record) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        log::warn!(
+                            "could not remove incremental churn record {}: {error}",
+                            unit.churn_record.display()
+                        );
+                        // Count the unit tree as removed even if its record
+                        // could not be removed.
+                        let record_bytes = std::fs::metadata(&unit.churn_record)
+                            .ok()
+                            .filter(|metadata| metadata.is_file())
+                            .map_or(0, |metadata| metadata.len());
+                        outcome.removed_units += 1;
+                        let bytes = unit.bytes.saturating_sub(record_bytes);
+                        outcome.removed_bytes = outcome.removed_bytes.saturating_add(bytes);
+                        outcome.remaining_bytes = outcome.remaining_bytes.saturating_sub(bytes);
+                        continue;
+                    }
+                }
+            }
             outcome.removed_units += 1;
             outcome.removed_bytes = outcome.removed_bytes.saturating_add(unit.bytes);
             outcome.remaining_bytes = outcome.remaining_bytes.saturating_sub(unit.bytes);
@@ -253,9 +276,10 @@ struct Unit {
     directory: PathBuf,
     bytes: u64,
     last_used: u64,
+    churn_record: PathBuf,
 }
 
-fn units(directory: &Path) -> Result<Vec<Unit>> {
+fn units(directory: &Path, measure_bytes: bool) -> Result<Vec<Unit>> {
     let root = directory.join("blake3");
     let listing = match std::fs::read_dir(root) {
         Ok(listing) => listing,
@@ -288,10 +312,22 @@ fn units(directory: &Path) -> Result<Vec<Unit>> {
             .or_else(|| entry.metadata().ok()?.modified().ok())
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
             .map_or(0, |age| age.as_secs());
+        let churn_record = directory.with_extension("json");
+        let bytes = if measure_bytes {
+            tree_bytes(&directory).saturating_add(
+                std::fs::metadata(&churn_record)
+                    .ok()
+                    .filter(|metadata| metadata.is_file())
+                    .map_or(0, |metadata| metadata.len()),
+            )
+        } else {
+            0
+        };
         units.push(Unit {
-            bytes: tree_bytes(&directory),
+            bytes,
             directory,
             last_used,
+            churn_record,
         });
     }
     Ok(units)
@@ -403,19 +439,36 @@ fn entries(root: &Path) -> Result<Vec<Entry>> {
         }
         let directory = entry.path();
         let record = read_record(&directory.join(RECORD_FILE));
+        let units = if record.is_some() {
+            units(&directory, true)?
+        } else {
+            units(&directory, false).unwrap_or_default()
+        };
+        let bytes = if record.is_some() {
+            let mut excluded = units
+                .iter()
+                .map(|unit| unit.directory.clone())
+                .collect::<HashSet<_>>();
+            excluded.extend(
+                units
+                    .iter()
+                    .filter(|unit| unit.churn_record.is_file())
+                    .map(|unit| unit.churn_record.clone()),
+            );
+            units.iter().map(|unit| unit.bytes).fold(
+                tree_bytes_except(&directory, &excluded),
+                u64::saturating_add,
+            )
+        } else {
+            tree_bytes(&directory)
+        };
         entries.push(Entry {
             key: entry.file_name().to_string_lossy().into_owned(),
-            bytes: tree_bytes(&directory),
+            bytes,
             live: record
                 .as_ref()
                 .map(|record| crate::store::checkout_is_live_on(root, &record.workspace_root)),
-            units: if record.is_some() {
-                units(&directory)?
-            } else {
-                // Untracked checkouts remain untouched even if their layout
-                // cannot be read, but count recognizable units when possible.
-                units(&directory).unwrap_or_default()
-            },
+            units,
             directory,
         });
     }
@@ -790,6 +843,10 @@ fn now_secs() -> u64 {
 }
 
 fn tree_bytes(root: &Path) -> u64 {
+    tree_bytes_except(root, &HashSet::new())
+}
+
+fn tree_bytes_except(root: &Path, excluded: &HashSet<PathBuf>) -> u64 {
     let mut total = 0_u64;
     let mut pending = vec![root.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -797,6 +854,9 @@ fn tree_bytes(root: &Path) -> u64 {
             continue;
         };
         for entry in listing.flatten() {
+            if excluded.contains(&entry.path()) {
+                continue;
+            }
             let Ok(metadata) = entry.metadata() else {
                 continue;
             };
@@ -1017,6 +1077,36 @@ mod tests {
         assert!(!old.exists());
         assert!(!older.exists());
         assert!(second_state.directory.join(RECORD_FILE).exists());
+    }
+
+    #[test]
+    fn unit_eviction_removes_its_churn_record_and_counts_each_subtree_once() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = touch(cache.path(), workspace.path()).unwrap();
+        let directory = unit(&state.directory, "unit", 0);
+        let record = directory.with_extension("json");
+        std::fs::write(&record, b"churn").unwrap();
+        std::fs::create_dir(state.directory.join("private")).unwrap();
+        std::fs::write(state.directory.join("private/marker"), b"private").unwrap();
+        std::fs::write(state.directory.join("blake3/orphan.json"), b"orphan").unwrap();
+        drop(state.lease);
+        let before = stats(cache.path()).unwrap();
+        assert_eq!(before.bytes, tree_bytes(&state.directory));
+        let preview = collect(cache.path(), Some(0), None, true).unwrap();
+        assert_eq!(preview.removed_bytes, 32 + 5);
+        assert!(record.exists());
+        let outcome = collect(cache.path(), Some(0), None, false).unwrap();
+        assert_eq!(outcome.removed_bytes, 32 + 5);
+        assert_eq!(outcome.remaining_bytes, tree_bytes(&state.directory));
+        assert_eq!(
+            before.bytes - outcome.remaining_bytes,
+            outcome.removed_bytes
+        );
+        assert!(!record.exists());
+        assert!(!directory.exists());
+        assert!(state.directory.join("private/marker").exists());
+        assert!(state.directory.join("blake3/orphan.json").exists());
     }
 
     #[test]
