@@ -13,7 +13,7 @@ This is for work such as a VM, Docker build, or another compiler that consumes t
 - **`<COMMAND>…`** — Command and arguments to run while capacity is reserved.
 
 ## Flags
-- **`--cpus <N>`** — CPU permits to hold while the command runs.
+- **`--cpus <N>`** — CPU cores to hold while the command runs.
 - **`--memory <SIZE>`** — Memory to hold from the configured scheduler budget.
 - **`--priority <PRIORITY>`** — Whether this reservation yields capacity to normal-priority builds.
 

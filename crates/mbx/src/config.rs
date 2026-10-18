@@ -406,23 +406,24 @@ struct RawScheduler {
     /// variable wins.
     #[usage(env = "MBX_SCHEDULER", default = true)]
     enabled: bool,
-    /// Number of compile permits in the machine-wide pool.
+    /// CPU core budget in the machine-wide pool before `scheduler.reserve_cpus`.
     ///
-    /// A typical compilation takes one permit; links and memory-heavy crates
-    /// can take more. This may also be set in workspace `.mbx.toml`; the
-    /// environment variable wins.
+    /// Compilers charge their thread counts; test binaries can use learned core
+    /// counts. Memory has its own independent budget. This may also be set in
+    /// workspace `.mbx.toml`; the environment variable wins.
     #[usage(env = "MBX_SCHEDULER_CPUS", default_note = "logical CPUs")]
     cpus: Option<i64>,
-    /// Permits withheld from `scheduler.cpus` to leave CPUs for other work.
+    /// CPU cores withheld from `scheduler.cpus` to leave CPUs for other work.
     ///
-    /// At least one permit always remains. This may also be set in workspace
-    /// `.mbx.toml`; the environment variable wins.
+    /// At least one core always remains; the memory budget is unaffected. This
+    /// may also be set in workspace `.mbx.toml`; the environment variable wins.
     #[usage(env = "MBX_SCHEDULER_RESERVE_CPUS", default = 0)]
     reserve_cpus: i64,
-    /// Memory budget the permits divide, such as `24GiB`, or `"none"`.
+    /// Independent memory budget, such as `24GiB`, or `"none"`.
     ///
-    /// Each permit stands for an equal share of it. `"none"` leaves plain CPU
-    /// permits and also turns off `scheduler.pressure` and `scheduler.suspend`.
+    /// Requests charge predicted memory bytes separately from CPU cores.
+    /// `"none"` schedules CPU only and turns off `scheduler.pressure` and
+    /// `scheduler.suspend`.
     /// This may also be set in workspace `.mbx.toml`; the environment
     /// variable wins.
     #[usage(
@@ -851,11 +852,11 @@ impl Config {
 pub struct SchedulerSettings {
     /// Whether compilations take permits at all.
     pub enabled: bool,
-    /// Machine-wide concurrent compile permits.
+    /// Machine-wide CPU core budget before reserving cores for other work.
     pub cpus: u64,
-    /// Permits withheld from the configured CPU count.
+    /// Cores withheld from the configured CPU count.
     pub reserve_cpus: u64,
-    /// Memory the permits divide; `None` leaves plain CPU permits.
+    /// Independent memory budget; `None` leaves CPU-only scheduling.
     pub memory_bytes: Option<u64>,
     /// Priority of this build's compilations against other builds.
     pub priority: SchedulerPriority,

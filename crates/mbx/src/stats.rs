@@ -314,7 +314,7 @@ mod tests {
         let text = report.text(false);
         assert!(
             text.contains(
-                "Scheduler: enabled (4 permits, 1000 B/permit, from the global settings)"
+                "Scheduler: enabled (4 cores, 3.9 KiB memory budget, from the global settings)"
             ),
             "{text}"
         );

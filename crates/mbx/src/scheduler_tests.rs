@@ -10,6 +10,7 @@ fn pool_at(dir: &Path, capacity: u64, bytes_per_permit: u64) -> Pool {
     // Tests must not depend on how much memory the machine running them has
     // free; anything that wants the gate closed injects its own probe.
     pool.domain_capacity = capacity;
+    pool.domain_memory_capacity = capacity.saturating_mul(bytes_per_permit);
     pool.available_memory = || None;
     pool.pressure = false;
     pool
@@ -134,15 +135,18 @@ fn weights_count_against_capacity() {
 }
 
 #[test]
-fn a_reservation_charges_the_larger_of_cpu_and_memory_requests() {
+fn a_reservation_charges_cpu_and_memory_separately() {
     let directory = tempfile::tempdir().unwrap();
     let pool = pool_at(directory.path(), 4, 1024);
 
     let reservation = pool.reserve(Some(1), Some(3 * 1024)).unwrap();
+    let cpu_only =
+        vector_attempt(&pool, 2, 0).expect("memory reservations leave CPU capacity free");
     assert!(
-        pool.try_admit(2, None).unwrap().is_none(),
-        "three memory permits leave only one"
+        vector_attempt(&pool, 1, 2 * 1024).is_none(),
+        "memory still has its own limit"
     );
+    drop(cpu_only);
     drop(reservation);
     assert!(pool.try_admit(4, None).unwrap().is_some());
 }
@@ -230,6 +234,8 @@ fn a_dead_holders_lease_is_reclaimed() {
             mode_key: None,
             version: LEASE_VERSION,
             weight: 1,
+            cpu: None,
+            memory_bytes: None,
             priority: "normal".into(),
             build_id: None,
             domain: None,
@@ -1694,7 +1700,7 @@ fn a_budget_change_preserves_the_memory_and_cpu_charges_of_live_leases() {
 }
 
 #[test]
-fn queued_domain_limits_use_the_waiters_original_permit_units() {
+fn queued_domain_limits_use_the_waiters_original_byte_budget() {
     let directory = tempfile::tempdir().unwrap();
     let mut old = pool_at(directory.path(), 4, 1024);
     old.pressure_domain = "a";
@@ -1735,55 +1741,72 @@ const GIB: u64 = 1 << 30;
 
 #[test]
 fn a_cpu_only_local_ceiling_ignores_memory() {
-    assert_eq!(local_ceiling(16, 0, 4, Some(GIB)), 4);
-    assert_eq!(local_ceiling(16, 0, 32, Some(GIB)), 16);
+    assert_eq!(
+        local_ceiling(16, 0, 4, Some(GIB)),
+        Resources {
+            cpu: 4,
+            memory_bytes: 0
+        }
+    );
+    assert_eq!(local_ceiling(16, 0, 32, Some(GIB)).cpu, 16);
 }
 
 #[test]
-fn the_local_ceiling_is_the_smallest_of_pool_cpus_and_memory() {
-    // 85% of 20GiB holds four 4GiB permits.
-    assert_eq!(local_ceiling(16, 4 * GIB, 8, Some(20 * GIB)), 4);
-    assert_eq!(local_ceiling(16, GIB, 2, Some(64 * GIB)), 2);
-    assert_eq!(local_ceiling(3, GIB, 8, Some(64 * GIB)), 3);
-    // Unknown memory leaves the pool and CPU limits in place.
-    assert_eq!(local_ceiling(16, GIB, 8, None), 8);
+fn the_local_ceiling_limits_cpu_and_memory_independently() {
+    let ceiling = local_ceiling(16, 64 * GIB, 8, Some(20 * GIB));
+    assert_eq!(ceiling.cpu, 8);
+    assert_eq!(ceiling.memory_bytes, 20 * GIB / 100 * 85);
+    assert_eq!(local_ceiling(16, GIB, 2, Some(64 * GIB)).cpu, 2);
+    assert_eq!(local_ceiling(3, GIB, 8, Some(64 * GIB)).cpu, 3);
+    assert_eq!(local_ceiling(16, GIB, 8, None).memory_bytes, GIB);
 }
 
 #[test]
 fn an_explicit_local_memory_budget_keeps_its_full_capacity() {
-    // 93.5% of local memory, as in the reported 120-CPU example.
     let budget = 98_590_438_452;
-    let local_memory = 105_444_319_232;
-    let bytes_per_permit = budget / 120;
     assert_eq!(
-        local_ceiling(120, bytes_per_permit, 120, Some(local_memory)),
-        120
+        local_ceiling(120, budget, 120, Some(105_444_319_232)).memory_bytes,
+        budget
     );
 }
 
 #[test]
 fn a_budget_equal_to_local_memory_keeps_its_full_capacity() {
-    let local_memory = 100 * GIB;
-    let bytes_per_permit = local_memory / 10;
     assert_eq!(
-        local_ceiling(10, bytes_per_permit, 10, Some(local_memory)),
-        10
+        local_ceiling(10, 100 * GIB, 10, Some(100 * GIB)).memory_bytes,
+        100 * GIB
     );
 }
 
 #[test]
 fn a_budget_above_local_memory_uses_the_85_percent_ceiling() {
-    let local_memory = 100 * GIB;
-    let bytes_per_permit = local_memory / 10 + 1;
     assert_eq!(
-        local_ceiling(10, bytes_per_permit, 10, Some(local_memory)),
-        8
+        local_ceiling(10, 100 * GIB + 1, 10, Some(100 * GIB)).memory_bytes,
+        100 * GIB / 100 * 85
     );
 }
 
 #[test]
 fn a_container_smaller_than_one_memory_permit_still_admits_one_compilation() {
-    assert_eq!(local_ceiling(16, 8 * GIB, 8, Some(4 * GIB)), 1);
+    let budget = local_ceiling(16, 128 * GIB, 8, Some(4 * GIB));
+    assert_eq!(budget.cpu, 8);
+    assert!(budget.fits(
+        Resources::default(),
+        Resources {
+            cpu: 1,
+            memory_bytes: 8 * GIB
+        }
+    ));
+    assert!(!budget.fits(
+        Resources {
+            cpu: 1,
+            memory_bytes: 8 * GIB
+        },
+        Resources {
+            cpu: 1,
+            memory_bytes: GIB
+        }
+    ));
 }
 
 fn compile_demand(name: &str, arguments: &[&str]) -> Demand {
@@ -2047,7 +2070,16 @@ fn scheduler_stats_read_old_records_without_locking_or_reclaiming_them() {
     std::fs::write(leases.join("stale"), old_lease).unwrap();
     std::fs::write(waiters.join("stale"), old_waiter).unwrap();
     let held = pool
-        .try_admit_named(2, None, &mut None, Some(&demand))
+        .try_admit_named(
+            Resources {
+                cpu: 2,
+                memory_bytes: 200,
+            },
+            2,
+            None,
+            &mut None,
+            Some(&demand),
+        )
         .unwrap()
         .unwrap();
     // Admission reclaimed the deliberately stale records; restore them before
@@ -2056,9 +2088,18 @@ fn scheduler_stats_read_old_records_without_locking_or_reclaiming_them() {
     std::fs::write(waiters.join("stale"), old_waiter).unwrap();
     let mut queued = None;
     assert!(
-        pool.try_admit_named(100, None, &mut queued, Some(&demand))
-            .unwrap()
-            .is_none()
+        pool.try_admit_named(
+            Resources {
+                cpu: 100,
+                memory_bytes: 10000
+            },
+            100,
+            None,
+            &mut queued,
+            Some(&demand)
+        )
+        .unwrap()
+        .is_none()
     );
     // Queue admission also reclaims stale records. Restore once more so the
     // stats reader sees both old and current records of each kind.
@@ -2067,7 +2108,7 @@ fn scheduler_stats_read_old_records_without_locking_or_reclaiming_them() {
     let snapshot = scheduler_snapshot(directory.path(), 100, 100, true);
     let text = snapshot.text();
     assert!(
-        text.contains("samples=3, charge=122 B / 2 permits (mode)"),
+        text.contains("samples=3, charge=1 cores + 122 B (mode)"),
         "{text}"
     );
     assert!(text.contains("lease unknown: mode=unknown, build=unknown, domain=unknown"));
@@ -2095,7 +2136,7 @@ fn scheduler_stats_read_old_records_without_locking_or_reclaiming_them() {
     assert!(
         fallback
             .text()
-            .contains("charge=1000 B / 10 permits (crate-wide fallback)")
+            .contains("charge=1 cores + 1000 B (crate-wide fallback)")
     );
 }
 
@@ -2406,6 +2447,11 @@ fn sim_request(
             mode_key: None,
             ticket,
             weight,
+            cpu: None,
+            memory_bytes: None,
+            cpu_cap: None,
+            mem_cap: None,
+            domain_memory_cap: None,
             priority: "normal".into(),
             domain: domain.0.into(),
             domain_capacity: domain.1,
@@ -2422,6 +2468,8 @@ fn sim_lease(record: &Waiting) -> Lease {
         name: None,
         mode_key: None,
         weight: record.weight,
+        cpu: record.cpu,
+        memory_bytes: record.memory_bytes,
         priority: record.priority.clone(),
         build_id: record.build.as_ref().map(|(id, _)| id.clone()),
         domain: Some(record.domain.clone()),
@@ -2698,7 +2746,7 @@ fn sim_random(state: &mut u64, low: u64, high: u64) -> u64 {
     low + (*state >> 16) % (high - low + 1)
 }
 
-fn check_random_admission_forks(multi_scope: bool) {
+fn check_random_admission_forks(multi_scope: bool, two_dimensions: bool) {
     let mut total_passes = 0;
     let mut mixed_budget_workloads = 0;
     for seed in 0..512_u64 {
@@ -2791,6 +2839,48 @@ fn check_random_admission_forks(multi_scope: bool) {
             });
             requests.push(request);
         }
+        if two_dimensions {
+            let global_memory = capacity * 8 * MEMORY_QUANTUM + 123;
+            let mut domain_memory_used = vec![0; domain_count];
+            let mut used_memory = 0;
+            for (_, record) in &mut initial {
+                let domain = record
+                    .domain
+                    .strip_prefix("domain-")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                let local_memory = domain_capacities[domain] * 8 * MEMORY_QUANTUM + 123;
+                let free =
+                    (global_memory - used_memory).min(local_memory - domain_memory_used[domain]);
+                let memory = sim_random(&mut state, 1, free.max(1)).min(free);
+                record.cpu = Some(record.weight);
+                record.memory_bytes = Some(memory);
+                record.mem_cap = Some(global_memory);
+                record.domain_memory_cap = Some(local_memory);
+                used_memory += memory;
+                domain_memory_used[domain] += memory;
+            }
+            for request in &mut requests {
+                let record = &mut request.record;
+                let domain = record
+                    .domain
+                    .strip_prefix("domain-")
+                    .unwrap()
+                    .parse::<usize>()
+                    .unwrap();
+                let local_memory = domain_capacities[domain] * 8 * MEMORY_QUANTUM + 123;
+                record.cpu = Some(record.weight);
+                record.memory_bytes =
+                    Some(sim_random(&mut state, 1, local_memory.min(global_memory)));
+                record.mem_cap = Some(if multi_scope {
+                    sim_random(&mut state, 1, global_memory)
+                } else {
+                    global_memory
+                });
+                record.domain_memory_cap = Some(local_memory);
+            }
+        }
         let budgets: std::collections::BTreeSet<_> = requests
             .iter()
             .map(|request| request.record.global_capacity)
@@ -2816,12 +2906,12 @@ fn check_random_admission_forks(multi_scope: bool) {
 
 #[test]
 fn single_scope_passes_preserve_all_waiters_in_counterfactuals() {
-    check_random_admission_forks(false);
+    check_random_admission_forks(false, false);
 }
 
 #[test]
 fn shared_scope_passes_preserve_older_waiters_with_fifo_continuations() {
-    check_random_admission_forks(true);
+    check_random_admission_forks(true, false);
 }
 
 #[test]
@@ -2925,4 +3015,528 @@ fn old_waiter_records_fall_back_to_the_request_global_capacity() {
         admission_decision(12, &live, [&protected].into_iter(), &request),
         AdmissionDecision::Waiting
     );
+}
+
+#[test]
+fn two_budget_single_scope_passes_preserve_all_waiters() {
+    check_random_admission_forks(false, true);
+}
+
+#[test]
+fn two_budget_shared_scope_passes_preserve_older_waiters() {
+    check_random_admission_forks(true, true);
+}
+
+fn vector_attempt(pool: &Pool, cpu: u64, memory_bytes: u64) -> Option<Permit> {
+    let weight = if pool.bytes_per_permit == 0 {
+        cpu
+    } else {
+        cpu.max(memory_bytes.div_ceil(pool.bytes_per_permit))
+    }
+    .max(1);
+    pool.try_admit_named(
+        Resources { cpu, memory_bytes },
+        weight,
+        None,
+        &mut None,
+        None,
+    )
+    .unwrap()
+}
+
+#[test]
+fn memory_heavy_compiles_leave_cpu_capacity_for_light_requests() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool_at(dir.path(), 32, GIB);
+    pool.record_peak("large", 24 * GIB, false).unwrap();
+    let large = pool.admit(&Demand::new("large", false)).unwrap();
+    let small = pool.admit(&Demand::new("small", false)).unwrap();
+    let leases = scan_leases(&dir.path().join(LEASES_DIR)).unwrap();
+    assert_eq!(
+        scope_used(leases.iter()),
+        Resources {
+            cpu: 2,
+            memory_bytes: 25 * GIB
+        }
+    );
+    assert!(
+        vector_attempt(&pool, 1, 8 * GIB).is_none(),
+        "free CPUs cannot replace full memory"
+    );
+    drop((large, small));
+}
+
+#[test]
+fn oversize_alone_applies_independently_to_each_dimension() {
+    let cap = Resources {
+        cpu: 4,
+        memory_bytes: 100,
+    };
+    assert!(cap.fits(
+        Resources::default(),
+        Resources {
+            cpu: 8,
+            memory_bytes: 200
+        }
+    ));
+    assert!(!cap.fits(
+        Resources {
+            cpu: 1,
+            memory_bytes: 0
+        },
+        Resources {
+            cpu: 8,
+            memory_bytes: 200
+        }
+    ));
+    assert!(!cap.fits(
+        Resources {
+            cpu: 0,
+            memory_bytes: 1
+        },
+        Resources {
+            cpu: 8,
+            memory_bytes: 200
+        }
+    ));
+    assert!(cap.fits(
+        Resources {
+            cpu: 0,
+            memory_bytes: 50
+        },
+        Resources {
+            cpu: 8,
+            memory_bytes: 50
+        }
+    ));
+    assert!(cap.fits(
+        Resources {
+            cpu: 2,
+            memory_bytes: 0
+        },
+        Resources {
+            cpu: 2,
+            memory_bytes: 200
+        }
+    ));
+}
+
+#[test]
+fn domain_budgets_are_independent_and_build_slots_only_limit_cpu() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pool = pool_at(dir.path(), 16, GIB);
+    pool.domain_capacity = 4;
+    pool.domain_memory_capacity = 8 * GIB;
+    pool.build = Some(("build".into(), 2));
+    let first = vector_attempt(&pool, 1, 7 * GIB).unwrap();
+    let second = vector_attempt(&pool, 1, GIB).expect("build slots do not count memory permits");
+    assert!(vector_attempt(&pool, 1, 0).is_none());
+    drop(second);
+    assert!(vector_attempt(&pool, 1, 2 * GIB).is_none());
+    let second = vector_attempt(&pool, 1, GIB).unwrap();
+    pool.build = Some(("other".into(), 2));
+    let cpu_only = vector_attempt(&pool, 2, 0).unwrap();
+    assert!(vector_attempt(&pool, 1, 0).is_none());
+    drop((first, second, cpu_only));
+}
+
+#[test]
+fn reservation_vector_and_legacy_charge_are_both_preserved() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool_at(dir.path(), 8, GIB);
+    let lease = pool.reserve(Some(2), Some(5 * GIB + 1)).unwrap();
+    let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
+    assert_eq!(
+        record.resources(),
+        Resources {
+            cpu: 2,
+            memory_bytes: 5 * GIB + 1
+        }
+    );
+    assert_eq!(record.weight, 6);
+    assert_eq!(record.bytes_per_permit, GIB);
+    drop(lease);
+    let lease = pool.reserve(Some(2), None).unwrap();
+    let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
+    assert_eq!(
+        record.resources(),
+        Resources {
+            cpu: 2,
+            memory_bytes: 0
+        }
+    );
+    drop(lease);
+    let lease = pool.reserve(None, Some(GIB)).unwrap();
+    let record: Lease = serde_json::from_slice(&std::fs::read(&lease.path).unwrap()).unwrap();
+    assert_eq!(
+        record.resources(),
+        Resources {
+            cpu: 0,
+            memory_bytes: GIB
+        }
+    );
+}
+
+#[test]
+fn legacy_records_charge_full_weight_on_both_axes() {
+    let lease: Lease = serde_json::from_str(
+        r#"{"version":1,"weight":4,"priority":"normal","bytes_per_permit":1073741824}"#,
+    )
+    .unwrap();
+    let waiter: Waiting = serde_json::from_str(r#"{"ticket":1,"weight":4,"priority":"normal","domain":"host","domain_capacity":8,"bytes_per_permit":1073741824,"build":null}"#).unwrap();
+    let expected = Resources {
+        cpu: 4,
+        memory_bytes: 4 * GIB,
+    };
+    assert_eq!(lease.resources(), expected);
+    assert_eq!(waiter.resources(), expected);
+    let mut request = sim_request(2, 0, 1, 1, ("host", 8), None).record;
+    request.cpu = Some(1);
+    request.memory_bytes = Some(1);
+    request.cpu_cap = Some(8);
+    request.mem_cap = Some(4 * GIB);
+    request.domain_memory_cap = Some(8 * GIB);
+    assert_eq!(
+        admission_decision(
+            8,
+            std::slice::from_ref(&lease),
+            std::iter::empty(),
+            &request
+        ),
+        AdmissionDecision::Waiting
+    );
+    request.mem_cap = Some(8 * GIB);
+    request.cpu_cap = Some(4);
+    assert_eq!(
+        admission_decision(4, &[lease], std::iter::empty(), &request),
+        AdmissionDecision::Waiting
+    );
+}
+
+#[test]
+fn demand_vectors_keep_legacy_weights_and_unmeasured_memory_guesses() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool_at(dir.path(), 8, GIB);
+    for demand in [
+        Demand::new("cold", false),
+        Demand::new("cold-link", true),
+        Demand::test("cold-suite", None),
+        Demand::nextest("cold-bin", "case"),
+    ] {
+        let plan = pool.demand_vector(&demand);
+        assert!(plan.resources.memory_bytes >= plan.weight * GIB);
+        assert_eq!(
+            (plan.weight, plan.predicted, plan.source),
+            pool.prediction(&demand)
+        );
+    }
+    pool.record_peak("crate", GIB, false).unwrap();
+    let mut demand = Demand::new("crate", false);
+    demand.threads = Some(4);
+    let plan = pool.demand_vector(&demand);
+    assert_eq!(
+        plan.resources,
+        Resources {
+            cpu: 4,
+            memory_bytes: GIB
+        }
+    );
+    assert_eq!(plan.weight, 4);
+    pool.record_cpu(&Demand::test("suite", None).name, 3)
+        .unwrap();
+    let suite = Demand::test("suite", None);
+    pool.record_peak(&suite.name, 2 * GIB, false).unwrap();
+    assert_eq!(
+        pool.demand_vector(&suite).resources,
+        Resources {
+            cpu: 3,
+            memory_bytes: 2 * GIB
+        }
+    );
+    pool.record_test_history("bin", "case", Some(123), Some(2))
+        .unwrap();
+    assert_eq!(
+        pool.demand_vector(&Demand::nextest("bin", "case"))
+            .resources,
+        Resources {
+            cpu: 2,
+            memory_bytes: 123
+        }
+    );
+    let cpu_only = pool_at(dir.path(), 8, 0);
+    assert_eq!(
+        cpu_only.demand_vector(&demand).resources,
+        Resources {
+            cpu: 4,
+            memory_bytes: 0
+        }
+    );
+}
+
+#[test]
+fn low_priority_preserves_headroom_on_both_axes() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pool = pool_at(dir.path(), 8, GIB);
+    pool.priority = SchedulerPriority::Low;
+    std::fs::write(dir.path().join(PRIORITY_WAIT_STAMP), b"").unwrap();
+    assert_eq!(
+        pool.effective_budget(),
+        Resources {
+            cpu: 6,
+            memory_bytes: 6 * GIB
+        }
+    );
+    pool.capacity = 1;
+    assert_eq!(
+        pool.effective_budget(),
+        Resources {
+            cpu: 1,
+            memory_bytes: 6 * GIB
+        }
+    );
+    pool.priority = SchedulerPriority::Normal;
+    assert_eq!(
+        pool.effective_budget(),
+        Resources {
+            cpu: 1,
+            memory_bytes: 8 * GIB
+        }
+    );
+}
+
+#[test]
+fn quantized_memory_slack_never_exceeds_exact_byte_slack() {
+    let u = MEMORY_QUANTUM;
+    assert!(can_pass_quantized(
+        120 * u,
+        &[54 * u, 54 * u],
+        &[54 * u],
+        10 * u,
+        u
+    ));
+    assert!(!can_pass_quantized(u64::MAX, &[65535 * u], &[u], 1, u));
+    let mut state = 73;
+    let mut accepted = 0;
+    for _ in 0..2000 {
+        let cap = sim_random(&mut state, 2, 120) * u + sim_random(&mut state, 1, u - 1);
+        let live = [
+            sim_random(&mut state, 1, cap / 2),
+            sim_random(&mut state, 1, cap / 2),
+        ];
+        let older = [
+            sim_random(&mut state, 1, cap),
+            sim_random(&mut state, 1, cap),
+        ];
+        let charge = sim_random(&mut state, 1, cap / 8);
+        if can_pass_quantized(cap, &live, &older, charge, u) {
+            accepted += 1;
+            let mut prefix = 0;
+            let mut items = live.to_vec();
+            for head in older {
+                prefix += head;
+                let free = cap - live.iter().sum::<u64>();
+                let slack = (0..(1 << items.len()))
+                    .filter_map(|mask| {
+                        let removed: u64 = items
+                            .iter()
+                            .enumerate()
+                            .filter(|(i, _)| mask & (1 << i) != 0)
+                            .map(|(_, w)| *w)
+                            .sum();
+                        (free + removed).checked_sub(prefix)
+                    })
+                    .min()
+                    .unwrap();
+                assert!(charge <= slack);
+                items.push(head);
+            }
+        }
+    }
+    assert!(accepted > 0);
+}
+
+#[test]
+fn demand_vectors_keep_mode_link_window_and_nextest_predictions_in_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool_at(dir.path(), 32, 100);
+    let demand = compile_demand("crate", &["--emit=metadata"]);
+    pool.record_peak("crate", 1000, false).unwrap();
+    for _ in 0..3 {
+        pool.record_compile(&demand, 200, false, true).unwrap();
+    }
+    let plan = pool.demand_vector(&demand);
+    assert_eq!(plan.source, "mode");
+    assert_eq!(
+        plan.resources,
+        Resources {
+            cpu: 1,
+            memory_bytes: 300
+        }
+    );
+    assert_eq!(plan.weight, 3);
+    for _ in 0..MIN_LINK_SAMPLES {
+        pool.record_link_peak("known [link]", 301, true, None)
+            .unwrap();
+    }
+    let plan = pool.demand_vector(&Demand::new("unknown", true));
+    assert_eq!(plan.source, "link-window");
+    assert_eq!(
+        plan.resources,
+        Resources {
+            cpu: 1,
+            memory_bytes: 301
+        }
+    );
+    assert_eq!(plan.weight, 4);
+    pool.record_test_history("bin", "case", Some(123), Some(64))
+        .unwrap();
+    let plan = pool.demand_vector(&Demand::nextest("bin", "case"));
+    assert_eq!(
+        plan.resources,
+        Resources {
+            cpu: 64,
+            memory_bytes: 123
+        }
+    );
+    assert_eq!(plan.weight, 32, "legacy charge retains its capacity clamp");
+}
+
+#[test]
+fn exact_memory_budget_and_legacy_transport_defaults_are_conservative() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut config = Config::for_test(dir.path());
+    config.scheduler.enabled = true;
+    config.scheduler.cpus = 8;
+    config.scheduler.reserve_cpus = 2;
+    config.scheduler.memory_bytes = Some(12001);
+    let pool = Pool::from_config(&config).unwrap();
+    assert_eq!(pool.capacity, 6);
+    assert_eq!(pool.bytes_per_permit, 2000);
+    assert_eq!(pool.memory_capacity, 12001);
+    assert_eq!(scheduler_report(&config).memory_capacity, 12001);
+    let env = session_environment_with_jobs(&config, None);
+    assert!(env.contains(&(SCHED_MEMORY_BYTES_ENV.into(), "12001".into())));
+    assert!(env.contains(&(SCHED_SLOT_BYTES_ENV.into(), "2000".into())));
+    assert!(env.contains(&(SCHED_SLOTS_ENV.into(), "6".into())));
+    assert_eq!(
+        Pool::new(dir.path().into(), 6, 2000, SchedulerPriority::Normal).memory_capacity,
+        12000
+    );
+}
+
+#[test]
+fn old_and_new_readers_share_records_without_losing_legacy_charges() {
+    #[derive(Deserialize)]
+    struct OldLease {
+        weight: u64,
+        bytes_per_permit: u64,
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool_at(dir.path(), 8, GIB);
+    pool.record_peak("measured", GIB + 1, false).unwrap();
+    let mut demand = Demand::new("measured", false);
+    demand.threads = Some(4);
+    let permit = pool.admit(&demand).unwrap();
+    let bytes = std::fs::read(&permit.path).unwrap();
+    let old: OldLease = serde_json::from_slice(&bytes).unwrap();
+    let new: Lease = serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(old.weight, 4);
+    assert_eq!(old.bytes_per_permit, GIB);
+    assert!(old.weight >= new.resources().cpu);
+    assert!(old.weight * old.bytes_per_permit >= new.resources().memory_bytes);
+    // Strip the vector to stand in for an old process's live lease.
+    let mut value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    value.as_object_mut().unwrap().remove("cpu");
+    value.as_object_mut().unwrap().remove("memory_bytes");
+    let legacy: Lease = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        legacy.resources(),
+        Resources {
+            cpu: 4,
+            memory_bytes: 4 * GIB
+        }
+    );
+    let mut queued = None;
+    pool.try_admit_named(
+        Resources {
+            cpu: 8,
+            memory_bytes: GIB,
+        },
+        8,
+        None,
+        &mut queued,
+        Some(&demand),
+    )
+    .unwrap();
+    let waiting = scan_waiters(&dir.path().join(WAITERS_DIR)).unwrap();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].cpu_cap, Some(8));
+    assert_eq!(waiting[0].mem_cap, Some(8 * GIB));
+    let snapshot = scheduler_snapshot(dir.path(), 8, GIB, true);
+    assert!(snapshot.text().contains("charge=4 cores + 1.0 GiB"));
+    let activity = snapshot
+        .activity
+        .iter()
+        .find(|item| item.kind == "lease")
+        .unwrap();
+    assert_eq!(activity.charged_cpu, 4);
+    assert_eq!(activity.charged_memory_bytes, GIB + 1);
+}
+
+#[test]
+fn passing_protects_the_waiting_processes_smaller_memory_budget() {
+    let u = MEMORY_QUANTUM;
+    let mut older = sim_request(1, 0, 1, 1, ("host", 100), None).record;
+    older.cpu = Some(1);
+    older.memory_bytes = Some(6 * u);
+    older.cpu_cap = Some(100);
+    older.mem_cap = Some(10 * u);
+    older.domain_memory_cap = Some(100 * u);
+    let mut request = older.clone();
+    request.ticket = 2;
+    request.memory_bytes = Some(2 * u);
+    request.mem_cap = Some(12 * u);
+    let mut active = older.clone();
+    active.memory_bytes = Some(4 * u);
+    let live = vec![sim_lease(&active); 2];
+    assert_eq!(
+        admission_decision(100, &live, [&older].into_iter(), &request),
+        AdmissionDecision::Waiting
+    );
+    assert_eq!(
+        admission_decision(100, &live[1..], std::iter::empty(), &older),
+        AdmissionDecision::Ordered
+    );
+}
+
+#[test]
+fn resource_admission_refuses_arithmetic_overflow() {
+    assert!(!fits(u64::MAX, 1, u64::MAX));
+    assert!(!fits(u64::MAX - 1, 2, u64::MAX));
+    assert!(fits(0, u64::MAX, 1));
+}
+
+#[test]
+fn new_processes_with_different_capacities_read_exact_oversize_memory() {
+    let dir = tempfile::tempdir().unwrap();
+    let small = pool_at(dir.path(), 8, GIB);
+    let large = pool_at(dir.path(), 128, GIB);
+    small.record_peak("oversize", 100 * GIB, false).unwrap();
+    let demand = Demand::new("oversize", false);
+    let held = small.admit(&demand).expect("oversize request runs alone");
+    let records = scan_leases(&dir.path().join(LEASES_DIR)).unwrap();
+    assert_eq!(records[0].weight, 8, "retain the old writer-capacity clamp");
+    assert_eq!(
+        records[0].resources(),
+        Resources {
+            cpu: 1,
+            memory_bytes: 100 * GIB
+        }
+    );
+    assert!(
+        vector_attempt(&large, 1, 29 * GIB).is_none(),
+        "the larger pool reads 100 GiB, not eight legacy permits"
+    );
+    let admitted = vector_attempt(&large, 1, 28 * GIB).expect("exactly the remaining memory fits");
+    drop((held, admitted));
 }

@@ -487,9 +487,9 @@ mbx must be able to write to it. mbx uses it only on Linux, and only while `sche
 - **Default:** logical CPUs
 - **Set with:** `MBX_SCHEDULER_CPUS`
 
-Number of compile permits in the machine-wide pool.
+CPU core budget in the machine-wide pool before `scheduler.reserve_cpus`.
 
-A typical compilation takes one permit; links and memory-heavy crates can take more. This may also be set in workspace `.mbx.toml`; the environment variable wins.
+Compilers charge their thread counts; test binaries can use learned core counts. Memory has its own independent budget. This may also be set in workspace `.mbx.toml`; the environment variable wins.
 
 ### `scheduler.enabled`
 
@@ -508,9 +508,9 @@ Cache hits never take a permit. A compilation that runs the compiler takes one f
 - **Default:** 85% of physical memory, or of the Linux cgroup memory limit if lower
 - **Set with:** `MBX_SCHEDULER_MEMORY`
 
-Memory budget the permits divide, such as `24GiB`, or `"none"`.
+Independent memory budget, such as `24GiB`, or `"none"`.
 
-Each permit stands for an equal share of it. `"none"` leaves plain CPU permits and also turns off `scheduler.pressure` and `scheduler.suspend`. This may also be set in workspace `.mbx.toml`; the environment variable wins.
+Requests charge predicted memory bytes separately from CPU cores. `"none"` schedules CPU only and turns off `scheduler.pressure` and `scheduler.suspend`. This may also be set in workspace `.mbx.toml`; the environment variable wins.
 
 ### `scheduler.pressure`
 
@@ -543,9 +543,9 @@ While a normal-priority build is waiting, a `low` build leaves about a quarter o
 - **Default:** `0`
 - **Set with:** `MBX_SCHEDULER_RESERVE_CPUS`
 
-Permits withheld from `scheduler.cpus` to leave CPUs for other work.
+CPU cores withheld from `scheduler.cpus` to leave CPUs for other work.
 
-At least one permit always remains. This may also be set in workspace `.mbx.toml`; the environment variable wins.
+At least one core always remains; the memory budget is unaffected. This may also be set in workspace `.mbx.toml`; the environment variable wins.
 
 ### `scheduler.suspend`
 

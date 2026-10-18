@@ -17,16 +17,11 @@
 //! by the next admission scan. Admission itself serializes on one registrar
 //! lock, held only long enough to scan and grant.
 //!
-//! Weights make links and historically memory-heavy crates cost more than one
-//! permit: the sum of admitted weights never exceeds the capacity, so the
-//! *predicted* memory of everything running stays inside the configured
-//! budget. Prediction comes from a small ledger of peak RSS per crate name,
-//! measured after every real compile on Unix; the static link weight is only
-//! the guess that stands in until one has been measured. Two things remain
-//! out of reach and are accepted: a single compilation larger than the
-//! machine will still be too large when it runs alone, and a simultaneous
-//! pile-up of never-measured crates can overshoot before the ledger has
-//! learned them.
+//! CPU cores and predicted memory bytes are independent budgets. A request
+//! must fit both, with an empty-scope exception on each dimension so oversize
+//! work can make progress. Peak-RSS history supplies the memory prediction;
+//! unmeasured work keeps the original permit-based memory guess. The legacy
+//! weight and permit size remain in records for older wrappers.
 //!
 //! Concurrent sessions may be configured with different capacities; each
 //! enforces its own bound against the same leases, so the loosest
@@ -101,9 +96,13 @@ pub(crate) const SCHED_DIR_ENV: &str = "MBX_SCHED_DIR";
 /// A nested `mbx` command otherwise constructs a new session and re-resolves
 /// configuration, which would replace an inherited empty `MBX_SCHED_DIR`.
 pub(crate) const SCHED_DISABLE_ENV: &str = "MBX_SCHED_DISABLE";
-/// Machine-wide concurrent compile permits.
+/// Machine-wide CPU budget after reserving cores for other work.
 pub(crate) const SCHED_SLOTS_ENV: &str = "MBX_SCHED_SLOTS";
-/// Memory one permit stands for; zero disables memory weighting.
+/// Configured CPU count before reserve_cpus, for the local CPU ceiling.
+const SCHED_CPUS_ENV: &str = "MBX_SCHED_CPUS";
+/// Exact memory budget, independent of legacy permit rounding.
+const SCHED_MEMORY_BYTES_ENV: &str = "MBX_SCHED_MEMORY_BYTES";
+/// Legacy memory share; zero disables memory predictions.
 pub(crate) const SCHED_SLOT_BYTES_ENV: &str = "MBX_SCHED_SLOT_BYTES";
 /// Permit priority of this build's compilations.
 pub(crate) const SCHED_PRIORITY_ENV: &str = "MBX_SCHED_PRIORITY";
@@ -112,7 +111,7 @@ const SCHED_PRESSURE_ENV: &str = "MBX_SCHED_PRESSURE";
 /// The session's resolved events gate, including workspace overrides.
 const SCHED_EVENTS_ENV: &str = "MBX_SCHED_EVENTS";
 const SCHED_BUILD_ID_ENV: &str = "MBX_SCHED_BUILD_ID";
-/// Most weighted permits one Cargo build may hold at once.
+/// Most CPU cores one Cargo build may hold at once.
 const SCHED_BUILD_SLOTS_ENV: &str = "MBX_SCHED_BUILD_SLOTS";
 
 /// Schema version of one lease record.
@@ -411,6 +410,10 @@ struct Lease {
     #[serde(default)]
     mode_key: Option<String>,
     weight: u64,
+    #[serde(default)]
+    cpu: Option<u64>,
+    #[serde(default)]
+    memory_bytes: Option<u64>,
     priority: String,
     #[serde(default)]
     build_id: Option<String>,
@@ -428,11 +431,21 @@ struct Waiting {
     mode_key: Option<String>,
     ticket: u64,
     weight: u64,
+    #[serde(default)]
+    cpu: Option<u64>,
+    #[serde(default)]
+    memory_bytes: Option<u64>,
     priority: String,
     domain: String,
     domain_capacity: u64,
     #[serde(default)]
     global_capacity: Option<u64>,
+    #[serde(default)]
+    cpu_cap: Option<u64>,
+    #[serde(default)]
+    mem_cap: Option<u64>,
+    #[serde(default)]
+    domain_memory_cap: Option<u64>,
     bytes_per_permit: u64,
     build: Option<(String, u64)>,
 }
@@ -443,62 +456,136 @@ struct QueueEntry {
 }
 
 fn fits(used: u64, weight: u64, capacity: u64) -> bool {
-    used == 0 || used.saturating_add(weight) <= capacity
+    used == 0
+        || used
+            .checked_add(weight)
+            .is_some_and(|total| total <= capacity)
 }
 
-// Sessions keep their original permit units across a configuration change.
-// Never charge a larger memory permit as one of a smaller pool's permits.
-// Keep the original weight as a CPU floor: reservations and tests may have
-// requested that many cores, even when their memory fits fewer new permits.
-fn lease_weight(lease: &Lease, bytes_per_permit: u64) -> u64 {
-    weight_in_units(lease.weight, lease.bytes_per_permit, bytes_per_permit)
+/// Physical resources. A zero memory ceiling means unlimited memory.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Resources {
+    cpu: u64,
+    memory_bytes: u64,
 }
 
-fn weight_in_units(weight: u64, original_unit: u64, unit: u64) -> u64 {
-    if unit == 0 {
-        weight
-    } else {
-        weight.max(weight.saturating_mul(original_unit).div_ceil(unit))
+impl Resources {
+    fn fits(self, used: Self, request: Self) -> bool {
+        // Each dimension grants its own empty-scope exception. An oversize
+        // CPU request still needs memory room, and vice versa.
+        fits(used.cpu, request.cpu, self.cpu)
+            && (self.memory_bytes == 0
+                || fits(used.memory_bytes, request.memory_bytes, self.memory_bytes))
     }
 }
 
-/// Protect every prefix of the older queue against every possible completion
-/// order. Earlier waiters eventually become leases too, so their weights join
-/// the subset sums after checking each prefix.
+/// The only legacy conversion: old records reserve their full weight on both
+/// axes. Keep zero as a real value for new memory-only/CPU-only reservations.
+fn record_resources(cpu: Option<u64>, memory: Option<u64>, weight: u64, unit: u64) -> Resources {
+    Resources {
+        cpu: cpu.unwrap_or(weight),
+        memory_bytes: memory.unwrap_or_else(|| weight.saturating_mul(unit)),
+    }
+}
+
+impl Lease {
+    fn resources(&self) -> Resources {
+        record_resources(
+            self.cpu,
+            self.memory_bytes,
+            self.weight,
+            self.bytes_per_permit,
+        )
+    }
+}
+
+impl Waiting {
+    fn resources(&self) -> Resources {
+        record_resources(
+            self.cpu,
+            self.memory_bytes,
+            self.weight,
+            self.bytes_per_permit,
+        )
+    }
+    fn global_budget(&self, fallback: Resources) -> Resources {
+        Resources {
+            cpu: self
+                .cpu_cap
+                .or(self.global_capacity)
+                .unwrap_or(fallback.cpu),
+            memory_bytes: self.mem_cap.unwrap_or_else(|| {
+                self.global_capacity.map_or(fallback.memory_bytes, |cap| {
+                    cap.saturating_mul(self.bytes_per_permit)
+                })
+            }),
+        }
+    }
+    fn domain_budget(&self) -> Resources {
+        Resources {
+            cpu: self.domain_capacity,
+            memory_bytes: self
+                .domain_memory_cap
+                .unwrap_or_else(|| self.domain_capacity.saturating_mul(self.bytes_per_permit)),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct Plan {
+    resources: Resources,
+    weight: u64,
+    predicted: Option<u64>,
+    source: &'static str,
+}
+
+const MEMORY_QUANTUM: u64 = 16 * 1024 * 1024;
+
 fn can_pass_waiters(capacity: u64, live: &[u64], older: &[u64], weight: u64) -> bool {
+    can_pass_quantized(capacity, live, older, weight, 1)
+}
+
+/// Protect every older prefix against every possible completion subset.
+fn can_pass_quantized(capacity: u64, live: &[u64], older: &[u64], charge: u64, unit: u64) -> bool {
     if older.is_empty() {
         return true;
     }
-    // Bound the complete bitset, including future leases from older waiters.
     const MAX_BITS: u64 = 1 << 16;
     let Some(total) = live.iter().chain(older).try_fold(0_u64, |sum, w| {
-        sum.checked_add(*w).filter(|sum| *sum < MAX_BITS)
+        sum.checked_add(w.div_ceil(unit))
+            .filter(|sum| *sum < MAX_BITS)
     }) else {
         return false;
     };
-    let used: u64 = live.iter().sum();
+    let Some(used) = live.iter().try_fold(0_u64, |sum, w| sum.checked_add(*w)) else {
+        return false;
+    };
     let Some(free) = capacity.checked_sub(used) else {
         return false;
     };
-    if weight > free {
+    if charge > free {
         return false;
     }
     let mut sums = vec![0_u64; (total as usize + 1).div_ceil(64)];
     sums[0] = 1;
     for w in live {
-        add_subset_weight(&mut sums, *w as usize);
+        add_subset_weight(&mut sums, w.div_ceil(unit) as usize);
     }
-    let mut prefix = 0;
-    for h in older {
-        prefix += h;
+    let mut prefix = 0_u64;
+    for (index, h) in older.iter().enumerate() {
+        let Some(next) = prefix.checked_add(*h) else {
+            return false;
+        };
+        prefix = next;
         let slack = if prefix <= free {
             free - prefix
         } else {
-            let threshold = (prefix - free) as usize;
-            let first_word = threshold / 64;
+            let threshold = prefix - free;
+            let quantized_threshold = threshold.div_ceil(unit) as usize;
+            let first_word = quantized_threshold / 64;
             let Some(sum) = (first_word..sums.len()).find_map(|index| {
                 let bits = if index == first_word {
-                    sums[index] & (u64::MAX << (threshold % 64))
+                    sums[index] & (u64::MAX << (quantized_threshold % 64))
                 } else {
                     sums[index]
                 };
@@ -506,12 +593,34 @@ fn can_pass_waiters(capacity: u64, live: &[u64], older: &[u64], weight: u64) -> 
             }) else {
                 return false;
             };
-            (sum - threshold) as u64
+            // Every eligible exact subset S >= threshold has rounded-up sum
+            // Q(S) >= ceil(threshold/unit). Thus the minimum DP sum is no
+            // larger than Q(S). Each item adds at most unit-1 rounding bytes;
+            // subtracting n*(unit-1) makes this a LOWER bound on every eligible
+            // exact sum, hence on slack. Extra ineligible subsets only reduce
+            // the bound. Saturation must refuse, not manufacture slack.
+            let Some(error) = (live.len() + index)
+                .try_into()
+                .ok()
+                .and_then(|count: u64| count.checked_mul(unit - 1))
+            else {
+                return false;
+            };
+            let Some(lower) = (sum as u64)
+                .checked_mul(unit)
+                .and_then(|sum| sum.checked_sub(error))
+            else {
+                return false;
+            };
+            let Some(slack) = lower.checked_sub(threshold) else {
+                return false;
+            };
+            slack
         };
-        if weight > slack {
+        if charge > slack {
             return false;
         }
-        add_subset_weight(&mut sums, *h as usize);
+        add_subset_weight(&mut sums, h.div_ceil(unit) as usize);
     }
     true
 }
@@ -528,28 +637,32 @@ fn add_subset_weight(sums: &mut [u64], weight: usize) {
     }
 }
 
-fn domain_used(live: &[Lease], domain: &str, bytes_per_permit: u64) -> u64 {
-    live.iter()
-        // Old wrappers do not identify their domain. Charge them locally too
-        // until they finish, rather than over-admitting during an upgrade.
-        .filter(|lease| lease.domain.as_deref().is_none_or(|id| id == domain))
-        .map(|lease| lease_weight(lease, bytes_per_permit))
-        .sum()
+fn scope_used<'a>(leases: impl Iterator<Item = &'a Lease>) -> Resources {
+    leases.fold(Resources::default(), |used, lease| {
+        let charge = lease.resources();
+        Resources {
+            cpu: used.cpu.saturating_add(charge.cpu),
+            memory_bytes: used.memory_bytes.saturating_add(charge.memory_bytes),
+        }
+    })
 }
 
-fn build_fits(
-    live: &[Lease],
-    build: &Option<(String, u64)>,
-    weight: u64,
-    bytes_per_permit: u64,
-) -> bool {
+fn domain_used(live: &[Lease], domain: &str) -> Resources {
+    scope_used(
+        live.iter()
+            .filter(|lease| lease.domain.as_deref().is_none_or(|id| id == domain)),
+    )
+}
+
+fn build_fits(live: &[Lease], build: &Option<(String, u64)>, cpu: u64) -> bool {
     build.as_ref().is_none_or(|(id, capacity)| {
         fits(
-            live.iter()
-                .filter(|lease| lease.build_id.as_ref() == Some(id))
-                .map(|lease| lease_weight(lease, bytes_per_permit))
-                .sum(),
-            weight,
+            scope_used(
+                live.iter()
+                    .filter(|lease| lease.build_id.as_ref() == Some(id)),
+            )
+            .cpu,
+            cpu,
             *capacity,
         )
     })
@@ -562,29 +675,24 @@ enum AdmissionDecision {
     Waiting,
 }
 
-/// Pure admission policy, shared by the pool and the event simulations. Keep
-/// today's scope exceptions as a fast path; only a refusal needs the slack
-/// calculation across every scope the passer shares with an older waiter.
+/// Both physical axes must fit before queue order or safe passing is checked.
 fn admission_decision<'a>(
     capacity: u64,
     live: &[Lease],
     waiting: impl Iterator<Item = &'a Waiting>,
     request: &Waiting,
 ) -> AdmissionDecision {
-    let used = live
-        .iter()
-        .map(|lease| lease_weight(lease, request.bytes_per_permit))
-        .sum();
-    if !build_fits(
-        live,
-        &request.build,
-        request.weight,
-        request.bytes_per_permit,
-    ) || !fits(
-        domain_used(live, &request.domain, request.bytes_per_permit),
-        request.weight,
-        request.domain_capacity,
-    ) || !fits(used, request.weight, capacity)
+    let fallback = Resources {
+        cpu: capacity,
+        memory_bytes: capacity.saturating_mul(request.bytes_per_permit),
+    };
+    let budget = request.global_budget(fallback);
+    let charge = request.resources();
+    if !build_fits(live, &request.build, charge.cpu)
+        || !request
+            .domain_budget()
+            .fits(domain_used(live, &request.domain), charge)
+        || !budget.fits(scope_used(live.iter()), charge)
     {
         return AdmissionDecision::Waiting;
     }
@@ -596,15 +704,14 @@ fn admission_decision<'a>(
         .collect();
     older.sort_unstable_by_key(|older| older.ticket);
     let ordered_blocked = older.iter().any(|older| {
-        if !build_fits(live, &older.build, older.weight, older.bytes_per_permit) {
+        if !build_fits(live, &older.build, older.resources().cpu) {
             return older.build.as_ref().map(|(id, _)| id)
                 == request.build.as_ref().map(|(id, _)| id);
         }
-        if !fits(
-            domain_used(live, &older.domain, older.bytes_per_permit),
-            older.weight,
-            older.domain_capacity,
-        ) {
+        if !older
+            .domain_budget()
+            .fits(domain_used(live, &older.domain), older.resources())
+        {
             return older.domain == request.domain;
         }
         true
@@ -612,8 +719,8 @@ fn admission_decision<'a>(
     if !ordered_blocked {
         return AdmissionDecision::Ordered;
     }
-    let scope_allows = |capacity, unit, build: Option<&str>, domain: Option<&str>| {
-        let weights: Vec<_> = live
+    let scope_allows = |budget: Resources, build: Option<&str>, domain: Option<&str>| {
+        let live: Vec<_> = live
             .iter()
             .filter(|lease| {
                 build.is_none_or(|id| lease.build_id.as_deref() == Some(id))
@@ -624,58 +731,65 @@ fn admission_decision<'a>(
                             .is_none_or(|lease_id| lease_id == id)
                     })
             })
-            .map(|lease| lease_weight(lease, unit))
+            .map(Lease::resources)
             .collect();
-        // Include all older waiters in this physical scope, even if a
-        // different ceiling currently blocks them. Their weights can later
-        // become live leases and must participate in the prefix calculation.
         let heads: Vec<_> = older
             .iter()
             .filter(|waiter| {
                 build.is_none_or(|id| waiter.build.as_ref().map(|(id, _)| id.as_str()) == Some(id))
                     && domain.is_none_or(|id| waiter.domain == id)
             })
-            .map(|waiter| weight_in_units(waiter.weight, waiter.bytes_per_permit, unit))
+            .map(|waiter| waiter.resources())
             .collect();
-        can_pass_waiters(
-            capacity,
-            &weights,
-            &heads,
-            weight_in_units(request.weight, request.bytes_per_permit, unit),
-        )
+        let cpus: Vec<_> = live.iter().map(|r| r.cpu).collect();
+        let head_cpus: Vec<_> = heads.iter().map(|r| r.cpu).collect();
+        let memory: Vec<_> = live.iter().map(|r| r.memory_bytes).collect();
+        let head_memory: Vec<_> = heads.iter().map(|r| r.memory_bytes).collect();
+        // Subsets sufficient on both axes are a subset of those sufficient
+        // on either one. Independent minima are therefore no larger than
+        // the joint minimum; requiring both independent slack bounds is safe.
+        can_pass_waiters(budget.cpu, &cpus, &head_cpus, charge.cpu)
+            && (budget.memory_bytes == 0
+                || can_pass_quantized(
+                    budget.memory_bytes,
+                    &memory,
+                    &head_memory,
+                    charge.memory_bytes,
+                    MEMORY_QUANTUM,
+                ))
     };
-    // Every scope may retain older permit units/limits, so protect each
-    // distinct recorded pair, starting with the request's global budget.
-    if !scope_allows(capacity, request.bytes_per_permit, None, None) {
+    if !scope_allows(budget, None, None) {
         return AdmissionDecision::Waiting;
     }
-    let mut checked_global =
-        std::collections::BTreeSet::from([(capacity, request.bytes_per_permit)]);
+    // Queue entries commonly share budgets. Evaluate each physical scope's
+    // distinct ceilings once, as in the scalar policy.
+    let mut checked_global = std::collections::BTreeSet::from([(budget.cpu, budget.memory_bytes)]);
     let mut checked = std::collections::BTreeSet::new();
     for waiter in &older {
-        // Older mbx records lack the global ceiling; retain the request's
-        // capacity as the fallback until those waiters leave the queue.
-        let waiter_capacity = waiter.global_capacity.unwrap_or(capacity);
-        if checked_global.insert((waiter_capacity, waiter.bytes_per_permit))
-            && !scope_allows(waiter_capacity, waiter.bytes_per_permit, None, None)
+        let global = waiter.global_budget(budget);
+        if checked_global.insert((global.cpu, global.memory_bytes))
+            && !scope_allows(global, None, None)
         {
             return AdmissionDecision::Waiting;
         }
+        let domain = waiter.domain_budget();
         if waiter.domain == request.domain
-            && checked.insert((false, waiter.domain_capacity, waiter.bytes_per_permit))
-            && !scope_allows(
-                waiter.domain_capacity,
-                waiter.bytes_per_permit,
-                None,
-                Some(&waiter.domain),
-            )
+            && checked.insert((false, domain.cpu, domain.memory_bytes))
+            && !scope_allows(domain, None, Some(&waiter.domain))
         {
             return AdmissionDecision::Waiting;
         }
         if let (Some((id, ceiling)), Some((request_id, _))) = (&waiter.build, &request.build)
             && id == request_id
-            && checked.insert((true, *ceiling, waiter.bytes_per_permit))
-            && !scope_allows(*ceiling, waiter.bytes_per_permit, Some(id), None)
+            && checked.insert((true, *ceiling, 0))
+            && !scope_allows(
+                Resources {
+                    cpu: *ceiling,
+                    memory_bytes: 0,
+                },
+                Some(id),
+                None,
+            )
         {
             return AdmissionDecision::Waiting;
         }
@@ -977,10 +1091,12 @@ pub(crate) struct Pool {
     pub(crate) dir: PathBuf,
     capacity: u64,
     domain_capacity: u64,
+    memory_capacity: u64,
+    domain_memory_capacity: u64,
     /// A per-Cargo-build ceiling, separate from the machine-wide capacity.
     build: Option<(String, u64)>,
-    /// Memory one permit stands for. Zero turns memory weighting and the
-    /// available-memory gate off, leaving plain CPU permits.
+    /// Original memory share, retained for fallback guesses and old readers.
+    /// Zero disables memory predictions and the available-memory gate.
     bytes_per_permit: u64,
     events: bool,
     priority: SchedulerPriority,
@@ -1022,6 +1138,8 @@ pub(crate) fn reservation_pool(config: &Config, priority: SchedulerPriority) -> 
             bytes_per_permit(scheduler.memory_bytes, permits),
             priority,
         );
+        pool.domain_capacity = scheduler.cpus.min(default_capacity()).max(1);
+        pool.set_memory_capacity(scheduler.memory_bytes.unwrap_or(0));
         pool.events = config.events;
         pool.pressure = scheduler.pressure;
         pool
@@ -1042,7 +1160,15 @@ fn resolve_pool() -> Option<Pool> {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or_default(),
             );
+            pool.domain_capacity = env_number(SCHED_CPUS_ENV)
+                .unwrap_or(capacity)
+                .min(default_capacity())
+                .max(1);
             pool.events = env_number(SCHED_EVENTS_ENV) != Some(0);
+            pool.set_memory_capacity(
+                env_number(SCHED_MEMORY_BYTES_ENV)
+                    .unwrap_or_else(|| capacity.saturating_mul(pool.bytes_per_permit)),
+            );
             pool.pressure = env_number(SCHED_PRESSURE_ENV) == Some(1);
             pool.build = std::env::var(SCHED_BUILD_ID_ENV)
                 .ok()
@@ -1100,6 +1226,11 @@ pub(crate) fn session_environment_with_jobs(
         ),
         (SCHED_EVENTS_ENV.into(), u8::from(config.events).to_string()),
         (SCHED_SLOTS_ENV.into(), permits.to_string()),
+        (SCHED_CPUS_ENV.into(), scheduler.cpus.to_string()),
+        (
+            SCHED_MEMORY_BYTES_ENV.into(),
+            scheduler.memory_bytes.unwrap_or(0).to_string(),
+        ),
         (
             SCHED_PRESSURE_ENV.into(),
             u8::from(scheduler.pressure).to_string(),
@@ -1198,36 +1329,46 @@ pub(crate) fn average_cores(cpu: Duration, wall: Duration) -> u64 {
 // CPU/cgroup budget as a second ceiling across every build in its domain.
 // A memory budget that fits in local memory is a local budget: it applies as
 // configured, so only a larger one is held to 85% of the local memory.
-fn domain_capacity(capacity: u64, bytes_per_permit: u64) -> u64 {
-    local_ceiling(
-        capacity,
-        bytes_per_permit,
-        default_capacity(),
-        crate::util::memory_total_bytes(),
-    )
+fn local_memory_ceiling(budget: u64, local: Option<u64>) -> u64 {
+    local.map_or(budget, |bytes| {
+        if budget > bytes {
+            bytes / 100 * 85
+        } else {
+            budget
+        }
+    })
 }
 
-/// The arithmetic half of `domain_capacity`, separated so it can be tested
-/// without depending on the CPUs and memory of the machine running it.
-fn local_ceiling(capacity: u64, bytes_per_permit: u64, cpus: u64, memory: Option<u64>) -> u64 {
-    let memory = if bytes_per_permit == 0 {
-        capacity
-    } else {
-        memory.map_or(capacity, |bytes| {
-            // The budget admission enforces. Permit rounding puts it fewer
-            // than `capacity` bytes below the configured value.
-            let budget = capacity.saturating_mul(bytes_per_permit);
-            if budget > bytes {
-                (bytes / 100 * 85) / bytes_per_permit
-            } else {
-                capacity
-            }
-        })
-    };
-    capacity.min(cpus).min(memory).max(1)
+/// Pure local ceilings, independently applied to each physical axis.
+fn local_ceiling(cpu: u64, memory: u64, local_cpus: u64, local_memory: Option<u64>) -> Resources {
+    Resources {
+        cpu: cpu.min(local_cpus).max(1),
+        memory_bytes: local_memory_ceiling(memory, local_memory),
+    }
 }
 
 impl Pool {
+    fn set_memory_capacity(&mut self, memory: u64) {
+        self.memory_capacity = memory;
+        self.domain_memory_capacity =
+            local_memory_ceiling(memory, crate::util::memory_total_bytes());
+    }
+
+    fn effective_budget(&self) -> Resources {
+        let yielding = self.priority == SchedulerPriority::Low && self.priority_wait_is_fresh();
+        let memory_headroom = if yielding && self.memory_capacity > 0 {
+            (self.memory_capacity / 4)
+                .max(1)
+                .min(self.memory_capacity - 1)
+        } else {
+            0
+        };
+        Resources {
+            cpu: self.capacity - self.reserved(),
+            memory_bytes: self.memory_capacity - memory_headroom,
+        }
+    }
+
     fn new(
         dir: PathBuf,
         capacity: u64,
@@ -1237,7 +1378,12 @@ impl Pool {
         Self {
             dir,
             capacity: capacity.max(1),
-            domain_capacity: domain_capacity(capacity, bytes_per_permit),
+            domain_capacity: local_ceiling(capacity, 0, default_capacity(), None).cpu,
+            memory_capacity: capacity.saturating_mul(bytes_per_permit),
+            domain_memory_capacity: local_memory_ceiling(
+                capacity.saturating_mul(bytes_per_permit),
+                crate::util::memory_total_bytes(),
+            ),
             build: None,
             bytes_per_permit,
             events: true,
@@ -1261,6 +1407,8 @@ impl Pool {
                 bytes_per_permit(scheduler.memory_bytes, permits),
                 scheduler.priority,
             );
+            pool.domain_capacity = scheduler.cpus.min(default_capacity()).max(1);
+            pool.set_memory_capacity(scheduler.memory_bytes.unwrap_or(0));
             pool.events = config.events;
             pool.pressure = scheduler.pressure;
             pool
@@ -1274,7 +1422,12 @@ impl Pool {
     pub(crate) fn admit(&self, demand: &Demand) -> Option<Permit> {
         let _phase = crate::phase_timing::phase("permit_wait");
         demand.observation.set(None);
-        let (weight, predicted, source) = self.prediction(demand);
+        let Plan {
+            resources,
+            weight,
+            predicted,
+            source,
+        } = self.demand_vector(demand);
         let started = Instant::now();
         let mut delay = POLL_INITIAL;
         let mut queued = None;
@@ -1284,10 +1437,11 @@ impl Pool {
             // The gate stops applying at its deadline so a machine that stays
             // short of memory delays this compilation rather than starving it.
             let gate = predicted.filter(|_| started.elapsed() < GATE_DEADLINE);
-            match self.try_admit_named(weight, gate, &mut queued, Some(demand)) {
+            match self.try_admit_named(resources, weight, gate, &mut queued, Some(demand)) {
                 Ok(Some(permit)) => {
                     demand.observation.set(Some(accuracy::Admission {
                         weight,
+                        resources,
                         predicted,
                         source,
                         wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
@@ -1323,8 +1477,8 @@ impl Pool {
                     );
                 }
                 debug!(
-                    "waiting for {weight} of {} machine-wide compile permits ({})",
-                    self.capacity, demand.name
+                    "waiting for {} cores and {} memory bytes ({})",
+                    resources.cpu, resources.memory_bytes, demand.name
                 );
             }
             std::thread::sleep(jittered(delay));
@@ -1369,7 +1523,16 @@ impl Pool {
             // Like compiler admission, a persistently low available-memory
             // reading must not turn an advisory gate into permanent starvation.
             let gate = memory_bytes.filter(|_| started.elapsed() < GATE_DEADLINE);
-            if let Some(permit) = self.try_admit_queued(weight, gate, &mut queued)? {
+            if let Some(permit) = self.try_admit_named(
+                Resources {
+                    cpu: cpus.unwrap_or(0),
+                    memory_bytes: memory_bytes.unwrap_or(0),
+                },
+                weight,
+                gate,
+                &mut queued,
+                None,
+            )? {
                 return Ok(permit);
             }
             if self.priority == SchedulerPriority::Normal
@@ -1390,7 +1553,13 @@ impl Pool {
         (weight, predicted)
     }
 
+    #[cfg(test)]
     fn prediction(&self, demand: &Demand) -> (u64, Option<u64>, &'static str) {
+        let plan = self.demand_vector(demand);
+        (plan.weight, plan.predicted, plan.source)
+    }
+
+    fn demand_vector(&self, demand: &Demand) -> Plan {
         if let Some(identity) = &demand.per_test {
             let path = test_history_path(&self.dir.join(TEST_HISTORY_DIR), &identity.binary);
             let history = lookup_test_history(&path, &identity.binary, &identity.test);
@@ -1406,7 +1575,15 @@ impl Pool {
                 .unwrap_or(1)
                 .max(1);
             if self.bytes_per_permit == 0 {
-                return (cores.min(self.capacity), None, "unmeasured");
+                return Plan {
+                    resources: Resources {
+                        cpu: cores,
+                        memory_bytes: 0,
+                    },
+                    weight: cores.min(self.capacity),
+                    predicted: None,
+                    source: "unmeasured",
+                };
             }
             let known_peak = measurement.and_then(|measurement| measurement.peak);
             let predicted = known_peak
@@ -1415,15 +1592,23 @@ impl Pool {
                 .div_ceil(self.bytes_per_permit)
                 .max(cores)
                 .clamp(1, self.capacity);
-            return (
+            return Plan {
+                resources: Resources {
+                    cpu: cores,
+                    memory_bytes: if known_peak.is_some() {
+                        predicted
+                    } else {
+                        predicted.max(weight.saturating_mul(self.bytes_per_permit))
+                    },
+                },
                 weight,
-                Some(predicted),
-                if known_peak.is_some() {
+                predicted: Some(predicted),
+                source: if known_peak.is_some() {
                     "test-history"
                 } else {
                     "unmeasured"
                 },
-            );
+            };
         }
         // What a test binary was measured using beats what it said or what
         // its harness would default to: libtest starts a thread per CPU
@@ -1443,11 +1628,15 @@ impl Pool {
             .max(1);
         let link_floor = demand.links.then_some(LINK_WEIGHT);
         if self.bytes_per_permit == 0 {
-            return (
-                link_floor.unwrap_or(1).max(threads).min(self.capacity),
-                None,
-                "unmeasured",
-            );
+            return Plan {
+                resources: Resources {
+                    cpu: link_floor.unwrap_or(1).max(threads),
+                    memory_bytes: 0,
+                },
+                weight: link_floor.unwrap_or(1).max(threads).min(self.capacity),
+                predicted: None,
+                source: "unmeasured",
+            };
         }
         let ledger = read_ledger(&self.ledger_path());
         let recorded = ledger
@@ -1528,13 +1717,30 @@ impl Pool {
             None if link_bytes.is_some() => (link_bytes, link_source),
             None => (None, source),
         };
-        // Memory and threads are separate costs of the same process; it takes
-        // whichever share of the pool is larger.
+        // Preserve the old scalar charge exactly for old readers. Admission
+        // uses the independent resources below, without this capacity clamp.
+        // Old readers retain today's oversize under-charge across different
+        // capacities; new readers use exact `cpu` and `memory_bytes` fields.
         let weight = predicted
             .map_or(1, |bytes| bytes.div_ceil(self.bytes_per_permit))
             .max(threads)
             .clamp(1, self.capacity);
-        (weight, predicted, source)
+        let memory_bytes = if source == "unmeasured" || source == "link-floor" {
+            predicted
+                .unwrap_or(0)
+                .max(weight.saturating_mul(self.bytes_per_permit))
+        } else {
+            predicted.unwrap_or(0)
+        };
+        Plan {
+            resources: Resources {
+                cpu: threads,
+                memory_bytes,
+            },
+            weight,
+            predicted,
+            source,
+        }
     }
 
     /// One admission attempt under the registrar lock.
@@ -1543,17 +1749,25 @@ impl Pool {
         self.try_admit_queued(weight, predicted, &mut None)
     }
 
+    #[cfg(test)]
     fn try_admit_queued(
         &self,
         weight: u64,
         predicted: Option<u64>,
         queued: &mut Option<QueueEntry>,
     ) -> Result<Option<Permit>> {
-        self.try_admit_named(weight, predicted, queued, None)
+        self.try_admit_named(
+            record_resources(None, None, weight, self.bytes_per_permit),
+            weight,
+            predicted,
+            queued,
+            None,
+        )
     }
 
     fn try_admit_named(
         &self,
+        resources: Resources,
         weight: u64,
         predicted: Option<u64>,
         queued: &mut Option<QueueEntry>,
@@ -1593,11 +1807,8 @@ impl Pool {
             *queued = None;
             return Ok(None);
         }
-        let capacity = self.capacity - self.reserved();
-        let used: u64 = live
-            .iter()
-            .map(|lease| lease_weight(lease, self.bytes_per_permit))
-            .sum();
+        let budget = self.effective_budget();
+        let capacity = budget.cpu;
         // The permit arithmetic bounds what history predicted; this bounds it
         // against the machine as it is right now, catching pressure the
         // ledger cannot see -- unmeasured crates already running, or memory
@@ -1607,7 +1818,7 @@ impl Pool {
         // there is no compilation whose finishing would return the memory
         // this one is short of, so deferring would stall the one thing that
         // could proceed and wait out the deadline to reach the same answer.
-        if used > 0
+        if !live.is_empty()
             && let Some(needed) = predicted
             && let Some(available) = (self.available_memory)()
             && available < needed
@@ -1632,6 +1843,11 @@ impl Pool {
             domain: self.pressure_domain.into(),
             domain_capacity: self.domain_capacity,
             global_capacity: Some(capacity),
+            cpu_cap: Some(budget.cpu),
+            mem_cap: Some(budget.memory_bytes),
+            domain_memory_cap: Some(self.domain_memory_capacity),
+            cpu: Some(resources.cpu),
+            memory_bytes: Some(resources.memory_bytes),
             bytes_per_permit: self.bytes_per_permit,
             build: self.build.clone(),
         };
@@ -1654,7 +1870,7 @@ impl Pool {
             }
             return Ok(None);
         }
-        let permit = self.grant(&leases, weight, demand)?;
+        let permit = self.grant(&leases, resources, weight, demand)?;
         *queued = None;
         if let Some((path, state)) = pressure_state.as_ref().zip(pressure.as_mut()) {
             state.last_admission_ms = Some(now);
@@ -1674,7 +1890,13 @@ impl Pool {
     /// and this compilation would then run unscheduled. So the name carries a
     /// token drawn once per process, and the file is created exclusively so
     /// that a collision is an error to retry rather than an overwrite.
-    fn grant(&self, leases: &Path, weight: u64, demand: Option<&Demand>) -> Result<Permit> {
+    fn grant(
+        &self,
+        leases: &Path,
+        resources: Resources,
+        weight: u64,
+        demand: Option<&Demand>,
+    ) -> Result<Permit> {
         let lease = serde_json::to_vec(&Lease {
             name: demand.map(|d| d.name.clone()),
             mode_key: demand.map(|d| {
@@ -1683,6 +1905,8 @@ impl Pool {
                     .unwrap_or_else(|| ledger_key(&d.name, d.links))
             }),
             version: LEASE_VERSION,
+            cpu: Some(resources.cpu),
+            memory_bytes: Some(resources.memory_bytes),
             weight,
             priority: self.priority.as_str().into(),
             build_id: self.build.as_ref().map(|(id, _)| id.clone()),
@@ -1732,7 +1956,8 @@ impl Pool {
             .wrap_err("failed to name a lease that was not already taken")
     }
 
-    /// Permits this build holds back for somebody who is waiting on them.
+    /// CPU headroom for waiting normal-priority work. `effective_budget`
+    /// withholds memory headroom too.
     ///
     /// Never the whole pool. A reserve equal to the capacity -- which a
     /// single-permit machine would otherwise get -- stops a low-priority
@@ -2222,6 +2447,7 @@ fn trim_compile_ledger(ledger: &mut MemoryLedger) {
 pub(crate) struct SchedulerReport {
     enabled: bool,
     capacity: u64,
+    memory_capacity: u64,
     bytes_per_permit: u64,
     entries: Vec<SchedulerEntry>,
     activity: Vec<SchedulerActivity>,
@@ -2235,6 +2461,7 @@ struct SchedulerEntry {
     successful_samples: u8,
     charge_bytes: Option<u64>,
     charge_permits: Option<u64>,
+    charge_cpu: Option<u64>,
     source: &'static str,
 }
 
@@ -2246,6 +2473,8 @@ struct SchedulerActivity {
     build_id: String,
     pressure_domain: String,
     charged_permits: u64,
+    charged_cpu: u64,
+    charged_memory_bytes: u64,
     charged_bytes: u64,
     age_secs: Option<u64>,
 }
@@ -2255,12 +2484,14 @@ struct SchedulerActivity {
 /// workspace that is; lease and waiter records keep what was really charged.
 pub(crate) fn scheduler_report(config: &Config) -> SchedulerReport {
     let capacity = config.scheduler.permits();
-    scheduler_snapshot(
+    let mut report = scheduler_snapshot(
         &config.cache_dir.join(SCHEDULER_DIR),
         capacity,
         bytes_per_permit(config.scheduler.memory_bytes, capacity),
         config.scheduler.enabled,
-    )
+    );
+    report.memory_capacity = config.scheduler.memory_bytes.unwrap_or(0);
+    report
 }
 
 fn scheduler_snapshot(
@@ -2287,6 +2518,7 @@ fn scheduler_snapshot(
                 recorded_peak_bytes: peak,
                 successful_samples: ledger.compile_samples.get(key).copied().unwrap_or(0),
                 charge_bytes,
+                charge_cpu: predictable.then_some(1),
                 charge_permits: charge_bytes
                     .map(|bytes| bytes.div_ceil(bytes_per_permit).clamp(1, capacity)),
                 source: if !predictable {
@@ -2322,6 +2554,7 @@ fn scheduler_snapshot(
             let record = if kind == "lease" {
                 serde_json::from_slice::<Lease>(&bytes).ok().map(|l| {
                     (
+                        l.resources(),
                         l.name,
                         l.mode_key,
                         l.build_id,
@@ -2333,6 +2566,7 @@ fn scheduler_snapshot(
             } else {
                 serde_json::from_slice::<Waiting>(&bytes).ok().map(|w| {
                     (
+                        w.resources(),
                         w.name,
                         w.mode_key,
                         w.build.map(|(id, _)| id),
@@ -2342,7 +2576,7 @@ fn scheduler_snapshot(
                     )
                 })
             };
-            if let Some((name, mode, build, domain, weight, unit)) = record {
+            if let Some((resources, name, mode, build, domain, weight, unit)) = record {
                 let unknown = || "unknown".to_owned();
                 activity.push(SchedulerActivity {
                     kind,
@@ -2351,6 +2585,8 @@ fn scheduler_snapshot(
                     build_id: build.unwrap_or_else(unknown),
                     pressure_domain: domain.unwrap_or_else(unknown),
                     charged_permits: weight,
+                    charged_cpu: resources.cpu,
+                    charged_memory_bytes: resources.memory_bytes,
                     charged_bytes: weight.saturating_mul(unit),
                     age_secs,
                 });
@@ -2360,6 +2596,7 @@ fn scheduler_snapshot(
     SchedulerReport {
         enabled,
         capacity,
+        memory_capacity: capacity.saturating_mul(bytes_per_permit),
         bytes_per_permit,
         entries,
         activity,
@@ -2370,15 +2607,19 @@ fn scheduler_snapshot(
 impl SchedulerReport {
     pub(crate) fn text(&self) -> String {
         let mut lines = vec![format!(
-            "Scheduler: {} ({} permits, {}/permit, from the global settings)",
+            "Scheduler: {} ({} cores, {} memory budget, from the global settings)",
             if self.enabled { "enabled" } else { "disabled" },
             self.capacity,
-            crate::stats::size(self.bytes_per_permit)
+            if self.bytes_per_permit == 0 {
+                "unlimited".into()
+            } else {
+                crate::stats::size(self.memory_capacity)
+            }
         )];
         for e in &self.entries {
-            let charge = e.charge_bytes.zip(e.charge_permits).map_or_else(
+            let charge = e.charge_bytes.zip(e.charge_cpu).map_or_else(
                 || "see admission".to_owned(),
-                |(bytes, permits)| format!("{} / {permits} permits", crate::stats::size(bytes)),
+                |(bytes, cpu)| format!("{cpu} cores + {}", crate::stats::size(bytes)),
             );
             let source = if e.source == "see admission" {
                 String::new()
@@ -2402,14 +2643,14 @@ impl SchedulerReport {
         );
         for a in &self.activity {
             lines.push(format!(
-                "  {} {}: mode={}, build={}, domain={}, charge={} / {} permits, age={}",
+                "  {} {}: mode={}, build={}, domain={}, charge={} cores + {}, age={}",
                 a.kind,
                 a.name,
                 a.mode_key,
                 a.build_id,
                 a.pressure_domain,
-                crate::stats::size(a.charged_bytes),
-                a.charged_permits,
+                a.charged_cpu,
+                crate::stats::size(a.charged_memory_bytes),
                 a.age_secs
                     .map_or_else(|| "unknown".into(), |s| format!("{s}s"))
             ));
@@ -2737,6 +2978,8 @@ fn scan_leases(leases: &Path) -> Result<Vec<Lease>> {
                     mode_key: None,
                     version: LEASE_VERSION,
                     weight: 1,
+                    cpu: None,
+                    memory_bytes: None,
                     priority: SchedulerPriority::Normal.as_str().into(),
                     build_id: None,
                     domain: None,

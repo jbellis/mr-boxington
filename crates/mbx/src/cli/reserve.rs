@@ -8,7 +8,7 @@ use std::process::{Command, ExitCode};
 
 #[derive(usage_rs::Args)]
 pub(super) struct ReserveArgs {
-    /// CPU permits to hold while the command runs.
+    /// CPU cores to hold while the command runs.
     #[usage(long, value_name = "N")]
     cpus: Option<u64>,
     /// Memory to hold from the configured scheduler budget.

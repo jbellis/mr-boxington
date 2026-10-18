@@ -218,18 +218,18 @@ hit where it would have compiled cold. Both paths rehash every input before
 trusting anything, so the worst a stale record can do is fall back
 to compiling.
 
-Permits are weighted by memory. Native links start at two permits, and every
-compilation is thereafter weighted by what it actually used, so admission uses
-the estimated memory cost of the running work. This is a scheduling estimate,
-not an operating-system memory limit. A link that turns out to fit in one
-permit stops being charged for two, which keeps the link-heavy tail of a build
-from running at half concurrency. A link mbx has never seen is weighed by the
-heaviest of this machine's recent links. That matters for tests: each test
-binary has its own crate name, so a cold `cargo test --no-run` has no
-per-crate history for the links in front of it. A compilation the Linux OOM
-killer stops is recorded heavier than it measured, so its retry runs with more
-room. Compiler memory use is measured only on Unix. On Windows, native links
-keep their two-permit weight and other compilations take one permit.
+The pool budgets CPU cores and predicted memory independently. A compiler's
+thread count charges CPU; measured peak history charges memory bytes. A large,
+CPU-light compile therefore leaves room for other work that fits the remaining
+memory. Unmeasured single-threaded compiles start with one default memory share,
+and native links start with two. The share is the memory budget divided by the
+CPU budget. Link history replaces that guess; a new link uses the heaviest of
+this machine's recent links. Each test binary has its own crate name, so this
+window helps a cold `cargo test --no-run` whose links have no per-crate history.
+A compilation the Linux OOM killer stops is recorded heavier than it measured,
+so its retry runs with more room. These are scheduling estimates, not operating
+system memory limits. Compiler memory use is measured only on Unix; Windows
+keeps the unmeasured guesses.
 
 The pool size, memory budget, and priority are settings; see
 [machine-wide compile scheduling](/scheduling#machine-wide-compile-scheduling).

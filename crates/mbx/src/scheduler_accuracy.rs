@@ -10,6 +10,7 @@ const MAX_BYTES: u64 = 8 * 1024 * 1024;
 #[derive(Clone, Copy)]
 pub(crate) struct Admission {
     pub weight: u64,
+    pub resources: Resources,
     pub predicted: Option<u64>,
     pub source: &'static str,
     pub wait_ms: u64,
@@ -34,6 +35,10 @@ struct Observation {
     source: String,
     predicted_bytes: Option<u64>,
     charged_permits: u64,
+    #[serde(default)]
+    charged_cpu: Option<u64>,
+    #[serde(default)]
+    charged_memory_bytes: Option<u64>,
     bytes_per_permit: u64,
     peak_bytes: Option<u64>,
     outcome: String,
@@ -78,6 +83,8 @@ impl Pool {
             source: admission.source.into(),
             predicted_bytes: admission.predicted,
             charged_permits: admission.weight,
+            charged_cpu: Some(admission.resources.cpu),
+            charged_memory_bytes: Some(admission.resources.memory_bytes),
             bytes_per_permit: self.bytes_per_permit,
             peak_bytes: peak,
             outcome: outcome(status),
@@ -112,6 +119,10 @@ impl Pool {
             permit,
             Admission {
                 weight,
+                resources: Resources {
+                    cpu: cpus.unwrap_or(0),
+                    memory_bytes: memory_bytes.unwrap_or(0),
+                },
                 predicted: None,
                 source: "reservation",
                 wait_ms,
@@ -138,6 +149,8 @@ impl Pool {
             source: admission.source.into(),
             predicted_bytes: None,
             charged_permits: admission.weight,
+            charged_cpu: Some(admission.resources.cpu),
+            charged_memory_bytes: Some(admission.resources.memory_bytes),
             bytes_per_permit: self.bytes_per_permit,
             peak_bytes: None,
             outcome: status.map_or_else(|| "unknown".into(), outcome),
@@ -260,7 +273,9 @@ impl Counts {
         let Some(peak) = o.peak_bytes else { return };
         self.measured += 1;
         self.highest_peak_bytes = Some(self.highest_peak_bytes.unwrap_or(0).max(peak));
-        let reserved = o.charged_permits.saturating_mul(o.bytes_per_permit);
+        let reserved = o
+            .charged_memory_bytes
+            .unwrap_or_else(|| o.charged_permits.saturating_mul(o.bytes_per_permit));
         if reserved == 0 {
             return;
         }
@@ -349,8 +364,8 @@ impl Summary {
                     samples.ratios.push(peak as f64 / predicted as f64);
                 }
                 samples.unused += o
-                    .charged_permits
-                    .saturating_mul(o.bytes_per_permit)
+                    .charged_memory_bytes
+                    .unwrap_or_else(|| o.charged_permits.saturating_mul(o.bytes_per_permit))
                     .saturating_sub(peak) as f64;
                 samples.clean_n += 1;
             }
@@ -494,6 +509,8 @@ mod tests {
             source: "mode".into(),
             predicted_bytes: Some(100),
             charged_permits: 2,
+            charged_cpu: None,
+            charged_memory_bytes: None,
             bytes_per_permit: 100,
             peak_bytes: peak,
             outcome: outcome.into(),
@@ -557,6 +574,11 @@ mod tests {
                 serde_json::json!(admission.predicted)
             );
             assert_eq!(value["charged_permits"], admission.weight);
+            assert_eq!(value["charged_cpu"], admission.resources.cpu);
+            assert_eq!(
+                value["charged_memory_bytes"],
+                admission.resources.memory_bytes
+            );
             assert_eq!(value["bytes_per_permit"], 100);
             assert_eq!(value["pressure_domain"], "fixture-domain");
             assert_eq!(value["build_id"], "build-123");
@@ -576,6 +598,8 @@ mod tests {
         let mut long = observation(Some(u64::MAX), "failed", u64::MAX);
         long.predicted_bytes = Some(u64::MAX);
         long.charged_permits = u64::MAX;
+        long.charged_cpu = Some(u64::MAX);
+        long.charged_memory_bytes = Some(u64::MAX);
         long.bytes_per_permit = u64::MAX;
         long.admission_wait_ms = u64::MAX;
         long.run_ms = u64::MAX;
@@ -593,10 +617,17 @@ mod tests {
     #[test]
     fn old_observation_lines_parse_without_optional_capacities() {
         let mut value = serde_json::to_value(observation(Some(10), "success", 1000)).unwrap();
+        value.as_object_mut().unwrap().remove("charged_cpu");
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("charged_memory_bytes");
         value.as_object_mut().unwrap().remove("build_id");
         value.as_object_mut().unwrap().remove("build_capacity");
         value.as_object_mut().unwrap().remove("domain_capacity");
         let parsed: Observation = serde_json::from_value(value).unwrap();
+        assert_eq!(parsed.charged_cpu, None);
+        assert_eq!(parsed.charged_memory_bytes, None);
         assert_eq!(parsed.build_id, None);
         assert_eq!(parsed.build_capacity, None);
         assert_eq!(parsed.domain_capacity, None);
@@ -624,6 +655,8 @@ mod tests {
         assert_eq!(value["kind"], "reservation");
         assert_eq!(value["key"], "reservation");
         assert_eq!(value["charged_permits"], 3);
+        assert_eq!(value["charged_cpu"], 3);
+        assert_eq!(value["charged_memory_bytes"], 0);
         assert_eq!(value["bytes_per_permit"], 100);
         assert_eq!(value["peak_bytes"], serde_json::Value::Null);
         assert_eq!(value["outcome"], "success");
@@ -644,6 +677,31 @@ mod tests {
             gated_pool.observe_reservation(admission, Some(&status(0)));
             assert!(!gated_dir.path().join(FILE).exists());
         }
+    }
+
+    #[test]
+    fn summary_prefers_exact_memory_charge_and_supports_legacy_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut exact = observation(Some(150), "success", 1000);
+        exact.charged_cpu = Some(2);
+        exact.charged_memory_bytes = Some(100);
+        append(dir.path(), exact).unwrap();
+        append(dir.path(), observation(Some(150), "success", 2000)).unwrap();
+        let summary = Summary::read(dir.path());
+        assert_eq!(summary.overall.exceeded, 1);
+        assert_eq!(summary.overall.worst_peak_reserved_ratio, Some(1.5));
+        assert_eq!(summary.keys[0].average_reserved_unused_bytes, Some(25.0));
+        let (permit, admission) = pool(dir.path(), 100)
+            .reserve_observed(Some(2), Some(201))
+            .unwrap();
+        drop(permit);
+        pool(dir.path(), 100).observe_reservation(admission, None);
+        let lines = std::fs::read_to_string(dir.path().join(FILE)).unwrap();
+        let value: serde_json::Value =
+            serde_json::from_str(lines.lines().next_back().unwrap()).unwrap();
+        assert_eq!(value["charged_cpu"], 2);
+        assert_eq!(value["charged_memory_bytes"], 201);
+        assert_eq!(value["charged_permits"], 3);
     }
 
     #[test]
