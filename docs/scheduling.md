@@ -88,6 +88,35 @@ key, build ID, pressure domain, age, and the charge it was really admitted or
 queued with. Older records show unknown names; abandoned records can remain
 visible until an admission reclaims them.
 
+With memory weighting enabled, completed admitted compiles, links, test binaries,
+and nextest tests append estimate-accuracy observations to
+`<cache_dir>/scheduler/observations.jsonl`. The existing `events` setting gates
+this log (on by default); `events = false` disables observations too. Each line
+pairs the prediction and its source with the admitted permits, bytes per permit,
+measured child peak RSS (or null), outcome, wrapper status, and wait/run times.
+Peak RSS has the same child-process measurement limitations as the memory ledger.
+Lines are smaller than 1 KiB; exceptionally long names, keys, or pressure domains
+are shortened with a hash suffix to preserve distinct identities.
+
+Before appending to a file over 8 MiB, a writer tries `observations.lock` without
+waiting, then rotates to `observations.jsonl.1`, replacing the previous generation.
+The usual retention bound is two approximately 8 MiB files. A busy rotation lock
+can temporarily allow growth; concurrent appends and rotation can lose a few lines.
+Observation failures are debug-logged and do not prevent the workload from running.
+
+The estimate-accuracy section of `mbx stats --scheduler` reads both generations,
+ignoring malformed lines, and states the retained time span as Unix milliseconds.
+It shows total observations, reservation exceedances, the worst peak/reservation
+ratio and its timestamp, and the 20 keys with the highest worst-case ratios.
+`--json` includes all keys, counts, highest peaks, median and nearest-rank p90
+peak/prediction ratios, and average reserved-but-unused bytes (clamped to zero
+when a run exceeds its reservation). Failed and OOM-killed runs have separate
+counts and still contribute to exceedances and worst cases; median, p90, and
+unused-byte averages use only successful unwrapped measurements. Missing peaks
+count as observations but do not contribute to measured statistics. Without
+observations, this section shows a short empty-state line.
+
+
 When a compilation cannot fit, it queues before newer requests. New requests
 stop filling the capacity it needs, so a large compilation can run even while
 other builds keep submitting small ones. Cancelling a waiter or killing its

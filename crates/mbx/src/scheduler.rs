@@ -48,6 +48,9 @@
 //! never around the other way, and a waiter blocked on a flight holds no
 //! permit.
 
+#[path = "scheduler_accuracy.rs"]
+mod accuracy;
+
 use crate::config::{Config, SchedulerPriority};
 use eyre::{Context, Result};
 use log::debug;
@@ -106,6 +109,8 @@ pub(crate) const SCHED_SLOT_BYTES_ENV: &str = "MBX_SCHED_SLOT_BYTES";
 pub(crate) const SCHED_PRIORITY_ENV: &str = "MBX_SCHED_PRIORITY";
 /// Identity shared by every compiler shim in one Cargo build.
 const SCHED_PRESSURE_ENV: &str = "MBX_SCHED_PRESSURE";
+/// The session's resolved events gate, including workspace overrides.
+const SCHED_EVENTS_ENV: &str = "MBX_SCHED_EVENTS";
 const SCHED_BUILD_ID_ENV: &str = "MBX_SCHED_BUILD_ID";
 /// Most weighted permits one Cargo build may hold at once.
 const SCHED_BUILD_SLOTS_ENV: &str = "MBX_SCHED_BUILD_SLOTS";
@@ -241,6 +246,7 @@ pub(crate) struct Demand {
     compile_mode: Option<String>,
     /// Another wrapper may have returned a cache hit without running rustc.
     count_compile_samples: bool,
+    observation: std::cell::Cell<Option<accuracy::Admission>>,
 }
 
 #[derive(Debug, Clone)]
@@ -263,6 +269,7 @@ impl Demand {
             profile: None,
             compile_mode: None,
             count_compile_samples: true,
+            observation: std::cell::Cell::new(None),
             per_test: None,
         }
     }
@@ -351,6 +358,7 @@ impl Demand {
             profile: None,
             compile_mode: None,
             count_compile_samples: true,
+            observation: std::cell::Cell::new(None),
             per_test: None,
         }
     }
@@ -365,6 +373,7 @@ impl Demand {
             profile: None,
             compile_mode: None,
             count_compile_samples: true,
+            observation: std::cell::Cell::new(None),
             per_test: Some(TestIdentity {
                 binary: binary.to_owned(),
                 test: test.to_owned(),
@@ -778,6 +787,7 @@ pub(crate) struct Pool {
     /// Memory one permit stands for. Zero turns memory weighting and the
     /// available-memory gate off, leaving plain CPU permits.
     bytes_per_permit: u64,
+    events: bool,
     priority: SchedulerPriority,
     /// Probe for currently available memory, injectable for tests.
     available_memory: fn() -> Option<u64>,
@@ -817,6 +827,7 @@ pub(crate) fn reservation_pool(config: &Config, priority: SchedulerPriority) -> 
             bytes_per_permit(scheduler.memory_bytes, permits),
             priority,
         );
+        pool.events = config.events;
         pool.pressure = scheduler.pressure;
         pool
     })
@@ -836,6 +847,7 @@ fn resolve_pool() -> Option<Pool> {
                     .and_then(|value| value.parse().ok())
                     .unwrap_or_default(),
             );
+            pool.events = env_number(SCHED_EVENTS_ENV) != Some(0);
             pool.pressure = env_number(SCHED_PRESSURE_ENV) == Some(1);
             pool.build = std::env::var(SCHED_BUILD_ID_ENV)
                 .ok()
@@ -891,6 +903,7 @@ pub(crate) fn session_environment_with_jobs(
                 .to_string_lossy()
                 .into_owned(),
         ),
+        (SCHED_EVENTS_ENV.into(), u8::from(config.events).to_string()),
         (SCHED_SLOTS_ENV.into(), permits.to_string()),
         (
             SCHED_PRESSURE_ENV.into(),
@@ -955,11 +968,13 @@ pub(crate) fn record_test_run(demand: &Demand, status: &ExitStatus, cores: Optio
         }
         return;
     };
+    let measured = child_peak_rss_bytes();
+    pool.observe(demand, status, measured);
     // A successful test is a true reading of what it costs, so it is recorded
     // whatever it measured, the way a successful link is: that is what lets a
     // light test retire the unmeasured default. A failure can only show that
     // a test is heavy.
-    let peak = child_peak_rss_bytes().and_then(|measured| {
+    let peak = measured.and_then(|measured| {
         ledger_peak(
             measured,
             oom_killed(status),
@@ -1030,6 +1045,7 @@ impl Pool {
             domain_capacity: domain_capacity(capacity, bytes_per_permit),
             build: None,
             bytes_per_permit,
+            events: true,
             priority,
             available_memory: crate::util::memory_available_bytes,
             pressure: true,
@@ -1050,6 +1066,7 @@ impl Pool {
                 bytes_per_permit(scheduler.memory_bytes, permits),
                 scheduler.priority,
             );
+            pool.events = config.events;
             pool.pressure = scheduler.pressure;
             pool
         })
@@ -1061,7 +1078,8 @@ impl Pool {
     /// unscheduled; it never means the compilation should not run.
     pub(crate) fn admit(&self, demand: &Demand) -> Option<Permit> {
         let _phase = crate::phase_timing::phase("permit_wait");
-        let (weight, predicted) = self.plan(demand);
+        demand.observation.set(None);
+        let (weight, predicted, source) = self.prediction(demand);
         let started = Instant::now();
         let mut delay = POLL_INITIAL;
         let mut queued = None;
@@ -1072,7 +1090,16 @@ impl Pool {
             // short of memory delays this compilation rather than starving it.
             let gate = predicted.filter(|_| started.elapsed() < GATE_DEADLINE);
             match self.try_admit_named(weight, gate, &mut queued, Some(demand)) {
-                Ok(Some(permit)) => return Some(permit),
+                Ok(Some(permit)) => {
+                    demand.observation.set(Some(accuracy::Admission {
+                        weight,
+                        predicted,
+                        source,
+                        wait_ms: started.elapsed().as_millis().try_into().unwrap_or(u64::MAX),
+                        started: Instant::now(),
+                    }));
+                    return Some(permit);
+                }
                 Ok(None) => {}
                 Err(error) => {
                     debug!("compiling without a machine-wide permit: {error:#}");
@@ -1152,7 +1179,13 @@ impl Pool {
     }
 
     /// The permits this demand costs, and its predicted memory when known.
+    #[cfg(test)]
     fn plan(&self, demand: &Demand) -> (u64, Option<u64>) {
+        let (weight, predicted, _) = self.prediction(demand);
+        (weight, predicted)
+    }
+
+    fn prediction(&self, demand: &Demand) -> (u64, Option<u64>, &'static str) {
         if let Some(identity) = &demand.per_test {
             let path = test_history_path(&self.dir.join(TEST_HISTORY_DIR), &identity.binary);
             let history = lookup_test_history(&path, &identity.binary, &identity.test);
@@ -1168,16 +1201,24 @@ impl Pool {
                 .unwrap_or(1)
                 .max(1);
             if self.bytes_per_permit == 0 {
-                return (cores.min(self.capacity), None);
+                return (cores.min(self.capacity), None, "unmeasured");
             }
-            let predicted = measurement
-                .and_then(|measurement| measurement.peak)
+            let known_peak = measurement.and_then(|measurement| measurement.peak);
+            let predicted = known_peak
                 .unwrap_or_else(|| UNMEASURED_TEST_WEIGHT.saturating_mul(self.bytes_per_permit));
             let weight = predicted
                 .div_ceil(self.bytes_per_permit)
                 .max(cores)
                 .clamp(1, self.capacity);
-            return (weight, Some(predicted));
+            return (
+                weight,
+                Some(predicted),
+                if known_peak.is_some() {
+                    "test-history"
+                } else {
+                    "unmeasured"
+                },
+            );
         }
         // What a test binary was measured using beats what it said or what
         // its harness would default to: libtest starts a thread per CPU
@@ -1200,6 +1241,7 @@ impl Pool {
             return (
                 link_floor.unwrap_or(1).max(threads).min(self.capacity),
                 None,
+                "unmeasured",
             );
         }
         let ledger = read_ledger(&self.ledger_path());
@@ -1207,6 +1249,7 @@ impl Pool {
             .crates
             .get(&ledger_key(&demand.name, demand.links))
             .copied();
+        let mut link_source = "link-floor";
         let link_bytes = link_floor.map(|weight| {
             // What this machine's links have actually cost beats a constant
             // chosen before anyone had seen one. Every test binary is its own
@@ -1229,6 +1272,9 @@ impl Pool {
             let measured = (window.len() >= MIN_LINK_SAMPLES)
                 .then(|| window.iter().copied().max())
                 .flatten();
+            if measured.is_some() {
+                link_source = "link-window";
+            }
             measured.unwrap_or_else(|| weight.saturating_mul(self.bytes_per_permit))
         });
         // History replaces the floor rather than merely raising it. The floor
@@ -1246,20 +1292,44 @@ impl Pool {
         // the two by far. Keyed by name alone it would retire the floor for
         // the link beside it, which is over-admission with a plausible number
         // attached to it.
-        let predicted = demand
-            .compile_mode
-            .as_deref()
-            .map_or(recorded, |key| {
-                compile_prediction(&ledger, &demand.name, key).0
-            })
-            .or(link_bytes);
+        let (estimate, source) = if let Some(key) = &demand.compile_mode {
+            let (value, trusted) = compile_prediction(&ledger, &demand.name, key);
+            (
+                value,
+                if trusted {
+                    "mode"
+                } else if value.is_some() {
+                    "crate-wide"
+                } else {
+                    "unmeasured"
+                },
+            )
+        } else {
+            (
+                recorded,
+                if recorded.is_none() {
+                    "unmeasured"
+                } else if demand.learns_cpu {
+                    "test-history"
+                } else if demand.links {
+                    "link-history"
+                } else {
+                    "crate-wide"
+                },
+            )
+        };
+        let (predicted, source) = match estimate {
+            Some(value) => (Some(value), source),
+            None if link_bytes.is_some() => (link_bytes, link_source),
+            None => (None, source),
+        };
         // Memory and threads are separate costs of the same process; it takes
         // whichever share of the pool is larger.
         let weight = predicted
             .map_or(1, |bytes| bytes.div_ceil(self.bytes_per_permit))
             .max(threads)
             .clamp(1, self.capacity);
-        (weight, predicted)
+        (weight, predicted, source)
     }
 
     /// One admission attempt under the registrar lock.
@@ -1508,10 +1578,12 @@ impl Pool {
     }
 
     fn note_compilation(&self, demand: &Demand, status: &ExitStatus) {
+        let measured = child_peak_rss_bytes();
+        self.observe(demand, status, measured);
         if self.bytes_per_permit == 0 {
             return;
         }
-        let Some(measured) = child_peak_rss_bytes() else {
+        let Some(measured) = measured else {
             return;
         };
         if demand.compile_mode.is_some() {
@@ -1974,6 +2046,7 @@ pub(crate) struct SchedulerReport {
     bytes_per_permit: u64,
     entries: Vec<SchedulerEntry>,
     activity: Vec<SchedulerActivity>,
+    accuracy: accuracy::Summary,
 }
 
 #[derive(Debug, Serialize)]
@@ -2111,6 +2184,7 @@ fn scheduler_snapshot(
         bytes_per_permit,
         entries,
         activity,
+        accuracy: accuracy::Summary::read(dir),
     }
 }
 
@@ -2164,6 +2238,7 @@ impl SchedulerReport {
         if self.activity.is_empty() {
             lines.push("  No lease or waiter records.".into());
         }
+        lines.push(self.accuracy.text());
         lines.join("\n")
     }
 }
