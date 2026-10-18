@@ -154,7 +154,13 @@ pub(crate) fn collect(
         .enumerate()
         .filter(|(_, entry)| entry.live == Some(false))
     {
-        let guard = deletion_guard(root, &entry.key, !dry_run)?;
+        let guard = match deletion_guard(root, &entry.key, !dry_run) {
+            Ok(guard) => guard,
+            Err(error) => {
+                log::debug!("incremental checkout disappeared or could not be reserved: {error}");
+                continue;
+            }
+        };
         if guard.active {
             active.insert(index);
             outcome.skipped_active_units += entry.units.len() as u64;
@@ -199,7 +205,13 @@ pub(crate) fn collect(
         if !required && max_bytes.is_none_or(|budget| outcome.remaining_bytes <= budget) {
             break;
         }
-        let guard = deletion_guard(root, &entry.key, !dry_run)?;
+        let guard = match deletion_guard(root, &entry.key, !dry_run) {
+            Ok(guard) => guard,
+            Err(error) => {
+                log::debug!("incremental checkout disappeared or could not be reserved: {error}");
+                continue;
+            }
+        };
         if guard.active {
             active.insert(index);
             outcome.skipped_active_units += 1;
@@ -279,58 +291,87 @@ struct Unit {
     churn_record: PathBuf,
 }
 
-fn units(directory: &Path, measure_bytes: bool) -> Result<Vec<Unit>> {
-    let root = directory.join("blake3");
-    let listing = match std::fs::read_dir(root) {
-        Ok(listing) => listing,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-    let mut units = Vec::new();
-    for entry in listing {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let directory = entry.path();
-        let last_used = std::fs::read_dir(&directory)?
-            .flatten()
-            .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
-            .filter_map(|entry| std::fs::read_dir(entry.path()).ok())
-            .flatten()
-            .flatten()
-            .filter(|entry| entry.file_name().to_string_lossy().starts_with("s-"))
-            .filter_map(|entry| {
-                entry
-                    .metadata()
-                    .ok()
-                    .filter(|metadata| metadata.is_dir())?
-                    .modified()
-                    .ok()
+fn nested_entries(directory: &Path) -> Vec<std::fs::DirEntry> {
+    match std::fs::read_dir(directory) {
+        Ok(listing) => listing
+            .filter_map(|entry| match entry {
+                Ok(entry) => Some(entry),
+                Err(error) => {
+                    warn_walk_error(directory, &error);
+                    None
+                }
             })
-            .max()
-            .or_else(|| entry.metadata().ok()?.modified().ok())
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map_or(0, |age| age.as_secs());
-        let churn_record = directory.with_extension("json");
-        let bytes = if measure_bytes {
-            tree_bytes(&directory).saturating_add(
-                std::fs::metadata(&churn_record)
-                    .ok()
-                    .filter(|metadata| metadata.is_file())
-                    .map_or(0, |metadata| metadata.len()),
-            )
-        } else {
-            0
-        };
-        units.push(Unit {
-            bytes,
-            directory,
-            last_used,
-            churn_record,
-        });
+            .collect(),
+        Err(error) => {
+            warn_walk_error(directory, &error);
+            Vec::new()
+        }
     }
-    Ok(units)
+}
+
+fn warn_walk_error(path: &Path, error: &std::io::Error) {
+    if error.kind() != std::io::ErrorKind::NotFound {
+        log::warn!(
+            "could not inspect incremental state {}: {error}",
+            path.display()
+        );
+    }
+}
+
+fn units(directory: &Path, measure_bytes: bool) -> Vec<Unit> {
+    nested_entries(&directory.join("blake3"))
+        .into_iter()
+        .filter_map(|entry| {
+            if !entry.file_type().ok()?.is_dir() {
+                return None;
+            }
+            measure_unit(entry.path(), measure_bytes)
+        })
+        .collect()
+}
+
+fn measure_unit(directory: PathBuf, measure_bytes: bool) -> Option<Unit> {
+    let metadata = std::fs::metadata(&directory).ok()?;
+    if !metadata.is_dir() {
+        return None;
+    }
+    let last_used = std::fs::read_dir(&directory)
+        .ok()?
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter_map(|entry| std::fs::read_dir(entry.path()).ok())
+        .flatten()
+        .flatten()
+        .filter(|entry| entry.file_name().to_string_lossy().starts_with("s-"))
+        .filter_map(|entry| {
+            entry
+                .metadata()
+                .ok()
+                .filter(|metadata| metadata.is_dir())?
+                .modified()
+                .ok()
+        })
+        .max()
+        .or_else(|| metadata.modified().ok())
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map_or(0, |age| age.as_secs());
+    let churn_record = directory.with_extension("json");
+    let bytes = if measure_bytes {
+        tree_bytes(&directory).saturating_add(
+            std::fs::metadata(&churn_record)
+                .ok()
+                .filter(|metadata| metadata.is_file())
+                .map_or(0, |metadata| metadata.len()),
+        )
+    } else {
+        0
+    };
+    Some(Unit {
+        bytes,
+        directory,
+        last_used,
+        churn_record,
+    })
 }
 
 /// Hold all existing rustc session locks through deletion; a held lock means
@@ -340,9 +381,31 @@ fn unit_locks(directory: &Path, dry_run: bool) -> Result<Option<Vec<fslock::Lock
     let mut paths = Vec::new();
     let mut pending = vec![directory.to_path_buf()];
     while let Some(directory) = pending.pop() {
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            let kind = entry.file_type()?;
+        let listing = match std::fs::read_dir(&directory) {
+            Ok(listing) => listing,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                warn_walk_error(&directory, &error);
+                return Ok(None);
+            }
+        };
+        for entry in listing {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    warn_walk_error(&directory, &error);
+                    return Ok(None);
+                }
+            };
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    warn_walk_error(&entry.path(), &error);
+                    return Ok(None);
+                }
+            };
             if kind.is_dir() {
                 pending.push(entry.path());
             }
@@ -351,11 +414,16 @@ fn unit_locks(directory: &Path, dry_run: bool) -> Result<Option<Vec<fslock::Lock
             let session = kind.is_dir() && name.starts_with("s-");
             let lock = kind.is_file() && name.starts_with("s-") && name.ends_with(".lock");
             if session || lock {
-                let modified = entry
-                    .metadata()?
-                    .modified()?
-                    .duration_since(UNIX_EPOCH)
-                    .map_or(now, |time| time.as_secs());
+                let modified = match entry.metadata().and_then(|metadata| metadata.modified()) {
+                    Ok(modified) => modified,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(error) => {
+                        warn_walk_error(&entry.path(), &error);
+                        return Ok(None);
+                    }
+                }
+                .duration_since(UNIX_EPOCH)
+                .map_or(now, |time| time.as_secs());
                 // rustc creates its lock file before flocking it. Do not win
                 // that race against a starting compiler; a unit used within
                 // the last minute is not an eviction candidate anyway.
@@ -372,9 +440,23 @@ fn unit_locks(directory: &Path, dry_run: bool) -> Result<Option<Vec<fslock::Lock
     // A preview must never take a compiler's lock, even momentarily.
     if !dry_run {
         for path in paths {
-            let mut lock = fslock::LockFile::open(&path)?;
-            if !lock.try_lock()? {
-                return Ok(None);
+            let mut lock = match fslock::LockFile::open(&path) {
+                Ok(lock) => lock,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => {
+                    warn_walk_error(&path, &error);
+                    return Ok(None);
+                }
+            };
+            match lock.try_lock() {
+                Ok(true) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                result => {
+                    if let Err(error) = result {
+                        warn_walk_error(&path, &error);
+                    }
+                    return Ok(None);
+                }
             }
             locks.push(lock);
         }
@@ -433,16 +515,22 @@ fn entries(root: &Path) -> Result<Vec<Entry>> {
     };
     let mut entries = Vec::new();
     for entry in listing {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() || entry.file_name() == LOCKS_DIR {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                warn_walk_error(root, &error);
+                continue;
+            }
+        };
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) || entry.file_name() == LOCKS_DIR {
             continue;
         }
         let directory = entry.path();
         let record = read_record(&directory.join(RECORD_FILE));
         let units = if record.is_some() {
-            units(&directory, true)?
+            units(&directory, true)
         } else {
-            units(&directory, false).unwrap_or_default()
+            units(&directory, false)
         };
         let bytes = if record.is_some() {
             let mut excluded = units
@@ -1107,6 +1195,29 @@ mod tests {
         assert!(!directory.exists());
         assert!(state.directory.join("private/marker").exists());
         assert!(state.directory.join("blake3/orphan.json").exists());
+    }
+
+    #[test]
+    fn vanished_units_and_sessions_do_not_abort_collection() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = touch(cache.path(), workspace.path()).unwrap();
+        let vanished = unit(&state.directory, "vanished", 0);
+        let listed = std::fs::read_dir(state.directory.join("blake3"))
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap();
+        std::fs::remove_dir_all(&vanished).unwrap();
+        assert!(measure_unit(listed.path(), true).is_none());
+        assert!(unit_locks(&vanished, false).unwrap().is_some());
+        let surviving = unit(&state.directory, "surviving", 0);
+        std::fs::remove_dir_all(surviving.join("crate-id/s-session")).unwrap();
+        assert!(unit_locks(&surviving, false).unwrap().is_some());
+        drop(state.lease);
+        let outcome = collect(cache.path(), Some(0), None, false).unwrap();
+        assert_eq!(outcome.removed_units, 1);
+        assert!(!surviving.exists());
     }
 
     #[test]
