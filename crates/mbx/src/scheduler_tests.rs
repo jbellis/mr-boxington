@@ -10,6 +10,7 @@ fn pool_at(dir: &Path, capacity: u64, bytes_per_permit: u64) -> Pool {
     // Tests must not depend on how much memory the machine running them has
     // free; anything that wants the gate closed injects its own probe.
     pool.domain_capacity = capacity;
+    pool.legacy_domain_capacity = capacity;
     pool.domain_memory_capacity = capacity.saturating_mul(bytes_per_permit);
     pool.available_memory = || None;
     pool.pressure = false;
@@ -2452,6 +2453,7 @@ fn sim_request(
             cpu_cap: None,
             mem_cap: None,
             domain_memory_cap: None,
+            domain_cpu_cap: None,
             priority: "normal".into(),
             domain: domain.0.into(),
             domain_capacity: domain.1,
@@ -3539,4 +3541,256 @@ fn new_processes_with_different_capacities_read_exact_oversize_memory() {
     );
     let admitted = vector_attempt(&large, 1, 28 * GIB).expect("exactly the remaining memory fits");
     drop((held, admitted));
+}
+
+// Pure scalar policy and prediction copied from fe73826 for compatibility
+// assertions. This reader deliberately knows no vector or exact-cap fields.
+mod legacy {
+    use super::*;
+    include!("scheduler_legacy_tests.rs");
+}
+
+#[test]
+fn old_reader_refuses_passing_a_new_memory_limited_domain_waiter() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pool = pool_at(dir.path(), 16, GIB);
+    pool.pressure_domain = "host";
+    pool.domain_capacity = 8;
+    pool.domain_memory_capacity = local_memory_ceiling(16 * GIB, Some(5 * GIB));
+    pool.legacy_domain_capacity = legacy_local_ceiling(16, GIB, 8, Some(5 * GIB));
+    let first = vector_attempt(&pool, 1, GIB).unwrap();
+    let second = vector_attempt(&pool, 1, GIB).unwrap();
+    pool.record_peak("head", 3 * GIB, false).unwrap();
+    let demand = Demand::new("head", false);
+    let plan = pool.demand_vector(&demand);
+    let mut queued = None;
+    assert!(
+        pool.try_admit_named(
+            plan.resources,
+            plan.weight,
+            None,
+            &mut queued,
+            Some(&demand)
+        )
+        .unwrap()
+        .is_none()
+    );
+    let waiting = scan_waiters(&dir.path().join(WAITERS_DIR)).unwrap();
+    let mut value = serde_json::to_value(&waiting[0]).unwrap();
+    assert_eq!(value["domain_capacity"], 4);
+    assert_eq!(value["domain_cpu_cap"], 8);
+    assert_eq!(
+        waiting[0].domain_budget(),
+        Resources {
+            cpu: 8,
+            memory_bytes: pool.domain_memory_capacity
+        }
+    );
+    let older: legacy::Waiting = serde_json::from_value(value.clone()).unwrap();
+    let live: Vec<legacy::Lease> = scan_leases(&dir.path().join(LEASES_DIR))
+        .unwrap()
+        .into_iter()
+        .map(|lease| serde_json::from_value(serde_json::to_value(lease).unwrap()).unwrap())
+        .collect();
+    let younger: legacy::Waiting = serde_json::from_value(serde_json::json!({
+        "ticket": 2, "weight": 2, "bytes_per_permit": GIB / 2,
+        "priority": "normal", "domain": "host", "domain_capacity": 8,
+        "global_capacity": 16, "build": null,
+    }))
+    .unwrap();
+    assert_eq!(
+        legacy::admission_decision(16, &live, [&older].into_iter(), &younger),
+        legacy::AdmissionDecision::Waiting
+    );
+    // The reviewer observed this unsafe pass before the legacy field was fixed.
+    value["domain_capacity"] = serde_json::json!(8);
+    let incorrect: legacy::Waiting = serde_json::from_value(value).unwrap();
+    assert_eq!(
+        legacy::admission_decision(16, &live, [&incorrect].into_iter(), &younger),
+        legacy::AdmissionDecision::Passing
+    );
+    drop((first, second, queued));
+}
+
+#[test]
+fn missing_exact_domain_caps_fall_back_to_the_legacy_scalar_on_both_axes() {
+    let mut record = sim_request(1, 0, 3, 1, ("host", 4), None).record;
+    record.bytes_per_permit = GIB;
+    let mut value = serde_json::to_value(record).unwrap();
+    value.as_object_mut().unwrap().remove("domain_cpu_cap");
+    value.as_object_mut().unwrap().remove("domain_memory_cap");
+    let mut record: Waiting = serde_json::from_value(value).unwrap();
+    assert_eq!(record.domain_cpu_cap, None);
+    assert_eq!(record.domain_memory_cap, None);
+    assert_eq!(
+        record.domain_budget(),
+        Resources {
+            cpu: 4,
+            memory_bytes: 4 * GIB
+        }
+    );
+    record.domain_cpu_cap = Some(8);
+    record.domain_memory_cap = Some(17 * GIB / 4);
+    assert_eq!(
+        record.domain_budget(),
+        Resources {
+            cpu: 8,
+            memory_bytes: 17 * GIB / 4
+        }
+    );
+}
+
+fn assert_legacy_record_fields(
+    pool: &Pool,
+    demand: Option<&Demand>,
+    weight: u64,
+    resources: Resources,
+) {
+    std::fs::write(pool.dir.join(PRIORITY_WAIT_STAMP), b"").unwrap();
+    let held = vector_attempt(pool, pool.capacity, 0).unwrap();
+    let mut queued = None;
+    assert!(
+        pool.try_admit_named(resources, weight, None, &mut queued, demand)
+            .unwrap()
+            .is_none()
+    );
+    let records = scan_waiters(&pool.dir.join(WAITERS_DIR)).unwrap();
+    assert_eq!(records.len(), 1);
+    let waiting = &records[0];
+    let legacy_waiting: legacy::Waiting =
+        serde_json::from_value(serde_json::to_value(waiting).unwrap()).unwrap();
+    let name = demand.map(|d| d.name.clone());
+    let mode = demand.map(|d| {
+        d.compile_mode
+            .clone()
+            .unwrap_or_else(|| ledger_key(&d.name, d.links))
+    });
+    let global = pool.capacity
+        - if pool.priority == SchedulerPriority::Low {
+            (pool.capacity / 4).max(1).min(pool.capacity - 1)
+        } else {
+            0
+        };
+    assert_eq!(
+        serde_json::to_value(legacy_waiting).unwrap(),
+        serde_json::json!({
+            "name": name, "mode_key": mode, "ticket": 1, "weight": weight,
+            "priority": pool.priority.as_str(), "domain": pool.pressure_domain,
+            "domain_capacity": pool.legacy_domain_capacity, "global_capacity": global,
+            "bytes_per_permit": pool.bytes_per_permit, "build": pool.build,
+        })
+    );
+    assert_eq!(waiting.domain_cpu_cap, Some(pool.domain_capacity));
+    assert_eq!(waiting.domain_memory_cap, Some(pool.domain_memory_capacity));
+    assert_eq!(waiting.domain_budget().cpu, pool.domain_capacity);
+    drop((held, queued));
+    let permit = pool
+        .try_admit_named(resources, weight, None, &mut None, demand)
+        .unwrap()
+        .unwrap();
+    let lease: legacy::Lease =
+        serde_json::from_slice(&std::fs::read(&permit.path).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::to_value(lease).unwrap(),
+        serde_json::json!({
+            "version": 1, "name": name, "mode_key": mode, "weight": weight,
+            "priority": pool.priority.as_str(), "build_id": pool.build.as_ref().map(|(id, _)| id),
+            "domain": pool.pressure_domain, "bytes_per_permit": pool.bytes_per_permit,
+        })
+    );
+}
+
+#[test]
+fn legacy_lease_and_waiter_fields_match_fe73826_across_demands_and_domain_limits() {
+    for (unit, local_cpus, local_memory) in [
+        (GIB, 8, Some(5 * GIB)),
+        (GIB / 2, 8, Some(5 * GIB)),
+        (0, 8, Some(5 * GIB)),
+        (GIB, 8, Some(64 * GIB)),
+        (GIB, 32, Some(GIB)),
+        (GIB, 32, None),
+        (13, 32, Some(208)),
+    ] {
+        for priority in [SchedulerPriority::Normal, SchedulerPriority::Low] {
+            let dir = tempfile::tempdir().unwrap();
+            let mut pool = Pool::new(dir.path().into(), 16, unit, priority);
+            assert_eq!(
+                pool.legacy_domain_capacity,
+                legacy::local_ceiling(
+                    16,
+                    unit,
+                    default_capacity(),
+                    crate::util::memory_total_bytes()
+                )
+            );
+            pool.available_memory = || None;
+            pool.pressure = false;
+            std::fs::write(dir.path().join(PRIORITY_WAIT_STAMP), b"").unwrap();
+            pool.pressure_domain = "host";
+            pool.build = Some(("build".into(), 12));
+            pool.domain_capacity = 16.min(local_cpus);
+            // The old ceiling uses the rounded permit budget even when the
+            // exact byte budget crosses the local-memory boundary.
+            pool.memory_capacity = 16 * unit + u64::from(unit == 13);
+            pool.domain_memory_capacity = local_memory_ceiling(pool.memory_capacity, local_memory);
+            pool.legacy_domain_capacity = legacy_local_ceiling(16, unit, local_cpus, local_memory);
+            assert_eq!(
+                pool.legacy_domain_capacity,
+                legacy::local_ceiling(16, unit, local_cpus, local_memory)
+            );
+            pool.record_peak("measured", 7 * GIB + 1, false).unwrap();
+            let mode = compile_demand("mode", &["--emit=metadata"]);
+            pool.record_peak("mode", 7 * GIB, false).unwrap();
+            for _ in 0..3 {
+                pool.record_compile(&mode, GIB + 1, false, true).unwrap();
+            }
+            pool.record_peak("measured-link", 3 * GIB + 1, true)
+                .unwrap();
+            for _ in 0..MIN_LINK_SAMPLES {
+                pool.record_link_peak("window-sample [link]", 2 * GIB + 1, true, None)
+                    .unwrap();
+            }
+            let suite = Demand::test("suite", None);
+            pool.record_peak(&suite.name, 2 * GIB + 1, false).unwrap();
+            pool.record_cpu(&suite.name, 3).unwrap();
+            pool.record_test_history("bin", "case", Some(GIB + 1), Some(2))
+                .unwrap();
+            let mut measured = Demand::new("measured", false);
+            measured.threads = Some(4);
+            for demand in [
+                Demand::new("cold", false),
+                Demand::new("cold-link", true)
+                    .with_link_profile(&[std::ffi::OsString::from("-Clto=fat")]),
+                Demand::test("cold-suite", Some(3)),
+                Demand::test("default-suite", None),
+                Demand::nextest("cold-bin", "case"),
+                measured,
+                mode,
+                Demand::new("measured-link", true),
+                Demand::new("window-link", true),
+                suite,
+                Demand::nextest("bin", "case"),
+            ] {
+                let expected = legacy::prediction(&pool, &demand);
+                let plan = pool.demand_vector(&demand);
+                assert_eq!((plan.weight, plan.predicted, plan.source), expected);
+                assert_legacy_record_fields(&pool, Some(&demand), expected.0, plan.resources);
+            }
+            let memory = (unit > 0).then_some(3 * unit + 1);
+            let reservation_weight = 2.max(memory.map_or(0, |bytes| bytes.div_ceil(unit)));
+            assert_eq!(
+                pool.reservation_weight(Some(2), memory).unwrap(),
+                reservation_weight
+            );
+            assert_legacy_record_fields(
+                &pool,
+                None,
+                reservation_weight,
+                Resources {
+                    cpu: 2,
+                    memory_bytes: memory.unwrap_or(0),
+                },
+            );
+        }
+    }
 }

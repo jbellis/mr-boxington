@@ -446,6 +446,8 @@ struct Waiting {
     mem_cap: Option<u64>,
     #[serde(default)]
     domain_memory_cap: Option<u64>,
+    #[serde(default)]
+    domain_cpu_cap: Option<u64>,
     bytes_per_permit: u64,
     build: Option<(String, u64)>,
 }
@@ -523,7 +525,7 @@ impl Waiting {
     }
     fn domain_budget(&self) -> Resources {
         Resources {
-            cpu: self.domain_capacity,
+            cpu: self.domain_cpu_cap.unwrap_or(self.domain_capacity),
             memory_bytes: self
                 .domain_memory_cap
                 .unwrap_or_else(|| self.domain_capacity.saturating_mul(self.bytes_per_permit)),
@@ -1091,6 +1093,8 @@ pub(crate) struct Pool {
     pub(crate) dir: PathBuf,
     capacity: u64,
     domain_capacity: u64,
+    /// The original combined CPU/memory ceiling, written for old readers.
+    legacy_domain_capacity: u64,
     memory_capacity: u64,
     domain_memory_capacity: u64,
     /// A per-Cargo-build ceiling, separate from the machine-wide capacity.
@@ -1339,6 +1343,31 @@ fn local_memory_ceiling(budget: u64, local: Option<u64>) -> u64 {
     })
 }
 
+// Preserve fe73826's combined scalar calculation, including permit rounding
+// and its one-permit minimum. Old readers cannot see the independent ceilings.
+fn legacy_local_ceiling(
+    capacity: u64,
+    bytes_per_permit: u64,
+    cpus: u64,
+    memory: Option<u64>,
+) -> u64 {
+    let memory = if bytes_per_permit == 0 {
+        capacity
+    } else {
+        memory.map_or(capacity, |bytes| {
+            // The budget admission enforces. Permit rounding puts it fewer
+            // than `capacity` bytes below the configured value.
+            let budget = capacity.saturating_mul(bytes_per_permit);
+            if budget > bytes {
+                (bytes / 100 * 85) / bytes_per_permit
+            } else {
+                capacity
+            }
+        })
+    };
+    capacity.min(cpus).min(memory).max(1)
+}
+
 /// Pure local ceilings, independently applied to each physical axis.
 fn local_ceiling(cpu: u64, memory: u64, local_cpus: u64, local_memory: Option<u64>) -> Resources {
     Resources {
@@ -1375,14 +1404,22 @@ impl Pool {
         bytes_per_permit: u64,
         priority: SchedulerPriority,
     ) -> Self {
+        let local_cpus = default_capacity();
+        let local_memory = crate::util::memory_total_bytes();
         Self {
             dir,
             capacity: capacity.max(1),
-            domain_capacity: local_ceiling(capacity, 0, default_capacity(), None).cpu,
+            domain_capacity: local_ceiling(capacity, 0, local_cpus, None).cpu,
+            legacy_domain_capacity: legacy_local_ceiling(
+                capacity,
+                bytes_per_permit,
+                local_cpus,
+                local_memory,
+            ),
             memory_capacity: capacity.saturating_mul(bytes_per_permit),
             domain_memory_capacity: local_memory_ceiling(
                 capacity.saturating_mul(bytes_per_permit),
-                crate::util::memory_total_bytes(),
+                local_memory,
             ),
             build: None,
             bytes_per_permit,
@@ -1841,7 +1878,8 @@ impl Pool {
             weight,
             priority: self.priority.as_str().into(),
             domain: self.pressure_domain.into(),
-            domain_capacity: self.domain_capacity,
+            domain_capacity: self.legacy_domain_capacity,
+            domain_cpu_cap: Some(self.domain_capacity),
             global_capacity: Some(capacity),
             cpu_cap: Some(budget.cpu),
             mem_cap: Some(budget.memory_bytes),
