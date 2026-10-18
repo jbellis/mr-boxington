@@ -623,24 +623,18 @@ impl DeletionGuard {
 fn deletion_guard(root: &Path, key: &str, cleanup: bool) -> Result<DeletionGuard> {
     let locks = lock_dir(root, key);
     let registrar_path = registrar_path(root);
-    if !cleanup {
-        // Without acquiring locks a preview cannot distinguish an abandoned
-        // lease from a live one, so conservatively retain either.
-        let active = match std::fs::read_dir(&locks) {
-            Ok(listing) => listing
-                .collect::<std::io::Result<Vec<_>>>()?
-                .iter()
-                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "lease")),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(error.into()),
-        };
+    if !cleanup && !registrar_path.exists() {
+        // Lease registration always creates the registrar first.
         return Ok(DeletionGuard {
             _registrar: None,
             locks,
-            active,
+            active: false,
             cleanup,
         });
     }
+    // These are mbx's own lease files, not rustc session locks: the rule
+    // against preview lock acquisition does not apply here. The registrar
+    // makes probing safe against a lease being created but not yet locked.
     std::fs::create_dir_all(registrar_path.parent().expect("registrar has a parent"))?;
     let mut registrar = fslock::LockFile::open(&registrar_path)?;
     registrar.lock()?;
@@ -649,7 +643,7 @@ fn deletion_guard(root: &Path, key: &str, cleanup: bool) -> Result<DeletionGuard
         Ok(listing) => listing,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             return Ok(DeletionGuard {
-                _registrar: Some(registrar),
+                _registrar: cleanup.then_some(registrar),
                 locks,
                 active,
                 cleanup,
@@ -673,7 +667,7 @@ fn deletion_guard(root: &Path, key: &str, cleanup: bool) -> Result<DeletionGuard
         }
     }
     Ok(DeletionGuard {
-        _registrar: Some(registrar),
+        _registrar: cleanup.then_some(registrar),
         locks,
         active,
         cleanup,
@@ -1009,13 +1003,22 @@ mod tests {
         acquiring.join().unwrap();
         assert_ne!(own.path, occupied);
         assert!(deletion_guard(cache.path(), key, false).unwrap().active);
+        let own_path = own.path.clone();
         drop(own);
+        assert!(!own_path.exists(), "normal lease drop removes its file");
         assert_eq!(
             std::fs::read(&occupied).unwrap(),
             b"another namespace's lease"
         );
         assert!(deletion_guard(cache.path(), key, false).unwrap().active);
         drop(other);
+        let stale_contents = std::fs::read(&occupied).unwrap();
+        assert!(!deletion_guard(cache.path(), key, false).unwrap().active);
+        assert_eq!(
+            std::fs::read(&occupied).unwrap(),
+            stale_contents,
+            "a preview must retain the stale lease file"
+        );
         assert!(!deletion_guard(cache.path(), key, true).unwrap().active);
         assert!(!occupied.exists());
     }
