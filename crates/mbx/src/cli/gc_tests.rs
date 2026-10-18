@@ -347,8 +347,8 @@ fn a_short_disk_collects_live_targets_past_their_budget() {
     let report = prune_targets(&config, &always_short(), config.gc.max_bytes);
 
     assert!(!views[0].exists(), "the older checkout's target went");
-    assert!(views[1].exists(), "the most recently used one is kept");
-    assert_eq!(report.freed_bytes, 64);
+    assert!(!views[1].exists(), "the newest inactive target also goes");
+    assert_eq!(report.freed_bytes, 128);
     assert!(
         report.removals[0].contains("under the"),
         "the report says why: {:?}",
@@ -514,22 +514,22 @@ fn a_combined_budget_shares_unoccupied_store_capacity() {
             !views[0].exists(),
             "the older target makes room for the occupied store"
         );
-        assert!(views[1].exists(), "the newest target remains protected");
+        assert!(views[1].exists(), "the newest target still fits the budget");
         let tight = RetentionSettings {
             max_total_bytes: Some(32),
             ..retention
         };
         let sweep = sweep_store(&config, &tight);
         assert!(
-            views[1].exists(),
-            "even an impossible budget preserves the newest target"
+            !views[1].exists(),
+            "a tighter budget also evicts the newest inactive target"
         );
         assert!(
-            sweep
+            !sweep
                 .lines
                 .iter()
                 .any(|line| line.contains("over gc.max_total_size")),
-            "the next build receives the budget warning: {:?}",
+            "without protected targets the budget can be met: {:?}",
             sweep.lines
         );
     }

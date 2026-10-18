@@ -729,8 +729,7 @@ fn target_budget_collects_oldest_live_view_first() {
 fn dry_run_leaves_selected_target_views_in_place() {
     let directory = tempfile::tempdir().unwrap();
     let config = test_config(directory.path(), true);
-    // Two views, because the most recently used one is never evicted for
-    // being over budget; the older one is what a dry run must report and keep.
+    // The older view has bytes to reclaim; a dry run reports it and keeps it.
     let old_workspace = checkout(directory.path(), "old");
     let new_workspace = checkout(directory.path(), "new");
     let old = place(
@@ -766,25 +765,25 @@ fn age_view(root: &Path, workspace_root: &Path, updated_secs: u64) {
 }
 
 #[test]
-fn a_budget_smaller_than_one_target_directory_keeps_it() {
+fn a_budget_smaller_than_one_target_directory_collects_it() {
     let directory = tempfile::tempdir().unwrap();
     let config = test_config(directory.path(), true);
     let workspace = checkout(directory.path(), "project");
     let managed = place(&config, &workspace, &workspace.join("target"), false).unwrap();
     std::fs::write(managed.join("artifact"), vec![0_u8; 4_096]).unwrap();
 
-    // Deleting it could not hold the total down: the next build recreates it.
-    // Collecting it anyway would delete the working checkout's outputs after
-    // every single build.
+    age_view(&config.target.root, &workspace, 1);
+
+    // The budget applies even when just one inactive target remains.
     let outcome = collect(&config.target.root, Some(16), None, false).unwrap();
 
-    assert_eq!(outcome.removed_views, 0);
-    assert_eq!(outcome.remaining_bytes, 4_096);
-    assert!(managed.join("artifact").exists());
+    assert_eq!(outcome.removed_views, 1);
+    assert_eq!(outcome.remaining_bytes, 0);
+    assert!(!managed.exists());
 }
 
 #[test]
-fn an_over_budget_sweep_keeps_the_most_recently_used_view() {
+fn an_over_budget_sweep_collects_even_the_most_recently_used_view() {
     let directory = tempfile::tempdir().unwrap();
     let config = test_config(directory.path(), true);
     let old_workspace = checkout(directory.path(), "old");
@@ -806,18 +805,18 @@ fn an_over_budget_sweep_keeps_the_most_recently_used_view() {
     std::fs::write(old.join("artifact"), vec![0_u8; 100]).unwrap();
     std::fs::write(new.join("artifact"), vec![0_u8; 100]).unwrap();
     age_view(&config.target.root, &old_workspace, 1);
+    age_view(&config.target.root, &new_workspace, 2);
 
-    // A budget neither view alone fits under: the older one still goes, and
-    // the one in use survives.
+    // Neither inactive view fits under this budget, so both go.
     let outcome = collect(&config.target.root, Some(10), None, false).unwrap();
 
-    assert_eq!(outcome.removed_live_views, 1);
-    assert!(!old.exists(), "the idle view is collected");
-    assert!(new.exists(), "the view in use is kept");
+    assert_eq!(outcome.removed_live_views, 2);
+    assert!(!old.exists(), "the older view is collected");
+    assert!(!new.exists(), "the newest inactive view is collected");
 }
 
 #[test]
-fn a_newer_abandoned_view_does_not_spend_the_live_view_s_protection() {
+fn gone_targets_are_collected_before_live_targets_are_sized() {
     let directory = tempfile::tempdir().unwrap();
     let config = test_config(directory.path(), true);
     let working = checkout(directory.path(), "working");
@@ -826,14 +825,13 @@ fn a_newer_abandoned_view_does_not_spend_the_live_view_s_protection() {
     let abandoned_view = place(&config, &abandoned, &abandoned.join("target"), false).unwrap();
     std::fs::write(working_view.join("artifact"), vec![0_u8; 100]).unwrap();
     std::fs::write(abandoned_view.join("artifact"), vec![0_u8; 100]).unwrap();
-    // The abandoned checkout was built more recently than the one still in
-    // use, so it sorts last -- it must not take the protected place, because
-    // it is being deleted either way.
+    // Gone state is removed regardless of recency; the remaining live view
+    // fits the budget on its own.
     age_view(&config.target.root, &working, 1);
     age_view(&config.target.root, &abandoned, 2);
     std::fs::remove_dir_all(&abandoned).unwrap();
 
-    let outcome = collect(&config.target.root, Some(10), None, false).unwrap();
+    let outcome = collect(&config.target.root, Some(100), None, false).unwrap();
 
     assert!(!abandoned_view.exists(), "the abandoned view is collected");
     assert!(
@@ -853,8 +851,7 @@ fn an_abandoned_checkout_is_collected_even_as_the_newest_view() {
     std::fs::write(managed.join("artifact"), vec![0_u8; 100]).unwrap();
     std::fs::remove_dir_all(&workspace).unwrap();
 
-    // Protecting the newest view is about budgets, not about outputs nothing
-    // can ask for again.
+    // Gone state is removed regardless of recency.
     let outcome = collect(&config.target.root, Some(10), None, false).unwrap();
 
     assert_eq!(outcome.removed_stale_views, 1);
@@ -1330,16 +1327,16 @@ fn over_budget_takes_evict_first_targets_before_older_ones_and_never_kept_ones()
     assert!(kept.1.exists());
     assert!(newest.1.exists());
 
-    // Nothing but the kept one and the most recent left to take.
+    // Only the explicitly kept target survives a zero-byte budget.
     let outcome = collect_by(&config.target.root, Some(0), None, &precedence, false).unwrap();
-    assert_eq!(outcome.removed_views, 1);
+    assert_eq!(outcome.removed_views, 2);
     assert!(!human.1.exists());
     assert!(kept.1.exists(), "a kept target is never collected for size");
-    assert!(newest.1.exists(), "the most recently used one is spared");
+    assert!(!newest.1.exists());
 }
 
 #[test]
-fn the_most_recent_target_is_spared_even_when_it_is_evict_first() {
+fn the_most_recent_target_is_collected_when_it_is_evict_first() {
     let directory = tempfile::tempdir().unwrap();
     let config = test_config(directory.path(), true);
     let [_, agent, human, newest] = ranked_views(directory.path(), &config);
@@ -1350,10 +1347,10 @@ fn the_most_recent_target_is_spared_even_when_it_is_evict_first() {
 
     let outcome = collect_by(&config.target.root, Some(0), None, &precedence, false).unwrap();
 
-    assert_eq!(outcome.removed_views, 3);
+    assert_eq!(outcome.removed_views, 4);
     assert!(!agent.1.exists());
     assert!(!human.1.exists());
-    assert!(newest.1.exists());
+    assert!(!newest.1.exists());
 }
 
 #[test]

@@ -209,7 +209,7 @@ A size such as `50GiB` counts logical bytes across the action store, managed tar
 
 Free space to keep on the disks that hold the cache directory and managed targets, or `"none"`.
 
-Below it, sweeps run more often and collect private state, generated source trees, managed targets, and shared store objects past their budgets to free the shortfall. Active and most recently used state stays, so the disk can remain short.
+Below it, sweeps run more often and collect private state, generated source trees, managed targets, and shared store objects past their budgets to free the shortfall. Active state and explicitly kept targets stay, so the disk can remain short.
 
 ### `http.download_timeout`
 
@@ -662,7 +662,7 @@ Collect managed targets, and build units inside them, unused this long, or `"non
 
 Size budget for managed targets, or `"none"`.
 
-Over budget, mbx collects managed targets least recently used first and keeps the most recently used one.
+Over budget, mbx collects inactive managed targets least recently used first. Use `target.keep` to protect specific checkouts.
 
 ### `target.root`
 

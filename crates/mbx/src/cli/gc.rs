@@ -1465,7 +1465,7 @@ fn target_limit(
 
 /// Say when collection could not bring a disk back above its minimum.
 ///
-/// Active and most-recently-used state is protected, so a disk filled by
+/// Active state and explicitly kept targets are protected, so a disk filled by
 /// something else can stay short after collection has removed everything it
 /// is allowed to remove.
 fn warn_if_still_low(config: &Config, retention: &RetentionSettings) {
@@ -1477,7 +1477,7 @@ fn warn_if_still_low(config: &Config, retention: &RetentionSettings) {
         .flatten();
     for disk in cache.into_iter().chain(target) {
         log::warn!(
-            "the disk holding {} still has {} free after collection, under the {} minimum; collection removed everything it is allowed to remove (active or most-recently-used state is kept), so something else may be using the disk",
+            "the disk holding {} still has {} free after collection, under the {} minimum; collection removed everything it is allowed to remove (active state and explicitly kept targets are retained), so something else may be using the disk",
             disk.path.display(),
             ByteSize::b(disk.available).display().iec(),
             ByteSize::b(disk.min_free).display().iec(),
@@ -1514,7 +1514,7 @@ fn total_budget_warning(
     }
     let verb = if dry_run { "would remain" } else { "remain" };
     Some(format!(
-        "{} logical {verb} after collection, over gc.max_total_size ({}); active, most-recently-used, kept, or untracked state can prevent reaching this collection target",
+        "{} logical {verb} after collection, over gc.max_total_size ({}); active, kept, or untracked state can prevent reaching this collection target",
         ByteSize::b(remaining).display().iec(),
         ByteSize::b(budget).display().iec(),
     ))

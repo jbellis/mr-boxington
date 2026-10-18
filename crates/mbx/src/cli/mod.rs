@@ -148,7 +148,7 @@ enum Commands {
     /// collects past those budgets to free
     /// the shortfall: private state and managed targets go first, then shared
     /// store objects, even below `gc.max_size`. Active state, held incremental
-    /// locks, and the most recent target stay, so a disk filled by something
+    /// locks, and explicitly kept targets stay, so a disk filled by something
     /// else can remain short.
     ///
     /// An evicted object is rebuilt when a build needs it again.

@@ -566,8 +566,8 @@ struct RawTarget {
     root: Option<PathBuf>,
     /// Size budget for managed targets, or `"none"`.
     ///
-    /// Over budget, mbx collects managed targets least recently used first and
-    /// keeps the most recently used one.
+    /// Over budget, mbx collects inactive managed targets least recently used
+    /// first. Use `target.keep` to protect specific checkouts.
     #[usage(
         env = "MBX_TARGET_MAX_SIZE",
         default_note = "10% of the target disk, from 10 GiB to 100 GiB; shared budget when `gc.max_total_size` is set"
@@ -641,8 +641,8 @@ struct RawGc {
     ///
     /// Below it, sweeps run more often and collect private state, generated
     /// source trees, managed targets, and shared store objects past their
-    /// budgets to free the shortfall. Active and most recently used state
-    /// stays, so the disk can remain short.
+    /// budgets to free the shortfall. Active state and explicitly kept targets
+    /// stay, so the disk can remain short.
     #[usage(
         env = "MBX_GC_MIN_FREE_SIZE",
         default_note = "10% of each disk, from 5 GiB to 50 GiB"

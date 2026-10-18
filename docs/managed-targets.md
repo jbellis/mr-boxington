@@ -330,8 +330,9 @@ A target directory is removed when any of these is true:
   in that checkout can restore matching cached outputs. Evicted or unsupported
   work must compile again.
 - The managed targets together exceed `target.max_size`. The least recently
-  used go first. The most recently used directory is never collected for being
-  over budget; if the budget cannot be met without it, mbx keeps it and warns.
+  used go first, including the most recent directory if needed. Active builds
+  and `target.keep` protect targets; if protected state prevents meeting the
+  budget, mbx warns.
 - The disk is low on space. See [When the disk runs low](#when-the-disk-runs-low).
 
 [Keep or evict specific checkouts](#keep-or-evict-specific-checkouts) changes
@@ -350,9 +351,9 @@ costs a recompile.
 
 ### Unused build units
 
-A checkout in regular use keeps its target directory, but Cargo leaves the
-previous build units behind whenever a lockfile update, feature change, or
-toolchain update moves its builds on to new ones. Collection also removes
+Within a retained target directory, Cargo leaves previous build units behind
+whenever a lockfile update, feature change, or toolchain update moves its builds
+on to new ones. Collection also removes
 those units once no build has used them for `target.max_age` plus a day:
 
 - With Cargo 1.100 or later, each unit is its own directory,
@@ -412,8 +413,7 @@ With the example above, `~/src/app` is kept and its agent worktrees under
 `~/src/app/.claude/worktrees` are evicted first. A tie keeps.
 
 Evict-first targets are collected least recently used first, ahead of the rest.
-The most recently used target directory is still spared, whichever list it is
-on. Kept targets count toward `target.max_size`, so the other checkouts' targets
+Kept targets count toward `target.max_size`, so the other checkouts' targets
 make room for them.
 
 `mbx settings set` and the environment variables take comma-separated lists:
@@ -445,9 +445,8 @@ private state and shared cache data regardless of the budgets:
 3. Shared cache objects on the cache disk, after the private state and managed
    targets stop freeing bytes.
 
-The most recently used target directory, and anything a running mbx command
-is using, is kept as usual. The shared action store can go below `gc.max_size`
-when the cache disk is short, because keeping the build machine usable takes
+Running commands' state and explicitly kept targets stay. The shared action
+store can go below `gc.max_size` when the cache disk is short, because keeping the build machine usable takes
 precedence over retaining every shared result. If collection cannot free
 enough, mbx logs a warning and leaves the rest to you. The next build reports
 what was removed and why:

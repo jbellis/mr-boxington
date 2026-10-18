@@ -5,7 +5,7 @@
 
 Collect build state and evict store objects to fit the size budgets.
 
-mbx collects learned incremental units and managed targets first, then evicts store objects until the action store fits its budget (`--max-size`, or `gc.max_size` by default, lowered when `gc.max_total_size` leaves less room). Under a combined budget, incremental state and generated source trees default to a cap of 10% of the total, at least 10 GiB but never above the total. When a disk has less free space than `gc.min_free_size`, mbx also collects past those budgets to free the shortfall: private state and managed targets go first, then shared store objects, even below `gc.max_size`. Active state, held incremental locks, and the most recent target stay, so a disk filled by something else can remain short.
+mbx collects learned incremental units and managed targets first, then evicts store objects until the action store fits its budget (`--max-size`, or `gc.max_size` by default, lowered when `gc.max_total_size` leaves less room). Under a combined budget, incremental state and generated source trees default to a cap of 10% of the total, at least 10 GiB but never above the total. When a disk has less free space than `gc.min_free_size`, mbx also collects past those budgets to free the shortfall: private state and managed targets go first, then shared store objects, even below `gc.max_size`. Active state, held incremental locks, and explicitly kept targets stay, so a disk filled by something else can remain short.
 
 An evicted object is rebuilt when a build needs it again.
 

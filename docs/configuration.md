@@ -193,8 +193,8 @@ based on measured rebuild cost.
 The budget is a **logical-byte collection target**, not a physical disk quota.
 Shared blocks can make physical usage smaller, while metadata, session history,
 and temporary files add overhead outside the budget. Builds can exceed the
-budget between sweeps. Active builds, held incremental session locks, the most recently used target,
-explicitly kept targets, and untracked state can also prevent collection from reaching it;
+budget between sweeps. Active builds, held incremental session locks, explicitly
+kept targets, and untracked state can also prevent collection from reaching it;
 mbx warns when the combined remainder exceeds the budget. If a component cannot
 be measured, mbx reports that the combined budget could not be verified and
 conservatively gives the action store no remaining allowance. Use

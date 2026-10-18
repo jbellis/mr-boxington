@@ -1469,24 +1469,10 @@ fn collect_with(
         && remaining > max_bytes
     {
         entries.sort_by_key(|entry| entry.2);
-        // Only the views the passes above left alone. An abandoned or expired
-        // one is going regardless, so letting it hold the protected place below
-        // would spend that protection on a directory already being deleted.
         let mut candidates: Vec<&(PathBuf, PathBuf, u64, u64, bool, Standing)> = entries
             .iter()
-            .filter(|entry| !selected.contains(&entry.0))
+            .filter(|entry| !selected.contains(&entry.0) && entry.5 != Standing::Keep)
             .collect();
-        // Spare the most recently used of them: that is the checkout somebody
-        // is almost certainly working in, very likely the one whose build just
-        // called this. Deleting it cannot hold the total down anyway, because
-        // the next build recreates it, so a budget smaller than one working
-        // target directory would otherwise delete those outputs after every
-        // build forever. An evict-first checkout gets the same protection,
-        // since an agent's build in its worktree is as current as any. A kept
-        // one that is most recent already has more, and spends this place, so
-        // it does not pass to an older target.
-        candidates.pop();
-        candidates.retain(|entry| entry.5 != Standing::Keep);
         // Stable, so each standing stays oldest-first.
         candidates.sort_by_key(|entry| entry.5);
         for entry in candidates {
@@ -1498,16 +1484,8 @@ fn collect_with(
             }
         }
         if remaining > max_bytes {
-            // Say so rather than delete the last directory standing: the
-            // budget cannot be met, and the user is the only one who can
-            // decide whether to raise it or keep fewer checkouts.
-            let kept = if entries.iter().any(|entry| entry.5 == Standing::Keep) {
-                " and those in target.keep are"
-            } else {
-                " is"
-            };
             log::warn!(
-                "managed target directories still hold {} after collection, over the {} budget; the most recently used one{kept} kept",
+                "managed target directories still hold {} after collection, over the {} budget; protected or untracked targets are kept",
                 bytesize::ByteSize::b(remaining).display().iec(),
                 bytesize::ByteSize::b(max_bytes).display().iec(),
             );
