@@ -924,6 +924,8 @@ pub(crate) fn average_cores(cpu: Duration, wall: Duration) -> u64 {
 
 // Explicit shared-pool budgets describe the host. Keep the process's own
 // CPU/cgroup budget as a second ceiling across every build in its domain.
+// A memory budget that fits in local memory is a local budget: it applies as
+// configured, so only a larger one is held to 85% of the local memory.
 fn domain_capacity(capacity: u64, bytes_per_permit: u64) -> u64 {
     local_ceiling(
         capacity,
@@ -939,7 +941,14 @@ fn local_ceiling(capacity: u64, bytes_per_permit: u64, cpus: u64, memory: Option
     let memory = if bytes_per_permit == 0 {
         capacity
     } else {
-        memory.map_or(capacity, |bytes| (bytes / 100 * 85) / bytes_per_permit)
+        memory.map_or(capacity, |bytes| {
+            let budget = capacity.saturating_mul(bytes_per_permit);
+            if budget > bytes {
+                (bytes / 100 * 85) / bytes_per_permit
+            } else {
+                capacity
+            }
+        })
     };
     capacity.min(cpus).min(memory).max(1)
 }

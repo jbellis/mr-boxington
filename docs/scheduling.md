@@ -103,12 +103,14 @@ cpus = 64
 memory = "256GiB"
 ```
 
-mbx also enforces a separate ceiling for each container, based on its available
-CPUs and 85% of its memory limit. All builds in that container share the ceiling;
-other containers draw from their own ceilings and the common host pool. Pressure
-control remains local to each container. During an upgrade, older compiler
-leases without a container identity count against every container until they
-finish. Patched wrappers also account for the permit units of builds started
+mbx also enforces a separate ceiling for each container. The ceiling is the
+container's available CPUs and, when the configured memory budget exceeds the
+container's memory limit, 85% of that limit. A memory budget that fits within
+local memory applies as configured. All builds in that container share the
+ceiling; other containers draw from their own ceilings and the common host pool.
+Pressure control remains local to each container. During an upgrade, older
+compiler leases without a container identity count against every container
+until they finish. Patched wrappers also account for the permit units of builds started
 before a budget change, conservatively preserving their CPU charges. Upgrade
 all wrappers sharing the pool to get ordered admission.
 

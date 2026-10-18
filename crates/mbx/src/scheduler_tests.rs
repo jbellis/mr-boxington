@@ -1738,6 +1738,38 @@ fn the_local_ceiling_is_the_smallest_of_pool_cpus_and_memory() {
 }
 
 #[test]
+fn an_explicit_local_memory_budget_keeps_its_full_capacity() {
+    // 93.5% of local memory, as in the reported 120-CPU example.
+    let budget = 98_590_438_452;
+    let local_memory = 105_444_319_232;
+    let bytes_per_permit = budget / 120;
+    assert_eq!(
+        local_ceiling(120, bytes_per_permit, 120, Some(local_memory)),
+        120
+    );
+}
+
+#[test]
+fn a_budget_equal_to_local_memory_keeps_its_full_capacity() {
+    let local_memory = 100 * GIB;
+    let bytes_per_permit = local_memory / 10;
+    assert_eq!(
+        local_ceiling(10, bytes_per_permit, 10, Some(local_memory)),
+        10
+    );
+}
+
+#[test]
+fn a_budget_above_local_memory_uses_the_85_percent_ceiling() {
+    let local_memory = 100 * GIB;
+    let bytes_per_permit = local_memory / 10 + 1;
+    assert_eq!(
+        local_ceiling(10, bytes_per_permit, 10, Some(local_memory)),
+        8
+    );
+}
+
+#[test]
 fn a_container_smaller_than_one_memory_permit_still_admits_one_compilation() {
     assert_eq!(local_ceiling(16, 8 * GIB, 8, Some(4 * GIB)), 1);
 }
