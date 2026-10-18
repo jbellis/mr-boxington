@@ -138,13 +138,12 @@ fn append(dir: &Path, mut observation: Observation) -> Result<()> {
             std::fs::rename(&path, dir.join(PREVIOUS))?;
         }
     }
+    // Shorten every long identity the same way on every line, whatever the
+    // rest of the line holds, so one key is never split between spellings.
+    compact(&mut observation.name)?;
+    compact(&mut observation.key)?;
+    compact(&mut observation.pressure_domain)?;
     let mut line = serde_json::to_vec(&observation)?;
-    if line.len() >= 1023 {
-        compact(&mut observation.name)?;
-        compact(&mut observation.key)?;
-        compact(&mut observation.pressure_domain)?;
-        line = serde_json::to_vec(&observation)?;
-    }
     line.push(b'\n');
     eyre::ensure!(line.len() < 1024, "observation exceeds line size limit");
     let mut file = std::fs::OpenOptions::new()
@@ -342,7 +341,7 @@ impl Summary {
                 overall.oom_killed_exceeded,
                 overall.other_exceeded,
             ),
-            "  Median, p90 and unused memory count only successful compiles that ran without another wrapper.".into(),
+            "  Median, p90 and unused memory count only successful runs with a measured peak that ran without another wrapper.".into(),
         ];
         let mut keys: Vec<_> = self.keys.iter().collect();
         keys.sort_by(|a, b| {
@@ -748,6 +747,23 @@ mod tests {
         let summary = Summary::read(dir.path());
         assert_eq!(summary.keys[0].median_peak_predicted_ratio, Some(2.5));
         assert_eq!(summary.keys[0].p90_peak_predicted_ratio, Some(4.0));
+    }
+
+    #[test]
+    fn a_long_key_is_shortened_the_same_way_on_every_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = format!("crate [compile {}]", "x".repeat(200));
+        let mut short_line = observation(Some(1), "success", 1);
+        short_line.key.clone_from(&key);
+        let mut long_line = observation(Some(u64::MAX), "success", u64::MAX);
+        long_line.key.clone_from(&key);
+        long_line.mbx_version = "v".repeat(300);
+        append(dir.path(), short_line).unwrap();
+        append(dir.path(), long_line).unwrap();
+        let summary = Summary::read(dir.path());
+        assert_eq!(summary.keys.len(), 1);
+        assert_eq!(summary.keys[0].counts.n, 2);
+        assert!(summary.keys[0].key.len() < key.len());
     }
 
     #[test]

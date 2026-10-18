@@ -105,7 +105,8 @@ can temporarily allow growth; concurrent appends and rotation can lose a few lin
 Observation failures are debug-logged and do not prevent the workload from running.
 
 The estimate-accuracy section of `mbx stats --scheduler` reads both generations,
-ignoring malformed lines, and states the retained time span as Unix milliseconds.
+ignoring malformed lines, and shows the retained time span as UTC dates and
+times. Timestamp fields in `--json` are Unix milliseconds.
 It shows total observations, reservation exceedances, the worst peak/reservation
 ratio and its timestamp, and the 20 keys with the highest worst-case ratios.
 `--json` includes all keys, counts, highest peaks, median and nearest-rank p90
