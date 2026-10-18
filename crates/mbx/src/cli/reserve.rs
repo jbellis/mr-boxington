@@ -50,12 +50,16 @@ fn run_direct(config: &Config, args: ReserveArgs) -> Result<ExitCode> {
     let Some(pool) = crate::scheduler::reservation_pool(config, args.priority) else {
         eyre::bail!("reserve needs scheduler.enabled")
     };
-    let _permit = pool.reserve(args.cpus, args.memory.map(|memory| memory.as_u64()))?;
+    let (permit, admission) =
+        pool.reserve_observed(args.cpus, args.memory.map(|memory| memory.as_u64()))?;
     let status = external_command(program, arguments)
         // Nested mbx work is covered by this reservation. Letting its compiler
         // shims take new permits would deadlock when this lease fills the pool.
         .status()
-        .wrap_err_with(|| format!("failed to run {program}"))?;
+        .wrap_err_with(|| format!("failed to run {program}"));
+    drop(permit);
+    pool.observe_reservation(admission, status.as_ref().ok());
+    let status = status?;
     Ok(exit_code(status))
 }
 
