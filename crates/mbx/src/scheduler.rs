@@ -942,6 +942,8 @@ fn local_ceiling(capacity: u64, bytes_per_permit: u64, cpus: u64, memory: Option
         capacity
     } else {
         memory.map_or(capacity, |bytes| {
+            // The budget admission enforces. Permit rounding puts it fewer
+            // than `capacity` bytes below the configured value.
             let budget = capacity.saturating_mul(bytes_per_permit);
             if budget > bytes {
                 (bytes / 100 * 85) / bytes_per_permit
