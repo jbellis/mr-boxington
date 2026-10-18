@@ -213,10 +213,11 @@ pub(crate) struct RawConfig {
     /// How much learned incremental state one crate may keep, or `"none"`.
     ///
     /// State past this is discarded before the crate compiles again.
+    /// Defaults to 8 GiB even when `gc.max_total_size` is set.
     #[usage(
         key = "learned_incremental_max_size",
         env = "MBX_LEARNED_INCREMENTAL_MAX_SIZE",
-        default_note = "8 GiB, or `gc.max_total_size` when set"
+        default_note = "8 GiB"
     )]
     learned_incremental_max_size: Option<String>,
     /// Cap on the per-compilation history one build records, or `"none"`.
@@ -621,8 +622,10 @@ struct RawGc {
     ///
     /// A size such as `50GiB` counts logical bytes across the action store,
     /// managed targets, learned incremental state, and generated source trees.
-    /// When set, it replaces the disk-scaled defaults of the component budgets;
-    /// explicit component limits still apply. Active and protected state may
+    /// When set, it replaces disk-scaled defaults and caps incremental state and
+    /// generated source trees at 10% of the total, at least 10 GiB but never
+    /// above the total, unless `gc.incremental_max_size` is explicit.
+    /// Explicit component limits still apply. Active and protected state may
     /// exceed this target.
     #[usage(env = "MBX_GC_MAX_TOTAL_SIZE")]
     max_total_size: Option<String>,
@@ -632,9 +635,11 @@ struct RawGc {
     /// Over budget, mbx collects the incremental state of inactive checkouts
     /// least recently used first and keeps the most recently used checkout's.
     /// Generated source trees get whatever budget incremental state leaves.
+    /// With `gc.max_total_size`, defaults to 10% of that total, at least
+    /// 10 GiB but never above the total.
     #[usage(
         env = "MBX_GC_INCREMENTAL_MAX_SIZE",
-        default_note = "5% of the cache disk, from 10 GiB to 100 GiB; shared budget when `gc.max_total_size` is set"
+        default_note = "5% of the cache disk, from 10 GiB to 100 GiB; with `gc.max_total_size`, 10% of the total, at least 10 GiB but never above the total"
     )]
     incremental_max_size: Option<String>,
     /// Collect learned incremental state unused this long, or `"none"`.
@@ -1324,9 +1329,10 @@ impl Config {
             target_max_age: parse_optional_duration(&raw.target.max_age)
                 .wrap_err(Invalid("target.max_age"))?,
             incremental_max_bytes: incremental_budget.unwrap_or_else(|| {
-                total_budget
-                    .is_none()
-                    .then(|| INCREMENTAL_BUDGET.resolve(store_disk))
+                Some(total_budget.map_or_else(
+                    || INCREMENTAL_BUDGET.resolve(store_disk),
+                    |total| total.min((total / 10).max(INCREMENTAL_BUDGET.floor)),
+                ))
             }),
             incremental_max_age: parse_optional_duration(&raw.gc.incremental_max_age)
                 .wrap_err(Invalid("gc.incremental_max_age"))?,
@@ -1471,9 +1477,7 @@ impl Config {
                     .map(parse_optional_byte_size)
                     .transpose()
                     .wrap_err(Invalid("learned_incremental_max_size"))?
-                    .unwrap_or(Some(
-                        total_budget.unwrap_or(DEFAULT_LEARNED_INCREMENTAL_MAX_SIZE),
-                    )),
+                    .unwrap_or(Some(DEFAULT_LEARNED_INCREMENTAL_MAX_SIZE)),
                 cache_links: raw.cache_links,
                 events_max_size: parse_optional_byte_size(&raw.events_max_size)
                     .wrap_err(Invalid("events_max_size"))?,
@@ -2447,18 +2451,27 @@ mod tests {
 
     #[test]
     fn a_total_budget_replaces_only_implicit_size_limits() {
-        for total in [1, 100] {
-            let value = format!("{total}GiB");
+        for (total, incremental) in [
+            (10 * 1024 * GIB, 1024 * GIB),
+            (100 * GIB, 10 * GIB),
+            (50 * GIB, 10 * GIB),
+            (8 * GIB, 8 * GIB),
+            (123 * GIB + 7, (123 * GIB + 7) / 10),
+        ] {
+            let value = format!("{total}B");
             let (config, settings) =
                 configured_measuring(None, &[("MBX_GC_MAX_TOTAL_SIZE", &value)], |_| {
                     panic!("a total budget needs no disk-scaled defaults")
                 })
                 .unwrap();
-            assert_eq!(config.gc.max_bytes, total * GIB);
-            assert_eq!(settings.retention.max_total_bytes, Some(total * GIB));
+            assert_eq!(config.gc.max_bytes, total);
+            assert_eq!(settings.retention.max_total_bytes, Some(total));
             assert_eq!(settings.retention.target_max_bytes, None);
-            assert_eq!(settings.retention.incremental_max_bytes, None);
-            assert_eq!(settings.learned_incremental_max_size, Some(total * GIB));
+            assert_eq!(settings.retention.incremental_max_bytes, Some(incremental));
+            assert_eq!(
+                settings.learned_incremental_max_size,
+                Some(DEFAULT_LEARNED_INCREMENTAL_MAX_SIZE)
+            );
             assert_eq!(settings.retention.min_free, Some(MinFree::ShareOfDisk));
             assert_eq!(
                 settings.retention.target_max_age,

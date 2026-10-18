@@ -487,7 +487,9 @@ For one setting covering all managed build data, use `gc.max_total_size` alone:
 max_total_size = "50GiB"
 ```
 
-This replaces implicit component size caps with a shared logical-byte budget.
+This replaces disk-scaled component caps with a shared logical-byte budget;
+learned incremental state and generated source trees default to a cap of 10%
+of the total, at least 10 GiB but never above the total.
 Explicit component caps still apply. See
 [Single cache budget](/configuration#single-cache-budget) for allocation order,
 protected state, and physical-space limitations. The following example instead

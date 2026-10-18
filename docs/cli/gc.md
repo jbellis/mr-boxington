@@ -5,14 +5,14 @@
 
 Collect build state and evict store objects to fit the size budgets.
 
-mbx collects learned incremental state and managed targets first, then evicts store objects until the action store fits its budget (`--max-size`, or `gc.max_size` by default, lowered when `gc.max_total_size` leaves less room). When a disk has less free space than `gc.min_free_size`, mbx also collects past those budgets to free the shortfall: private state and managed targets go first, then shared store objects, even below `gc.max_size`. Active and most recently used state stays, so a disk filled by something else can remain short.
+mbx collects learned incremental state and managed targets first, then evicts store objects until the action store fits its budget (`--max-size`, or `gc.max_size` by default, lowered when `gc.max_total_size` leaves less room). Under a combined budget, incremental state and generated source trees default to a cap of 10% of the total, at least 10 GiB but never above the total. When a disk has less free space than `gc.min_free_size`, mbx also collects past those budgets to free the shortfall: private state and managed targets go first, then shared store objects, even below `gc.max_size`. Active and most recently used state stays, so a disk filled by something else can remain short.
 
 An evicted object is rebuilt when a build needs it again.
 
 ## Flags
 - **`--max-size <SIZE>`** — Size the action store may occupy afterwards, such as `20GiB`.
 
-  Defaults to `gc.max_size`. Managed targets, learned incremental state, and generated source trees are still collected to their own budgets. With `gc.max_total_size` set, they share what is left of that total after the action store, whose share this flag caps.
+  Defaults to `gc.max_size`. Managed targets, learned incremental state, and generated source trees are still collected to their own budgets. With `gc.max_total_size` set, incremental state and generated source trees default to a cap of 10% of the total, at least 10 GiB but never above the total; managed targets use what remains after them and the action store, whose share this flag caps.
 - **`--json`** — Print a stable machine-readable report.
 - **`--dry-run`** — Show what collection would remove without changing any files.
 
