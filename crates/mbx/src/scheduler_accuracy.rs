@@ -100,6 +100,7 @@ impl Pool {
         cpus: Option<u64>,
         memory_bytes: Option<u64>,
     ) -> Result<(super::Permit, Admission)> {
+        let weight = self.reservation_weight(cpus, memory_bytes)?;
         let requested_at = Instant::now();
         let permit = self.reserve(cpus, memory_bytes)?;
         let wait_ms = requested_at
@@ -107,14 +108,10 @@ impl Pool {
             .as_millis()
             .try_into()
             .unwrap_or(u64::MAX);
-        let cpu_weight = cpus.unwrap_or(0);
-        let memory_weight = memory_bytes
-            .map(|memory| memory.div_ceil(self.bytes_per_permit))
-            .unwrap_or(0);
         Ok((
             permit,
             Admission {
-                weight: cpu_weight.max(memory_weight),
+                weight,
                 predicted: None,
                 source: "reservation",
                 wait_ms,

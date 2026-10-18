@@ -1142,7 +1142,12 @@ impl Pool {
     /// Unlike compiler admission this propagates scheduler errors: silently
     /// running an explicitly reserved command without its reservation would
     /// defeat the command's purpose.
-    pub(crate) fn reserve(&self, cpus: Option<u64>, memory_bytes: Option<u64>) -> Result<Permit> {
+    /// The permits a reservation of `cpus` and `memory_bytes` holds.
+    pub(crate) fn reservation_weight(
+        &self,
+        cpus: Option<u64>,
+        memory_bytes: Option<u64>,
+    ) -> Result<u64> {
         let cpu_weight = cpus.unwrap_or(0);
         let memory_weight = match memory_bytes {
             Some(_) if self.bytes_per_permit == 0 => {
@@ -1155,6 +1160,11 @@ impl Pool {
         if weight == 0 {
             eyre::bail!("reserve needs --cpus, --memory, or both")
         }
+        Ok(weight)
+    }
+
+    pub(crate) fn reserve(&self, cpus: Option<u64>, memory_bytes: Option<u64>) -> Result<Permit> {
+        let weight = self.reservation_weight(cpus, memory_bytes)?;
 
         let started = Instant::now();
         let mut delay = POLL_INITIAL;
