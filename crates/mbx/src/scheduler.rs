@@ -422,6 +422,8 @@ struct Waiting {
     priority: String,
     domain: String,
     domain_capacity: u64,
+    #[serde(default)]
+    global_capacity: Option<u64>,
     bytes_per_permit: u64,
     build: Option<(String, u64)>,
 }
@@ -633,13 +635,23 @@ fn admission_decision<'a>(
             weight_in_units(request.weight, request.bytes_per_permit, unit),
         )
     };
-    // Global capacity is always shared. Domain and build ceilings may retain
-    // older permit units/limits, so protect each distinct recorded pair too.
+    // Every scope may retain older permit units/limits, so protect each
+    // distinct recorded pair, starting with the request's global budget.
     if !scope_allows(capacity, request.bytes_per_permit, None, None) {
         return AdmissionDecision::Waiting;
     }
+    let mut checked_global =
+        std::collections::BTreeSet::from([(capacity, request.bytes_per_permit)]);
     let mut checked = std::collections::BTreeSet::new();
     for waiter in &older {
+        // Older mbx records lack the global ceiling; retain the request's
+        // capacity as the fallback until those waiters leave the queue.
+        let waiter_capacity = waiter.global_capacity.unwrap_or(capacity);
+        if checked_global.insert((waiter_capacity, waiter.bytes_per_permit))
+            && !scope_allows(waiter_capacity, waiter.bytes_per_permit, None, None)
+        {
+            return AdmissionDecision::Waiting;
+        }
         if waiter.domain == request.domain
             && checked.insert((false, waiter.domain_capacity, waiter.bytes_per_permit))
             && !scope_allows(
@@ -1539,6 +1551,7 @@ impl Pool {
             priority: self.priority.as_str().into(),
             domain: self.pressure_domain.into(),
             domain_capacity: self.domain_capacity,
+            global_capacity: Some(capacity),
             bytes_per_permit: self.bytes_per_permit,
             build: self.build.clone(),
         };

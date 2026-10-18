@@ -2409,6 +2409,7 @@ fn sim_request(
             priority: "normal".into(),
             domain: domain.0.into(),
             domain_capacity: domain.1,
+            global_capacity: None,
             bytes_per_permit: 0,
             build: build.map(|(id, capacity)| (id.into(), capacity)),
         },
@@ -2472,11 +2473,12 @@ impl<'a> AdmissionSimulation<'a> {
     }
 
     fn decision(&self, position: usize) -> AdmissionDecision {
+        let request = &self.requests[self.queue[position]].record;
         admission_decision(
-            self.capacity,
+            request.global_capacity.unwrap_or(self.capacity),
             &self.live,
             self.queue.iter().map(|id| &self.requests[*id].record),
-            &self.requests[self.queue[position]].record,
+            request,
         )
     }
 
@@ -2530,11 +2532,12 @@ impl<'a> AdmissionSimulation<'a> {
                 }
                 // The real decision with an empty older queue still enforces
                 // every physical ceiling, without any overtaking exceptions.
+                let request = &self.requests[self.queue[position]].record;
                 admission_decision(
-                    self.capacity,
+                    request.global_capacity.unwrap_or(self.capacity),
                     &self.live,
                     std::iter::empty(),
-                    &self.requests[self.queue[position]].record,
+                    request,
                 )
             } else {
                 self.decision(position)
@@ -2697,6 +2700,7 @@ fn sim_random(state: &mut u64, low: u64, high: u64) -> u64 {
 
 fn check_random_admission_forks(multi_scope: bool) {
     let mut total_passes = 0;
+    let mut mixed_budget_workloads = 0;
     for seed in 0..512_u64 {
         let mut state = seed + 1;
         let capacity = sim_random(&mut state, 4, 128);
@@ -2778,14 +2782,20 @@ fn check_random_admission_forks(multi_scope: bool) {
                 .min(if arrival == 0 { capacity } else { 3 });
             let weight = sim_random(&mut state, 1, limit);
             let duration = sim_random(&mut state, 1, 50);
-            requests.push(make_request(
-                requests.len() as u64 + 1,
-                arrival,
-                weight,
-                duration,
-                build,
-            ));
+            let mut request =
+                make_request(requests.len() as u64 + 1, arrival, weight, duration, build);
+            request.record.global_capacity = Some(if multi_scope {
+                sim_random(&mut state, weight, capacity)
+            } else {
+                capacity
+            });
+            requests.push(request);
         }
+        let budgets: std::collections::BTreeSet<_> = requests
+            .iter()
+            .map(|request| request.record.global_capacity)
+            .collect();
+        mixed_budget_workloads += usize::from(budgets.len() > 1);
         let (_, passes) = simulate_admission(
             capacity,
             &initial,
@@ -2796,6 +2806,12 @@ fn check_random_admission_forks(multi_scope: bool) {
         total_passes += passes;
     }
     assert!(total_passes > 0, "random workloads must exercise passing");
+    if multi_scope {
+        assert!(
+            mixed_budget_workloads > 0,
+            "random workloads must mix global budgets"
+        );
+    }
 }
 
 #[test]
@@ -2852,4 +2868,61 @@ fn real_queue_protects_both_prefix_counterexamples() {
         }
         drop((admitted, second));
     }
+}
+
+#[test]
+fn passing_protects_the_waiting_processes_smaller_global_budget() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut older = pool_at(directory.path(), 10, 0);
+    let newer = pool_at(directory.path(), 12, 0);
+    // Keep the domain ceiling above both global budgets to isolate the
+    // process's global limit, independent of its container ceiling.
+    older.domain_capacity = 12;
+    let first = newer.try_admit(4, None).unwrap().unwrap();
+    let second = newer.try_admit(4, None).unwrap().unwrap();
+    let mut head = None;
+    assert!(
+        older
+            .try_admit_queued(6, None, &mut head)
+            .unwrap()
+            .is_none()
+    );
+    let waiting = scan_waiters(&directory.path().join(WAITERS_DIR)).unwrap();
+    assert_eq!(waiting.len(), 1);
+    assert_eq!(waiting[0].global_capacity, Some(10));
+    let mut small = None;
+    assert!(
+        newer
+            .try_admit_queued(2, None, &mut small)
+            .unwrap()
+            .is_none()
+    );
+    // Against capacity 12 the passer would have two permits of slack, but
+    // the head's capacity 10 has zero. It starts on this first completion.
+    drop(first);
+    let admitted = older.try_admit_queued(6, None, &mut head).unwrap().unwrap();
+    assert!(head.is_none());
+    drop((admitted, second));
+}
+
+#[test]
+fn old_waiter_records_fall_back_to_the_request_global_capacity() {
+    let legacy: Waiting = serde_json::from_str(
+        r#"{"ticket":1,"weight":6,"priority":"normal","domain":"host","domain_capacity":12,"bytes_per_permit":0,"build":null}"#,
+    ).unwrap();
+    assert_eq!(legacy.global_capacity, None);
+    let live = vec![sim_lease(&sim_request(0, 0, 4, 1, ("host", 12), None).record); 2];
+    let request = sim_request(2, 0, 2, 1, ("host", 12), None).record;
+    assert_eq!(
+        admission_decision(12, &live, [&legacy].into_iter(), &request),
+        AdmissionDecision::Passing
+    );
+    let protected = Waiting {
+        global_capacity: Some(10),
+        ..legacy
+    };
+    assert_eq!(
+        admission_decision(12, &live, [&protected].into_iter(), &request),
+        AdmissionDecision::Waiting
+    );
 }
