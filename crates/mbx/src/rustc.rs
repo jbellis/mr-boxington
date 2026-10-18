@@ -57,6 +57,7 @@ const PRIVATE_ARTIFACT_VERSION: u8 = 1;
 struct LearnedPlan {
     /// Whether this unit has churned often enough to keep incremental state.
     hot: bool,
+    backstop_rejected: bool,
     /// Consecutive changed-content misses, including this one.
     streak: u32,
     /// Where that state lives, once somewhere to put it has been resolved.
@@ -79,6 +80,7 @@ impl LearnedPlan {
             if self.directory.as_ref().is_some_and(|directory| {
                 incremental_state_exceeds_backstop(directory, session::incremental_budget())
             }) {
+                self.backstop_rejected = true;
                 self.hot = false;
                 self.directory = None;
             }
@@ -345,7 +347,10 @@ pub(crate) fn compile(
                 }
             }
             Ok(None) => {
-                learned = plan_learned_reuse(&compilation, &discovered, learned_enabled);
+                // The fast plan already measured this unit for this compile.
+                if !learned.backstop_rejected {
+                    learned = plan_learned_reuse(&compilation, &discovered, learned_enabled);
+                }
             }
             Err(error) => {
                 session::report_shim_warning(&format!("result was not restored: {error:#}"));
@@ -1432,6 +1437,7 @@ fn learned_plan(
     };
     LearnedPlan {
         hot: enabled && streak >= threshold,
+        backstop_rejected: false,
         streak,
         directory: None,
         record: None,
@@ -1816,6 +1822,7 @@ fn reuse_hot_workspace_plan(
         };
         Ok(LearnedPlan {
             hot: true,
+            backstop_rejected: false,
             streak,
             directory: None,
             record: Some((state_path, sources)),
