@@ -7,6 +7,8 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+const SESSION_START_GRACE_SECS: u64 = 60;
+
 const RECORD_FILE: &str = "checkout.json";
 const RECORD_VERSION: u8 = 1;
 const LOCKS_DIR: &str = ".locks";
@@ -161,7 +163,7 @@ pub(crate) fn collect(
         let locks = entry
             .units
             .iter()
-            .map(|unit| unit_locks(&unit.directory))
+            .map(|unit| unit_locks(&unit.directory, dry_run))
             .collect::<Result<Vec<_>>>()?;
         if locks.iter().any(Option::is_none) {
             continue;
@@ -203,7 +205,7 @@ pub(crate) fn collect(
             outcome.skipped_active_units += 1;
             continue;
         }
-        let Some(_locks) = unit_locks(&unit.directory)? else {
+        let Some(_locks) = unit_locks(&unit.directory, dry_run)? else {
             outcome.skipped_active_units += 1;
             continue;
         };
@@ -297,8 +299,9 @@ fn units(directory: &Path) -> Result<Vec<Unit>> {
 
 /// Hold all existing rustc session locks through deletion; a held lock means
 /// the unit is in use. Never wait for a compiler while collecting.
-fn unit_locks(directory: &Path) -> Result<Option<Vec<fslock::LockFile>>> {
-    let mut locks = Vec::new();
+fn unit_locks(directory: &Path, dry_run: bool) -> Result<Option<Vec<fslock::LockFile>>> {
+    let now = now_secs();
+    let mut paths = Vec::new();
     let mut pending = vec![directory.to_path_buf()];
     while let Some(directory) = pending.pop() {
         for entry in std::fs::read_dir(directory)? {
@@ -309,13 +312,35 @@ fn unit_locks(directory: &Path) -> Result<Option<Vec<fslock::LockFile>>> {
             }
             let name = entry.file_name();
             let name = name.to_string_lossy();
-            if kind.is_file() && name.starts_with("s-") && name.ends_with(".lock") {
-                let mut lock = fslock::LockFile::open(&entry.path())?;
-                if !lock.try_lock()? {
+            let session = kind.is_dir() && name.starts_with("s-");
+            let lock = kind.is_file() && name.starts_with("s-") && name.ends_with(".lock");
+            if session || lock {
+                let modified = entry
+                    .metadata()?
+                    .modified()?
+                    .duration_since(UNIX_EPOCH)
+                    .map_or(now, |time| time.as_secs());
+                // rustc creates its lock file before flocking it. Do not win
+                // that race against a starting compiler; a unit used within
+                // the last minute is not an eviction candidate anyway.
+                if now.saturating_sub(modified) <= SESSION_START_GRACE_SECS {
                     return Ok(None);
                 }
-                locks.push(lock);
             }
+            if lock {
+                paths.push(entry.path());
+            }
+        }
+    }
+    let mut locks = Vec::new();
+    // A preview must never take a compiler's lock, even momentarily.
+    if !dry_run {
+        for path in paths {
+            let mut lock = fslock::LockFile::open(&path)?;
+            if !lock.try_lock()? {
+                return Ok(None);
+            }
+            locks.push(lock);
         }
     }
     Ok(Some(locks))
@@ -457,11 +482,21 @@ impl DeletionGuard {
 fn deletion_guard(root: &Path, key: &str, cleanup: bool) -> Result<DeletionGuard> {
     let locks = lock_dir(root, key);
     let registrar_path = registrar_path(root);
-    if !cleanup && !registrar_path.exists() {
+    if !cleanup {
+        // Without acquiring locks a preview cannot distinguish an abandoned
+        // lease from a live one, so conservatively retain either.
+        let active = match std::fs::read_dir(&locks) {
+            Ok(listing) => listing
+                .collect::<std::io::Result<Vec<_>>>()?
+                .iter()
+                .any(|entry| entry.path().extension().is_some_and(|ext| ext == "lease")),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error.into()),
+        };
         return Ok(DeletionGuard {
             _registrar: None,
             locks,
-            active: false,
+            active,
             cleanup,
         });
     }
@@ -1027,9 +1062,14 @@ mod tests {
         let inactive = unit(&state.directory, "inactive", 1);
         let mut lock = fslock::LockFile::open(&active.join("crate-id/s-session.lock")).unwrap();
         lock.lock().unwrap();
+        std::fs::File::open(active.join("crate-id/s-session.lock"))
+            .unwrap()
+            .set_modified(UNIX_EPOCH)
+            .unwrap();
         drop(state.lease);
         let preview = collect(cache.path(), Some(0), None, true).unwrap();
-        assert_eq!(preview.removed_units, 1);
+        assert_eq!(preview.removed_units, 2);
+        assert_eq!(preview.skipped_active_units, 0);
         assert!(inactive.exists());
         let outcome = collect(cache.path(), Some(0), None, false).unwrap();
         assert_eq!(outcome.removed_units, 1);
@@ -1038,6 +1078,35 @@ mod tests {
         assert!(outcome.remaining_bytes > 0);
         assert!(active.exists());
         assert!(!inactive.exists());
+    }
+
+    #[test]
+    fn fresh_sessions_and_unflocked_locks_receive_a_grace_period() {
+        for fresh_lock in [false, true] {
+            let cache = tempfile::tempdir().unwrap();
+            let workspace = tempfile::tempdir().unwrap();
+            let state = touch(cache.path(), workspace.path()).unwrap();
+            let directory = unit(
+                &state.directory,
+                "unit",
+                if fresh_lock { 0 } else { now_secs() },
+            );
+            let lock = directory.join("crate-id/s-session.lock");
+            std::fs::write(&lock, b"").unwrap();
+            if !fresh_lock {
+                std::fs::File::open(&lock)
+                    .unwrap()
+                    .set_modified(UNIX_EPOCH)
+                    .unwrap();
+            }
+            drop(state.lease);
+            for dry_run in [true, false] {
+                let outcome = collect(cache.path(), Some(0), None, dry_run).unwrap();
+                assert_eq!(outcome.skipped_active_units, 1);
+                assert_eq!(outcome.removed_units, 0);
+                assert!(directory.exists());
+            }
+        }
     }
 
     #[test]
@@ -1058,7 +1127,7 @@ mod tests {
         let cache = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let state = touch(cache.path(), workspace.path()).unwrap();
-        unit(&state.directory, "unit", now_secs());
+        unit(&state.directory, "unit", 0);
         std::fs::write(state.directory.join("file-digests.json"), b"bookkeeping").unwrap();
         drop(state.lease);
         workspace.close().unwrap();
