@@ -156,7 +156,7 @@ Sweep after a build when collection is due.
 - **Default:** `30d`
 - **Set with:** `MBX_GC_INCREMENTAL_MAX_AGE`
 
-Collect learned incremental state unused this long, or `"none"`.
+Collect learned incremental units unused this long, or `"none"`.
 
 ### `gc.incremental_max_size`
 
@@ -167,7 +167,7 @@ Collect learned incremental state unused this long, or `"none"`.
 
 Shared budget for learned incremental state and generated source trees, or `"none"`.
 
-Over budget, mbx collects the incremental state of inactive checkouts least recently used first and keeps the most recently used checkout's. Generated source trees get whatever budget incremental state leaves. With `gc.max_total_size`, defaults to 10% of that total, at least 10 GiB but never above the total.
+Over budget, mbx collects inactive incremental units least recently used first, using rustc session directory modification times. Generated source trees get whatever budget incremental state leaves. With `gc.max_total_size`, defaults to 10% of that total, at least 10 GiB but never above the total.
 
 ### `gc.interval`
 
@@ -268,17 +268,6 @@ mbx stops forcing `CARGO_INCREMENTAL=0`, so Cargo's profiles decide: by default,
 Use private incremental state for crates whose sources keep changing.
 
 A workspace crate qualifies on its first source edit; any other crate after three consecutive misses with changed sources. A qualifying crate's outputs, and those of crates that link them, stay out of the shared cache. Off in CI (`CI` set to `1`, `true`, or `yes`), while `incremental` or `eager_incremental` is in effect, and for compilations selected for verification by `MBX_VERIFY` or `verify_sample_rate`.
-
-### `learned_incremental_max_size`
-
-- **Type:** `option<string>`
-- **Optional:** true
-- **Default:** 8 GiB
-- **Set with:** `MBX_LEARNED_INCREMENTAL_MAX_SIZE`
-
-How much learned incremental state one crate may keep, or `"none"`.
-
-State past this is discarded before the crate compiles again. Defaults to 8 GiB even when `gc.max_total_size` is set.
 
 ### `linker.default`
 
