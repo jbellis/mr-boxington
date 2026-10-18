@@ -529,10 +529,14 @@ mod tests {
         if crate::store::same_filesystem_paths(cache.path(), other_fs) {
             return;
         }
-        let parent = tempfile::Builder::new()
+        // An unwritable mount is not a test failure, as in
+        // real_cross_device_probe_warns.
+        let Ok(parent) = tempfile::Builder::new()
             .prefix("mbx-incremental-")
             .tempdir_in(other_fs)
-            .unwrap();
+        else {
+            return;
+        };
         let checkout_parent = parent.path().join("manager");
         std::fs::create_dir(&checkout_parent).unwrap();
         let checkout = checkout_parent.join("checkout");
