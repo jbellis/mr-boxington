@@ -88,11 +88,13 @@ key, build ID, pressure domain, age, and the charge it was really admitted or
 queued with. Older records show unknown names; abandoned records can remain
 visible until an admission reclaims them.
 
-When a compilation cannot fit, it queues before newer requests. New requests
-stop filling the capacity it needs, so a large compilation can run even while
-other builds keep submitting small ones. Cancelling a waiter or killing its
-process releases its queue position. A request waiting for its own build or
-container to drain does not hold up unrelated builds or containers.
+When a compilation cannot fit, it queues before newer requests. Newer requests
+may use capacity a waiting request cannot use when it next becomes able to
+start. Within one scope this never delays an older request. When a request
+waits on its own build or container limit, the existing rule already lets
+other builds or containers start, which can rarely delay the waiting request
+after a pass. Cancelling a waiter or killing its process releases its queue
+position.
 
 Cache hits do not need compiler permits. If a process dies, the kernel
 releases its permits. For the weighting and recovery details, see

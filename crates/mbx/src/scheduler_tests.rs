@@ -1588,14 +1588,24 @@ fn cancelled_and_crashed_waiters_release_their_queue_positions() {
             .unwrap()
             .is_none()
     );
-    assert!(pool.try_admit(1, None).unwrap().is_none());
-    drop(queued.take());
+    // The only live lease returns three permits; the head needs two, so
+    // using the remaining one cannot delay it.
     assert!(pool.try_admit(1, None).unwrap().is_some());
+    drop(queued.take());
     assert!(
-        pool.try_admit_queued(2, None, &mut queued)
+        scan_waiters(&directory.path().join(WAITERS_DIR))
+            .unwrap()
+            .is_empty()
+    );
+    assert!(pool.try_admit(1, None).unwrap().is_some());
+    // A full-pool waiter has zero slack, preserving the crash-recovery
+    // assertion that removing its queue position lets a small request pass.
+    assert!(
+        pool.try_admit_queued(4, None, &mut queued)
             .unwrap()
             .is_none()
     );
+    assert!(pool.try_admit(1, None).unwrap().is_none());
     // Leave the file behind with its lock released, as after process death.
     let mut crashed = queued.take().unwrap();
     drop(crashed._guard.lock.take());
@@ -2263,5 +2273,583 @@ fn scheduler_stats_compile_charges_match_admission_predictions() {
             }
         }
         pool.record_compile(&demand, 81, false, true).unwrap();
+    }
+}
+
+#[test]
+fn idle_capacity_slack_uses_every_possible_completion_subset() {
+    assert!(can_pass_waiters(120, &[54, 54], &[54], 12));
+    assert!(!can_pass_waiters(120, &[54, 54], &[54], 13));
+    assert!(can_pass_waiters(120, &[54, 54, 1], &[54], 11));
+    assert!(!can_pass_waiters(120, &[54, 54, 1], &[54], 12));
+    let mut live = vec![54];
+    live.extend([1; 54]);
+    assert!(!can_pass_waiters(120, &live, &[54], 1));
+}
+
+#[test]
+fn idle_capacity_protects_each_prefix_instead_of_individual_or_summed_heads() {
+    // Individual checks would admit two permits, delaying the second waiter
+    // when the eight-permit lease ends: both older requests need all ten.
+    assert!(!can_pass_waiters(10, &[8], &[6, 4], 2));
+    // Summing the heads would admit one permit, delaying the first waiter
+    // when the six-permit lease ends while the two-permit lease stays live.
+    assert!(!can_pass_waiters(10, &[6, 2], &[8, 1], 1));
+}
+
+#[test]
+fn idle_capacity_bitset_handles_word_boundaries_and_refuses_excessive_work() {
+    assert!(can_pass_waiters(160, &[64, 64], &[64], 32));
+    assert!(!can_pass_waiters(160, &[64, 64], &[64], 33));
+    assert!(can_pass_waiters(65_536, &[65_534], &[1], 1));
+    assert!(!can_pass_waiters(65_537, &[65_535], &[1], 1));
+    assert!(!can_pass_waiters(u64::MAX, &[u64::MAX], &[1], 1));
+    assert!(!can_pass_waiters(4, &[5], &[4], 1));
+    assert!(!can_pass_waiters(4, &[3], &[5], 1));
+    assert!(
+        can_pass_waiters(4, &[], &[], 5),
+        "no waiters leaves admission to fits"
+    );
+}
+
+#[test]
+fn queued_builds_share_only_capacity_they_cannot_use_in_each_scope() {
+    for scope in ["global", "domain", "build"] {
+        let directory = tempfile::tempdir().unwrap();
+        let mut pool = pool_at(
+            directory.path(),
+            if scope == "global" { 120 } else { 240 },
+            0,
+        );
+        pool.domain_capacity = if scope == "domain" { 120 } else { 240 };
+        if scope == "build" {
+            pool.build = Some(("bounded-build".into(), 120));
+        }
+        let first = pool.try_admit(54, None).unwrap().unwrap();
+        let second = pool.try_admit(54, None).unwrap().unwrap();
+        let mut head = None;
+        assert!(
+            pool.try_admit_queued(54, None, &mut head)
+                .unwrap()
+                .is_none(),
+            "{scope}"
+        );
+        let mut newer = None;
+        let small = pool
+            .try_admit_queued(1, None, &mut newer)
+            .unwrap()
+            .expect(scope);
+        assert!(newer.is_none());
+        let additional: Vec<_> = (0..11)
+            .map(|_| {
+                pool.try_admit_queued(1, None, &mut None)
+                    .unwrap()
+                    .expect(scope)
+            })
+            .collect();
+        assert!(pool.try_admit_queued(1, None, &mut None).unwrap().is_none());
+        drop(first);
+        // The passer is still live when the head starts, at exactly the same
+        // completion that would have admitted it without any passing.
+        let admitted = pool
+            .try_admit_queued(54, None, &mut head)
+            .unwrap()
+            .expect(scope);
+        assert!(head.is_none());
+        drop((admitted, small, additional, second));
+    }
+}
+
+#[test]
+fn queued_builds_refuse_passing_when_small_live_leases_can_fill_the_head() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 120, 0);
+    let large = pool.try_admit(54, None).unwrap().unwrap();
+    let small: Vec<_> = (0..54)
+        .map(|_| pool.try_admit(1, None).unwrap().unwrap())
+        .collect();
+    let mut head = None;
+    assert!(
+        pool.try_admit_queued(54, None, &mut head)
+            .unwrap()
+            .is_none()
+    );
+    let mut newer = None;
+    assert!(
+        pool.try_admit_queued(1, None, &mut newer)
+            .unwrap()
+            .is_none()
+    );
+    drop((large, small));
+}
+
+#[derive(Clone)]
+struct SimRequest {
+    arrival: u64,
+    duration: u64,
+    record: Waiting,
+}
+
+fn sim_request(
+    ticket: u64,
+    arrival: u64,
+    weight: u64,
+    duration: u64,
+    domain: (&str, u64),
+    build: Option<(&str, u64)>,
+) -> SimRequest {
+    SimRequest {
+        arrival,
+        duration,
+        record: Waiting {
+            name: None,
+            mode_key: None,
+            ticket,
+            weight,
+            priority: "normal".into(),
+            domain: domain.0.into(),
+            domain_capacity: domain.1,
+            bytes_per_permit: 0,
+            build: build.map(|(id, capacity)| (id.into(), capacity)),
+        },
+    }
+}
+
+fn sim_lease(record: &Waiting) -> Lease {
+    Lease {
+        version: LEASE_VERSION,
+        name: None,
+        mode_key: None,
+        weight: record.weight,
+        priority: record.priority.clone(),
+        build_id: record.build.as_ref().map(|(id, _)| id.clone()),
+        domain: Some(record.domain.clone()),
+        bytes_per_permit: record.bytes_per_permit,
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SimPolicy {
+    Today,
+    TodayOrPass,
+    StrictFifo,
+}
+
+#[derive(Clone)]
+struct AdmissionSimulation<'a> {
+    capacity: u64,
+    now: u64,
+    live: Vec<Lease>,
+    finishes: Vec<u64>,
+    queue: Vec<usize>,
+    requests: &'a [SimRequest],
+    started: Vec<Option<u64>>,
+}
+
+impl<'a> AdmissionSimulation<'a> {
+    fn new(capacity: u64, initial: &[(u64, Waiting)], requests: &'a [SimRequest]) -> Self {
+        Self {
+            capacity,
+            now: 0,
+            live: initial
+                .iter()
+                .map(|(_, record)| sim_lease(record))
+                .collect(),
+            finishes: initial.iter().map(|(finish, _)| *finish).collect(),
+            queue: Vec::new(),
+            requests,
+            started: vec![None; requests.len()],
+        }
+    }
+
+    fn expire(&mut self) {
+        for index in (0..self.live.len()).rev() {
+            if self.finishes[index] <= self.now {
+                self.live.swap_remove(index);
+                self.finishes.swap_remove(index);
+            }
+        }
+    }
+
+    fn decision(&self, position: usize) -> AdmissionDecision {
+        admission_decision(
+            self.capacity,
+            &self.live,
+            self.queue.iter().map(|id| &self.requests[*id].record),
+            &self.requests[self.queue[position]].record,
+        )
+    }
+
+    fn grant(&mut self, position: usize) {
+        let id = self.queue.remove(position);
+        let request = &self.requests[id];
+        self.live.push(sim_lease(&request.record));
+        self.finishes.push(self.now + request.duration);
+        self.started[id] = Some(self.now);
+    }
+
+    fn check_fork(&self, position: usize, strict_fifo: bool) {
+        let mut a = self.clone();
+        let mut b = self.clone();
+        let passer = self.queue[position];
+        a.grant(position);
+        let policy = if strict_fifo {
+            SimPolicy::StrictFifo
+        } else {
+            SimPolicy::Today
+        };
+        a.drain(policy);
+        b.drain(policy);
+        let protected = if strict_fifo {
+            &self.queue[..position]
+        } else {
+            &self.queue[..]
+        };
+        for id in protected {
+            if *id != passer {
+                assert!(
+                    a.started[*id].unwrap() <= b.started[*id].unwrap(),
+                    "passer ticket {} at {} delayed ticket {}: A={:?}, B={:?}",
+                    self.requests[passer].record.ticket,
+                    self.now,
+                    self.requests[*id].record.ticket,
+                    a.started[*id],
+                    b.started[*id],
+                );
+            }
+        }
+    }
+
+    fn step(&mut self, policy: SimPolicy, check_forks: Option<bool>) -> usize {
+        let mut position = 0;
+        let mut passes = 0;
+        while position < self.queue.len() {
+            let decision = if policy == SimPolicy::StrictFifo {
+                if position != 0 {
+                    break;
+                }
+                // The real decision with an empty older queue still enforces
+                // every physical ceiling, without any overtaking exceptions.
+                admission_decision(
+                    self.capacity,
+                    &self.live,
+                    std::iter::empty(),
+                    &self.requests[self.queue[position]].record,
+                )
+            } else {
+                self.decision(position)
+            };
+            if decision == AdmissionDecision::Waiting
+                || (policy == SimPolicy::Today && decision == AdmissionDecision::Passing)
+            {
+                position += 1;
+                continue;
+            }
+            if decision == AdmissionDecision::Passing {
+                passes += 1;
+                if let Some(strict_fifo) = check_forks {
+                    self.check_fork(position, strict_fifo);
+                }
+            }
+            self.grant(position);
+        }
+        passes
+    }
+
+    fn drain(&mut self, policy: SimPolicy) {
+        while !self.queue.is_empty() {
+            self.expire();
+            self.step(policy, None);
+            if !self.queue.is_empty() {
+                self.now = *self
+                    .finishes
+                    .iter()
+                    .min()
+                    .expect("a live lease can unblock the queue");
+            }
+        }
+    }
+}
+
+fn simulate_admission(
+    capacity: u64,
+    initial: &[(u64, Waiting)],
+    requests: &[SimRequest],
+    policy: SimPolicy,
+    check_forks: Option<bool>,
+) -> (Vec<u64>, usize) {
+    let mut simulation = AdmissionSimulation::new(capacity, initial, requests);
+    let mut next = 0;
+    let mut passes = 0;
+    loop {
+        simulation.expire();
+        while next < requests.len() && requests[next].arrival <= simulation.now {
+            simulation.queue.push(next);
+            next += 1;
+        }
+        passes += simulation.step(policy, check_forks);
+        let event = simulation
+            .finishes
+            .iter()
+            .copied()
+            .chain(requests.get(next).map(|request| request.arrival))
+            .min();
+        let Some(event) = event else { break };
+        simulation.now = event;
+    }
+    assert!(simulation.queue.is_empty());
+    (
+        simulation.started.into_iter().map(Option::unwrap).collect(),
+        passes,
+    )
+}
+
+#[test]
+fn ordered_admission_prefix_regressions_keep_original_admission_times() {
+    for (initial, requests) in [
+        (vec![(2, 8), (1, 2)], vec![(0, 6, 5), (0, 4, 5), (1, 2, 10)]),
+        (
+            vec![(2, 6), (10, 2)],
+            vec![(0, 8, 5), (0, 1, 5), (1, 1, 10)],
+        ),
+    ] {
+        let initial: Vec<_> = initial
+            .into_iter()
+            .map(|(end, weight)| (end, sim_request(0, 0, weight, 1, ("host", 10), None).record))
+            .collect();
+        let requests: Vec<_> = requests
+            .into_iter()
+            .enumerate()
+            .map(|(id, (arrival, weight, duration))| {
+                sim_request(id as u64 + 1, arrival, weight, duration, ("host", 10), None)
+            })
+            .collect();
+        let (old, _) = simulate_admission(10, &initial, &requests, SimPolicy::Today, None);
+        let (new, _) =
+            simulate_admission(10, &initial, &requests, SimPolicy::TodayOrPass, Some(false));
+        assert_eq!(new, old);
+    }
+}
+
+#[test]
+fn a_passer_must_protect_the_global_pool_even_when_the_head_is_domain_blocked() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut a = pool_at(directory.path(), 4, 0);
+    a.pressure_domain = "A";
+    let mut b = pool_at(directory.path(), 4, 0);
+    b.pressure_domain = "B";
+    let first = a.try_admit(2, None).unwrap().unwrap();
+    let second = b.try_admit(1, None).unwrap().unwrap();
+    let mut head = None;
+    assert!(a.try_admit_queued(3, None, &mut head).unwrap().is_none());
+    assert!(a.try_admit_queued(1, None, &mut None).unwrap().is_none());
+    drop(first);
+    assert!(a.try_admit_queued(3, None, &mut head).unwrap().is_some());
+    drop(second);
+}
+
+#[test]
+fn today_or_pass_keeps_the_unrelated_domain_admission_at_time_one() {
+    let initial = vec![(3, sim_request(0, 0, 2, 1, ("A", 2), Some(("a", 4))).record)];
+    let requests = vec![
+        sim_request(1, 0, 1, 1, ("A", 2), Some(("a", 4))),
+        sim_request(2, 1, 2, 4, ("B", 2), Some(("b", 4))),
+        sim_request(3, 5, 1, 1, ("B", 2), Some(("b", 4))),
+        sim_request(4, 6, 1, 1, ("A", 2), Some(("a", 4))),
+    ];
+    let (old, _) = simulate_admission(4, &initial, &requests, SimPolicy::Today, None);
+    let (new, _) = simulate_admission(4, &initial, &requests, SimPolicy::TodayOrPass, None);
+    assert_eq!(new, vec![3, 1, 5, 6]);
+    assert_eq!(new, old);
+}
+
+#[test]
+fn todays_build_exception_can_refill_capacity_after_a_passer_leaves_the_queue() {
+    let initial = vec![(2, sim_request(0, 0, 2, 1, ("D", 4), Some(("h", 4))).record)];
+    let requests = vec![
+        sim_request(1, 0, 3, 1, ("D", 4), Some(("h", 4))),
+        sim_request(2, 0, 1, 1, ("D", 4), Some(("h", 4))),
+        sim_request(3, 0, 2, 2, ("D", 4), Some(("r", 4))),
+    ];
+    let mut before = AdmissionSimulation::new(4, &initial, &requests);
+    before.queue = vec![0, 1, 2];
+    assert_eq!(before.decision(1), AdmissionDecision::Passing);
+    let mut a = before.clone();
+    a.grant(1);
+    a.drain(SimPolicy::Today);
+    let mut b = before.clone();
+    b.drain(SimPolicy::Today);
+    assert_eq!(a.started, vec![Some(3), Some(0), Some(1)]);
+    assert_eq!(b.started, vec![Some(2), Some(2), Some(3)]);
+    // Today's build exception allows R from another build to refill the
+    // capacity after C finishes. It delays H one tick; the pass check itself
+    // would refuse that refill. Preserve this known scope-exception behavior.
+    assert_eq!(a.started[0].unwrap() - b.started[0].unwrap(), 1);
+    before.check_fork(1, true);
+}
+
+fn sim_random(state: &mut u64, low: u64, high: u64) -> u64 {
+    *state = state
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    low + (*state >> 16) % (high - low + 1)
+}
+
+fn check_random_admission_forks(multi_scope: bool) {
+    let mut total_passes = 0;
+    for seed in 0..512_u64 {
+        let mut state = seed + 1;
+        let capacity = sim_random(&mut state, 4, 128);
+        let domain_count = if multi_scope {
+            sim_random(&mut state, 2, 4)
+        } else {
+            1
+        } as usize;
+        let domain_capacities: Vec<_> = (0..domain_count)
+            .map(|_| {
+                if multi_scope {
+                    sim_random(&mut state, 1, capacity)
+                } else {
+                    capacity
+                }
+            })
+            .collect();
+        let mut build_domains = Vec::new();
+        for domain in 0..domain_count {
+            let count = if multi_scope {
+                sim_random(&mut state, 1, 3)
+            } else {
+                1
+            };
+            build_domains.extend(std::iter::repeat_n(domain, count as usize));
+        }
+        let build_capacities: Vec<_> = build_domains
+            .iter()
+            .map(|_| {
+                if multi_scope {
+                    sim_random(&mut state, 1, capacity)
+                } else {
+                    capacity
+                }
+            })
+            .collect();
+        let make_request = |id, arrival, weight, duration, build: usize| {
+            let domain = build_domains[build];
+            sim_request(
+                id,
+                arrival,
+                weight,
+                duration,
+                (&format!("domain-{domain}"), domain_capacities[domain]),
+                Some((&format!("build-{build}"), build_capacities[build])),
+            )
+        };
+        let mut initial = Vec::new();
+        let mut used = 0;
+        let mut domain_used = vec![0; domain_count];
+        let mut build_used = vec![0; build_domains.len()];
+        for _ in 0..capacity {
+            if sim_random(&mut state, 0, 99) < 15 {
+                break;
+            }
+            let build = sim_random(&mut state, 0, build_domains.len() as u64 - 1) as usize;
+            let domain = build_domains[build];
+            let free = (capacity - used)
+                .min(domain_capacities[domain] - domain_used[domain])
+                .min(build_capacities[build] - build_used[build]);
+            if free != 0 {
+                let weight = sim_random(&mut state, 1, free);
+                let end = sim_random(&mut state, 1, 50);
+                initial.push((end, make_request(0, 0, weight, 1, build).record));
+                used += weight;
+                domain_used[domain] += weight;
+                build_used[build] += weight;
+            }
+        }
+        let mut requests = Vec::new();
+        for arrival in std::iter::repeat_n(0, sim_random(&mut state, 1, 8) as usize).chain(1..=100)
+        {
+            if arrival != 0 && sim_random(&mut state, 0, 99) >= 65 {
+                continue;
+            }
+            let build = sim_random(&mut state, 0, build_domains.len() as u64 - 1) as usize;
+            let limit = domain_capacities[build_domains[build]]
+                .min(build_capacities[build])
+                .min(if arrival == 0 { capacity } else { 3 });
+            let weight = sim_random(&mut state, 1, limit);
+            let duration = sim_random(&mut state, 1, 50);
+            requests.push(make_request(
+                requests.len() as u64 + 1,
+                arrival,
+                weight,
+                duration,
+                build,
+            ));
+        }
+        let (_, passes) = simulate_admission(
+            capacity,
+            &initial,
+            &requests,
+            SimPolicy::TodayOrPass,
+            Some(multi_scope),
+        );
+        total_passes += passes;
+    }
+    assert!(total_passes > 0, "random workloads must exercise passing");
+}
+
+#[test]
+fn single_scope_passes_preserve_all_waiters_in_counterfactuals() {
+    check_random_admission_forks(false);
+}
+
+#[test]
+fn shared_scope_passes_preserve_older_waiters_with_fifo_continuations() {
+    check_random_admission_forks(true);
+}
+
+#[test]
+fn real_queue_protects_both_prefix_counterexamples() {
+    for (weights, heads, drop_before_pass, passer) in
+        [([8, 2], [6, 4], true, 2), ([6, 2], [8, 1], false, 1)]
+    {
+        let directory = tempfile::tempdir().unwrap();
+        let mut pool = pool_at(directory.path(), 10, 0);
+        pool.domain_capacity = 20;
+        let first = pool.try_admit(weights[0], None).unwrap().unwrap();
+        let mut second = pool.try_admit(weights[1], None).unwrap();
+        let mut head = None;
+        let mut next = None;
+        assert!(
+            pool.try_admit_queued(heads[0], None, &mut head)
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            pool.try_admit_queued(heads[1], None, &mut next)
+                .unwrap()
+                .is_none()
+        );
+        if drop_before_pass {
+            drop(second.take());
+        }
+        assert!(
+            pool.try_admit_queued(passer, None, &mut None)
+                .unwrap()
+                .is_none()
+        );
+        drop(first);
+        let admitted = pool
+            .try_admit_queued(heads[0], None, &mut head)
+            .unwrap()
+            .unwrap();
+        if drop_before_pass {
+            assert!(
+                pool.try_admit_queued(heads[1], None, &mut next)
+                    .unwrap()
+                    .is_some()
+            );
+        }
+        drop((admitted, second));
     }
 }

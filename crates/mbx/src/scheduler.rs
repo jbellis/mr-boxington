@@ -394,7 +394,7 @@ impl Drop for Permit {
 }
 
 /// One lease record, stored beside the lock that proves its holder is alive.
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct Lease {
     version: u8,
     #[serde(default)]
@@ -411,7 +411,7 @@ struct Lease {
     bytes_per_permit: u64,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 struct Waiting {
     #[serde(default)]
     name: Option<String>,
@@ -440,15 +440,80 @@ fn fits(used: u64, weight: u64, capacity: u64) -> bool {
 // Keep the original weight as a CPU floor: reservations and tests may have
 // requested that many cores, even when their memory fits fewer new permits.
 fn lease_weight(lease: &Lease, bytes_per_permit: u64) -> u64 {
-    if bytes_per_permit == 0 {
-        lease.weight
+    weight_in_units(lease.weight, lease.bytes_per_permit, bytes_per_permit)
+}
+
+fn weight_in_units(weight: u64, original_unit: u64, unit: u64) -> u64 {
+    if unit == 0 {
+        weight
     } else {
-        lease.weight.max(
-            lease
-                .weight
-                .saturating_mul(lease.bytes_per_permit)
-                .div_ceil(bytes_per_permit),
-        )
+        weight.max(weight.saturating_mul(original_unit).div_ceil(unit))
+    }
+}
+
+/// Protect every prefix of the older queue against every possible completion
+/// order. Earlier waiters eventually become leases too, so their weights join
+/// the subset sums after checking each prefix.
+fn can_pass_waiters(capacity: u64, live: &[u64], older: &[u64], weight: u64) -> bool {
+    if older.is_empty() {
+        return true;
+    }
+    // Bound the complete bitset, including future leases from older waiters.
+    const MAX_BITS: u64 = 1 << 16;
+    let Some(total) = live.iter().chain(older).try_fold(0_u64, |sum, w| {
+        sum.checked_add(*w).filter(|sum| *sum < MAX_BITS)
+    }) else {
+        return false;
+    };
+    let used: u64 = live.iter().sum();
+    let Some(free) = capacity.checked_sub(used) else {
+        return false;
+    };
+    if weight > free {
+        return false;
+    }
+    let mut sums = vec![0_u64; (total as usize + 1).div_ceil(64)];
+    sums[0] = 1;
+    for w in live {
+        add_subset_weight(&mut sums, *w as usize);
+    }
+    let mut prefix = 0;
+    for h in older {
+        prefix += h;
+        let slack = if prefix <= free {
+            free - prefix
+        } else {
+            let threshold = (prefix - free) as usize;
+            let first_word = threshold / 64;
+            let Some(sum) = (first_word..sums.len()).find_map(|index| {
+                let bits = if index == first_word {
+                    sums[index] & (u64::MAX << (threshold % 64))
+                } else {
+                    sums[index]
+                };
+                (bits != 0).then(|| index * 64 + bits.trailing_zeros() as usize)
+            }) else {
+                return false;
+            };
+            (sum - threshold) as u64
+        };
+        if weight > slack {
+            return false;
+        }
+        add_subset_weight(&mut sums, *h as usize);
+    }
+    true
+}
+
+fn add_subset_weight(sums: &mut [u64], weight: usize) {
+    let words = weight / 64;
+    let shift = weight % 64;
+    for index in (words..sums.len()).rev() {
+        let mut shifted = sums[index - words] << shift;
+        if shift != 0 && index > words {
+            shifted |= sums[index - words - 1] >> (64 - shift);
+        }
+        sums[index] |= shifted;
     }
 }
 
@@ -477,6 +542,124 @@ fn build_fits(
             *capacity,
         )
     })
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AdmissionDecision {
+    Ordered,
+    Passing,
+    Waiting,
+}
+
+/// Pure admission policy, shared by the pool and the event simulations. Keep
+/// today's scope exceptions as a fast path; only a refusal needs the slack
+/// calculation across every scope the passer shares with an older waiter.
+fn admission_decision<'a>(
+    capacity: u64,
+    live: &[Lease],
+    waiting: impl Iterator<Item = &'a Waiting>,
+    request: &Waiting,
+) -> AdmissionDecision {
+    let used = live
+        .iter()
+        .map(|lease| lease_weight(lease, request.bytes_per_permit))
+        .sum();
+    if !build_fits(
+        live,
+        &request.build,
+        request.weight,
+        request.bytes_per_permit,
+    ) || !fits(
+        domain_used(live, &request.domain, request.bytes_per_permit),
+        request.weight,
+        request.domain_capacity,
+    ) || !fits(used, request.weight, capacity)
+    {
+        return AdmissionDecision::Waiting;
+    }
+    let mut older: Vec<_> = waiting
+        .filter(|older| {
+            older.ticket < request.ticket
+                && !(older.priority == "low" && request.priority == "normal")
+        })
+        .collect();
+    older.sort_unstable_by_key(|older| older.ticket);
+    let ordered_blocked = older.iter().any(|older| {
+        if !build_fits(live, &older.build, older.weight, older.bytes_per_permit) {
+            return older.build.as_ref().map(|(id, _)| id)
+                == request.build.as_ref().map(|(id, _)| id);
+        }
+        if !fits(
+            domain_used(live, &older.domain, older.bytes_per_permit),
+            older.weight,
+            older.domain_capacity,
+        ) {
+            return older.domain == request.domain;
+        }
+        true
+    });
+    if !ordered_blocked {
+        return AdmissionDecision::Ordered;
+    }
+    let scope_allows = |capacity, unit, build: Option<&str>, domain: Option<&str>| {
+        let weights: Vec<_> = live
+            .iter()
+            .filter(|lease| {
+                build.is_none_or(|id| lease.build_id.as_deref() == Some(id))
+                    && domain.is_none_or(|id| {
+                        lease
+                            .domain
+                            .as_deref()
+                            .is_none_or(|lease_id| lease_id == id)
+                    })
+            })
+            .map(|lease| lease_weight(lease, unit))
+            .collect();
+        // Include all older waiters in this physical scope, even if a
+        // different ceiling currently blocks them. Their weights can later
+        // become live leases and must participate in the prefix calculation.
+        let heads: Vec<_> = older
+            .iter()
+            .filter(|waiter| {
+                build.is_none_or(|id| waiter.build.as_ref().map(|(id, _)| id.as_str()) == Some(id))
+                    && domain.is_none_or(|id| waiter.domain == id)
+            })
+            .map(|waiter| weight_in_units(waiter.weight, waiter.bytes_per_permit, unit))
+            .collect();
+        can_pass_waiters(
+            capacity,
+            &weights,
+            &heads,
+            weight_in_units(request.weight, request.bytes_per_permit, unit),
+        )
+    };
+    // Global capacity is always shared. Domain and build ceilings may retain
+    // older permit units/limits, so protect each distinct recorded pair too.
+    if !scope_allows(capacity, request.bytes_per_permit, None, None) {
+        return AdmissionDecision::Waiting;
+    }
+    let mut checked = std::collections::BTreeSet::new();
+    for waiter in &older {
+        if waiter.domain == request.domain
+            && checked.insert((false, waiter.domain_capacity, waiter.bytes_per_permit))
+            && !scope_allows(
+                waiter.domain_capacity,
+                waiter.bytes_per_permit,
+                None,
+                Some(&waiter.domain),
+            )
+        {
+            return AdmissionDecision::Waiting;
+        }
+        if let (Some((id, ceiling)), Some((request_id, _))) = (&waiter.build, &request.build)
+            && id == request_id
+            && checked.insert((true, *ceiling, waiter.bytes_per_permit))
+            && !scope_allows(*ceiling, waiter.bytes_per_permit, Some(id), None)
+        {
+            return AdmissionDecision::Waiting;
+        }
+    }
+    AdmissionDecision::Passing
 }
 
 /// What one finished compilation leaves in its flight file: the prediction
@@ -1344,36 +1527,23 @@ impl Pool {
         std::fs::create_dir_all(&waiters)?;
         let waiting = scan_waiters(&waiters)?;
         let ticket = queued.as_ref().map_or(u64::MAX, |entry| entry.ticket);
-        let overtaking = waiting.iter().any(|older| {
-            if older.ticket >= ticket
-                || (older.priority == "low" && self.priority == SchedulerPriority::Normal)
-            {
-                return false;
-            }
-            // A request waiting for its own build/domain to drain must not
-            // block unrelated containers. Within that scope, stop refilling
-            // the slots it needs. Otherwise reserve its place in the host pool.
-            if !build_fits(&live, &older.build, older.weight, older.bytes_per_permit) {
-                return older.build.as_ref().map(|(id, _)| id)
-                    == self.build.as_ref().map(|(id, _)| id);
-            }
-            if !fits(
-                domain_used(&live, &older.domain, older.bytes_per_permit),
-                older.weight,
-                older.domain_capacity,
-            ) {
-                return older.domain == self.pressure_domain;
-            }
-            true
-        });
-        if overtaking
-            || !build_fits(&live, &self.build, weight, self.bytes_per_permit)
-            || !fits(
-                domain_used(&live, self.pressure_domain, self.bytes_per_permit),
-                weight,
-                self.domain_capacity,
-            )
-            || !fits(used, weight, capacity)
+        let request = Waiting {
+            name: demand.map(|d| d.name.clone()),
+            mode_key: demand.map(|d| {
+                d.compile_mode
+                    .clone()
+                    .unwrap_or_else(|| ledger_key(&d.name, d.links))
+            }),
+            ticket,
+            weight,
+            priority: self.priority.as_str().into(),
+            domain: self.pressure_domain.into(),
+            domain_capacity: self.domain_capacity,
+            bytes_per_permit: self.bytes_per_permit,
+            build: self.build.clone(),
+        };
+        if admission_decision(capacity, &live, waiting.iter(), &request)
+            == AdmissionDecision::Waiting
         {
             if queued.is_none() {
                 let ticket = waiting
@@ -1383,21 +1553,7 @@ impl Pool {
                     .unwrap_or(0)
                     .checked_add(1)
                     .ok_or_else(|| eyre::eyre!("scheduler queue exhausted"))?;
-                let record = Waiting {
-                    name: demand.map(|d| d.name.clone()),
-                    mode_key: demand.map(|d| {
-                        d.compile_mode
-                            .clone()
-                            .unwrap_or_else(|| ledger_key(&d.name, d.links))
-                    }),
-                    ticket,
-                    weight,
-                    priority: self.priority.as_str().into(),
-                    domain: self.pressure_domain.into(),
-                    domain_capacity: self.domain_capacity,
-                    bytes_per_permit: self.bytes_per_permit,
-                    build: self.build.clone(),
-                };
+                let record = Waiting { ticket, ..request };
                 *queued = Some(QueueEntry {
                     ticket,
                     _guard: self.lock_record(&waiters, &serde_json::to_vec(&record)?)?,
