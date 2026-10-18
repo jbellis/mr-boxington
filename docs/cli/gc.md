@@ -16,5 +16,5 @@ An evicted object is rebuilt when a build needs it again.
 - **`--json`** — Print a stable machine-readable report.
 - **`--dry-run`** — Show what collection would remove without changing any files.
 
-  While a disk has less free space than `gc.min_free_size`, a real run can remove a different amount than the preview, because it measures the disk again after each step. To free the cache disk, a real run can also evict more store objects than the action-store budget requires, and the preview never lists them.
+  While a disk has less free space than `gc.min_free_size`, a real run can remove a different amount than the preview, because it measures the disk again after each step. To free the cache disk, a real run can also evict more store objects than the action-store budget requires, and the preview never lists them. A preview does not probe rustc's session locks, so it can list a unit a compiler is still writing; a real run keeps such units.
 - **`-h --help`** — Print help

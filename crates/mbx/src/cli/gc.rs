@@ -63,6 +63,8 @@ pub(super) struct GcArgs {
     /// disk again after each step. To free the cache disk, a real run can also
     /// evict more store objects than the action-store budget requires, and the
     /// preview never lists them.
+    /// A preview does not probe rustc's session locks, so it can list a unit
+    /// a compiler is still writing; a real run keeps such units.
     #[usage(long)]
     pub(super) dry_run: bool,
     /// Run the throttled sweep a build schedules, if one is due. Builds start
