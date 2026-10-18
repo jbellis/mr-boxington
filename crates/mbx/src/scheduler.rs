@@ -543,6 +543,15 @@ struct Plan {
 
 const MEMORY_QUANTUM: u64 = 16 * 1024 * 1024;
 
+// Match the scalar charge an old reader computes after a permit-unit change.
+fn weight_in_units(weight: u64, original_unit: u64, unit: u64) -> u64 {
+    if unit == 0 {
+        weight
+    } else {
+        weight.max(weight.saturating_mul(original_unit).div_ceil(unit))
+    }
+}
+
 fn can_pass_waiters(capacity: u64, live: &[u64], older: &[u64], weight: u64) -> bool {
     can_pass_quantized(capacity, live, older, weight, 1)
 }
@@ -792,6 +801,64 @@ fn admission_decision<'a>(
                 Some(id),
                 None,
             )
+        {
+            return AdmissionDecision::Waiting;
+        }
+    }
+    // Old writers still decide their own admission using scalar weights.
+    // Vector slack cannot protect them: max(cpu, memory permits) is not
+    // additive across leases with different dominant resources.
+    let scalar_scope_allows = |capacity, unit, build: Option<&str>, domain: Option<&str>| {
+        let weights: Vec<_> = live
+            .iter()
+            .filter(|lease| {
+                build.is_none_or(|id| lease.build_id.as_deref() == Some(id))
+                    && domain
+                        .is_none_or(|id| lease.domain.as_deref().is_none_or(|other| other == id))
+            })
+            .map(|lease| weight_in_units(lease.weight, lease.bytes_per_permit, unit))
+            .collect();
+        let heads: Vec<_> = older
+            .iter()
+            .filter(|waiter| {
+                build.is_none_or(|id| waiter.build.as_ref().map(|(id, _)| id.as_str()) == Some(id))
+                    && domain.is_none_or(|id| waiter.domain == id)
+            })
+            .map(|waiter| weight_in_units(waiter.weight, waiter.bytes_per_permit, unit))
+            .collect();
+        can_pass_waiters(
+            capacity,
+            &weights,
+            &heads,
+            weight_in_units(request.weight, request.bytes_per_permit, unit),
+        )
+    };
+    let mut scalar_checked = std::collections::BTreeSet::new();
+    for waiter in &older {
+        // New waiters need only the vector checks. An old scalar passer
+        // reading their legacy weights is conservative: weight >= cpu and
+        // weight * bytes_per_permit >= memory (subject to the existing
+        // legacy capacity clamp for oversized demands).
+        if waiter.cpu.is_some() && waiter.memory_bytes.is_some() {
+            continue;
+        }
+        let unit = waiter.bytes_per_permit;
+        let global = waiter.global_capacity.unwrap_or(capacity);
+        if scalar_checked.insert((0, global, unit))
+            && !scalar_scope_allows(global, unit, None, None)
+        {
+            return AdmissionDecision::Waiting;
+        }
+        if waiter.domain == request.domain
+            && scalar_checked.insert((1, waiter.domain_capacity, unit))
+            && !scalar_scope_allows(waiter.domain_capacity, unit, None, Some(&waiter.domain))
+        {
+            return AdmissionDecision::Waiting;
+        }
+        if let (Some((id, ceiling)), Some((request_id, _))) = (&waiter.build, &request.build)
+            && id == request_id
+            && scalar_checked.insert((2, *ceiling, unit))
+            && !scalar_scope_allows(*ceiling, unit, Some(id), None)
         {
             return AdmissionDecision::Waiting;
         }

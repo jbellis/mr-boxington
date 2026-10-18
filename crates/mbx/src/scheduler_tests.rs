@@ -2489,6 +2489,7 @@ enum SimPolicy {
 #[derive(Clone)]
 struct AdmissionSimulation<'a> {
     capacity: u64,
+    legacy_readers: bool,
     now: u64,
     live: Vec<Lease>,
     finishes: Vec<u64>,
@@ -2501,6 +2502,7 @@ impl<'a> AdmissionSimulation<'a> {
     fn new(capacity: u64, initial: &[(u64, Waiting)], requests: &'a [SimRequest]) -> Self {
         Self {
             capacity,
+            legacy_readers: false,
             now: 0,
             live: initial
                 .iter()
@@ -2524,12 +2526,39 @@ impl<'a> AdmissionSimulation<'a> {
 
     fn decision(&self, position: usize) -> AdmissionDecision {
         let request = &self.requests[self.queue[position]].record;
-        admission_decision(
+        self.reader_decision(
             request.global_capacity.unwrap_or(self.capacity),
             &self.live,
             self.queue.iter().map(|id| &self.requests[*id].record),
             request,
         )
+    }
+
+    fn reader_decision<'b>(
+        &self,
+        capacity: u64,
+        live: &[Lease],
+        waiting: impl Iterator<Item = &'b Waiting>,
+        request: &Waiting,
+    ) -> AdmissionDecision {
+        if !self.legacy_readers || request.cpu.is_some() || request.memory_bytes.is_some() {
+            return admission_decision(capacity, live, waiting, request);
+        }
+        // Use the independent fe73826 reader for the legacy process itself,
+        // including in both counterfactual forks and strict FIFO admission.
+        let live: Vec<legacy::Lease> = live
+            .iter()
+            .map(|record| serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap())
+            .collect();
+        let waiting: Vec<legacy::Waiting> = waiting
+            .map(|record| serde_json::from_value(serde_json::to_value(record).unwrap()).unwrap())
+            .collect();
+        let request = serde_json::from_value(serde_json::to_value(request).unwrap()).unwrap();
+        match legacy::admission_decision(capacity, &live, waiting.iter(), &request) {
+            legacy::AdmissionDecision::Ordered => AdmissionDecision::Ordered,
+            legacy::AdmissionDecision::Passing => AdmissionDecision::Passing,
+            legacy::AdmissionDecision::Waiting => AdmissionDecision::Waiting,
+        }
     }
 
     fn grant(&mut self, position: usize) {
@@ -2583,7 +2612,7 @@ impl<'a> AdmissionSimulation<'a> {
                 // The real decision with an empty older queue still enforces
                 // every physical ceiling, without any overtaking exceptions.
                 let request = &self.requests[self.queue[position]].record;
-                admission_decision(
+                self.reader_decision(
                     request.global_capacity.unwrap_or(self.capacity),
                     &self.live,
                     std::iter::empty(),
@@ -3792,5 +3821,229 @@ fn legacy_lease_and_waiter_fields_match_fe73826_across_demands_and_domain_limits
                 },
             );
         }
+    }
+}
+
+fn mixed_legacy_pass_fixture() -> (Vec<Lease>, Waiting, Waiting) {
+    let mut head = sim_request(1, 0, 4, 1, ("host", 12), None).record;
+    head.bytes_per_permit = GIB;
+    head.global_capacity = Some(12);
+    let mut request = head.clone();
+    request.ticket = 2;
+    request.weight = 1;
+    request.cpu = Some(1);
+    request.memory_bytes = Some(GIB);
+    let live = [(4, 1), (1, 4), (2, 2)]
+        .map(|(cpu, mem)| {
+            let mut record = request.clone();
+            record.weight = cpu.max(mem);
+            record.cpu = Some(cpu);
+            record.memory_bytes = Some(mem * GIB);
+            sim_lease(&record)
+        })
+        .to_vec();
+    (live, head, request)
+}
+
+#[test]
+fn mixed_legacy_waiter_requires_scalar_and_vector_slack() {
+    let (live, head, request) = mixed_legacy_pass_fixture();
+    // Marking the head as a new writer leaves the vector-only policy in place.
+    let mut vector_head = head.clone();
+    vector_head.cpu = Some(4);
+    vector_head.memory_bytes = Some(4 * GIB);
+    assert_eq!(
+        admission_decision(12, &live, [&vector_head].into_iter(), &request),
+        AdmissionDecision::Passing
+    );
+    assert_eq!(
+        admission_decision(12, &live, [&head].into_iter(), &request),
+        AdmissionDecision::Waiting
+    );
+    // The weight-2 completion frees exactly enough scalar room without a passer.
+    let old_head: legacy::Waiting =
+        serde_json::from_value(serde_json::to_value(&head).unwrap()).unwrap();
+    let mut remaining: Vec<legacy::Lease> = live[..2]
+        .iter()
+        .map(|lease| serde_json::from_value(serde_json::to_value(lease).unwrap()).unwrap())
+        .collect();
+    assert_eq!(
+        legacy::admission_decision(12, &remaining, std::iter::empty(), &old_head),
+        legacy::AdmissionDecision::Ordered
+    );
+    remaining
+        .push(serde_json::from_value(serde_json::to_value(sim_lease(&request)).unwrap()).unwrap());
+    assert_eq!(
+        legacy::admission_decision(12, &remaining, std::iter::empty(), &old_head),
+        legacy::AdmissionDecision::Waiting
+    );
+    // Scalar slack alone is insufficient when the exact CPU ceiling is tighter.
+    let mut tight = request.clone();
+    tight.cpu_cap = Some(11);
+    tight.domain_capacity = 20;
+    assert!(can_pass_waiters(20, &[4, 4, 2], &[4], 1));
+    let mut roomy_head = head.clone();
+    roomy_head.global_capacity = Some(20);
+    roomy_head.domain_capacity = 20;
+    assert_eq!(
+        admission_decision(20, &live, [&roomy_head].into_iter(), &tight),
+        AdmissionDecision::Waiting
+    );
+    let mut roomy = request.clone();
+    roomy.global_capacity = Some(20);
+    roomy.domain_capacity = 20;
+    roomy_head.domain_capacity = 20;
+    assert_eq!(
+        admission_decision(20, &live, [&roomy_head].into_iter(), &roomy),
+        AdmissionDecision::Passing
+    );
+}
+
+#[test]
+fn mixed_legacy_waiter_blocks_passer_in_real_pool() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pool = pool_at(dir.path(), 12, GIB);
+    pool.pressure_domain = "host";
+    let held: Vec<_> = [(4, 1), (1, 4), (2, 2)]
+        .into_iter()
+        .map(|(cpu, mem)| pool.reserve(Some(cpu), Some(mem * GIB)).unwrap())
+        .collect();
+    let (live, head, request) = mixed_legacy_pass_fixture();
+    let waiters = dir.path().join(WAITERS_DIR);
+    std::fs::create_dir_all(&waiters).unwrap();
+    let _head_guard = pool
+        .lock_record(&waiters, &serde_json::to_vec(&head).unwrap())
+        .unwrap();
+    let mut vector_head = head.clone();
+    vector_head.cpu = Some(4);
+    vector_head.memory_bytes = Some(4 * GIB);
+    assert_eq!(
+        admission_decision(12, &live, [&vector_head].into_iter(), &request),
+        AdmissionDecision::Passing
+    );
+    assert!(pool.try_admit_queued(1, None, &mut None).unwrap().is_none());
+    drop(_head_guard);
+    let _vector_head_guard = pool
+        .lock_record(&waiters, &serde_json::to_vec(&vector_head).unwrap())
+        .unwrap();
+    assert!(pool.try_admit_queued(1, None, &mut None).unwrap().is_some());
+    drop(held);
+}
+
+#[test]
+fn mixed_version_passes_preserve_legacy_waiters_in_counterfactuals() {
+    let mut total_passes = 0;
+    for seed in 0..512_u64 {
+        let mut state = seed + 1;
+        let capacity = sim_random(&mut state, 8, 24);
+        let mut make_record = |ticket| {
+            let unit = GIB * sim_random(&mut state, 1, 2);
+            let weight = sim_random(&mut state, 1, 4);
+            let mut record = sim_request(
+                ticket,
+                0,
+                weight,
+                1,
+                ("host", capacity),
+                Some(("build", capacity)),
+            )
+            .record;
+            record.global_capacity = Some(sim_random(&mut state, 8, capacity));
+            record.bytes_per_permit = unit;
+            // Every third waiter is genuinely legacy-only. New records keep
+            // a conservative scalar weight but vary their dominant resource.
+            if ticket % 3 != 1 {
+                record.cpu = Some(sim_random(&mut state, 1, weight));
+                record.memory_bytes = Some(sim_random(&mut state, 1, weight) * unit);
+            }
+            record
+        };
+        let initial: Vec<_> = (0..3).map(|_| (1, make_record(0))).collect();
+        let mut requests: Vec<_> = (1..=12)
+            .map(|ticket| SimRequest {
+                arrival: 0,
+                duration: 1,
+                record: make_record(ticket),
+            })
+            .collect();
+        // Different completion times exercise every admitted passer's fork.
+        let initial: Vec<_> = initial
+            .into_iter()
+            .map(|(_, record)| (sim_random(&mut state, 1, 20), record))
+            .collect();
+        for request in &mut requests {
+            request.duration = sim_random(&mut state, 1, 20);
+        }
+        let mut simulation = AdmissionSimulation::new(capacity, &initial, &requests);
+        simulation.legacy_readers = true;
+        simulation.queue = (0..requests.len()).collect();
+        while !simulation.queue.is_empty() {
+            simulation.expire();
+            total_passes += simulation.step(SimPolicy::TodayOrPass, Some(true));
+            if !simulation.queue.is_empty() {
+                simulation.now = *simulation
+                    .finishes
+                    .iter()
+                    .min()
+                    .expect("live work unblocks queue");
+            }
+        }
+    }
+    eprintln!("mixed-version seeds 0..512: {total_passes} passes checked");
+    assert!(
+        total_passes > 0,
+        "mixed-version workloads must exercise passing"
+    );
+}
+
+#[test]
+fn legacy_waiter_scalar_slack_uses_its_units_and_each_shared_ceiling() {
+    for scope in [
+        "global",
+        "missing-global",
+        "domain",
+        "build",
+        "changed-unit",
+    ] {
+        let (mut live, mut head, mut request) = mixed_legacy_pass_fixture();
+        head.global_capacity = Some(20);
+        head.domain_capacity = 20;
+        request.global_capacity = Some(20);
+        request.domain_capacity = 20;
+        match scope {
+            "global" => head.global_capacity = Some(12),
+            "missing-global" => head.global_capacity = None,
+            "domain" => head.domain_capacity = 12,
+            "build" => {
+                head.build = Some(("build".into(), 12));
+                request.build = Some(("build".into(), 20));
+                for lease in &mut live {
+                    lease.build_id = Some("build".into());
+                }
+            }
+            "changed-unit" => {
+                // The head's half-sized units double every lease and the
+                // passer, while retaining the CPU floor of its own weight.
+                head.bytes_per_permit = GIB / 2;
+                head.weight = 8;
+                head.global_capacity = Some(24);
+                head.domain_capacity = 40;
+            }
+            _ => unreachable!(),
+        }
+        let fallback = if scope == "missing-global" { 12 } else { 20 };
+        let mut vector_head = head.clone();
+        vector_head.cpu = Some(head.weight);
+        vector_head.memory_bytes = Some(head.weight * head.bytes_per_permit);
+        assert_eq!(
+            admission_decision(fallback, &live, [&vector_head].into_iter(), &request),
+            AdmissionDecision::Passing,
+            "vector policy: {scope}"
+        );
+        assert_eq!(
+            admission_decision(fallback, &live, [&head].into_iter(), &request),
+            AdmissionDecision::Waiting,
+            "scalar policy: {scope}"
+        );
     }
 }
