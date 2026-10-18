@@ -1553,6 +1553,9 @@ pub(crate) fn bypassed_library_incremental_flag(arguments: &[OsString]) -> Optio
         identity.push(0);
     }
     let directory = incremental_directory(&CacheDigest::blake3(&identity), &crate_name, false)?;
+    if incremental_state_exceeds_backstop(&directory, session::incremental_budget()) {
+        return None;
+    }
     Some(private_incremental_flag(&directory))
 }
 

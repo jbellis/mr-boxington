@@ -2227,6 +2227,58 @@ fn editing_one_crate_takes_its_dependents_private_too() {
 }
 
 #[test]
+fn a_staticlib_above_the_incremental_backstop_leaves_existing_sessions_alone() {
+    fn sessions(root: &Path) -> Vec<PathBuf> {
+        let mut pending = vec![root.to_path_buf()];
+        let mut sessions = Vec::new();
+        while let Some(directory) = pending.pop() {
+            for entry in std::fs::read_dir(directory).unwrap() {
+                let entry = entry.unwrap();
+                if entry.file_type().unwrap().is_dir() {
+                    if entry.file_name().to_string_lossy().starts_with("s-") {
+                        sessions.push(entry.path());
+                    } else {
+                        pending.push(entry.path());
+                    }
+                }
+            }
+        }
+        sessions.sort();
+        sessions
+    }
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    let manifest = project.path().join("Cargo.toml");
+    let mut text = std::fs::read_to_string(&manifest).unwrap();
+    text.push_str("\n[lib]\ncrate-type = [\"staticlib\", \"rlib\"]\n");
+    std::fs::write(&manifest, text).unwrap();
+    generate_lockfile(project.path());
+    let environment = [("MBX_GC_INCREMENTAL_MAX_SIZE", "0B"), ("MBX_GC_AUTO", "0")];
+    build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("cold.json"),
+        &environment,
+    );
+    let before = sessions(&store.path().join("incremental"));
+    assert_eq!(before.len(), 1);
+    edit_project(project.path(), 1);
+    build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("edit.json"),
+        &environment,
+    );
+    assert_eq!(
+        sessions(&store.path().join("incremental")),
+        before,
+        "an oversized staticlib must compile without creating another incremental session"
+    );
+}
+
+#[test]
 fn a_staticlib_the_cache_bypasses_still_compiles_incrementally() {
     let store = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
