@@ -622,3 +622,51 @@ fn incremental_report_merges_unit_counts_and_serializes_additively() {
     assert_eq!(report["removed_directories"], 1);
     assert_eq!(report["removed_bytes"], 50);
 }
+
+#[test]
+fn generated_trees_get_a_bounded_first_share_despite_busy_incremental_state() {
+    for automatic in [false, true] {
+        let directory = tempfile::tempdir().unwrap();
+        let config = super::cargo_tests::managed_target_config(directory.path());
+        let incremental = config.cache_dir.join("incremental/untracked");
+        std::fs::create_dir_all(&incremental).unwrap();
+        std::fs::write(incremental.join("busy"), [0; 200]).unwrap();
+        let root = config.cache_dir.join(crate::out_dir::ROOT);
+        for name in ["1".repeat(64), "2".repeat(64)] {
+            let tree = root.join(name);
+            std::fs::create_dir_all(&tree).unwrap();
+            std::fs::write(tree.join("generated.rs"), [0; 4]).unwrap();
+        }
+        let mut retention = RetentionSettings {
+            incremental_max_bytes: Some(100),
+            incremental_max_age: None,
+            target_max_bytes: None,
+            target_max_age: None,
+            min_free: None,
+            ..always_short()
+        };
+        let collect = |retention: &RetentionSettings| {
+            if automatic {
+                prune_targets(&config, retention, config.gc.max_bytes);
+            } else {
+                gc::run(&config, config.gc.max_bytes, false, false, retention).unwrap();
+            }
+        };
+        collect(&retention);
+        let generated = crate::out_dir::stats(&root).unwrap();
+        assert_eq!(generated.remaining_directories, 2);
+        assert_eq!(
+            generated.remaining_bytes, 8,
+            "under the 10-byte first share"
+        );
+        assert!(incremental.join("busy").exists());
+        retention.incremental_max_bytes = Some(40);
+        collect(&retention);
+        let generated = crate::out_dir::stats(&root).unwrap();
+        assert_eq!(generated.remaining_directories, 1);
+        assert_eq!(
+            generated.remaining_bytes, 4,
+            "capped at one tenth of the share"
+        );
+    }
+}

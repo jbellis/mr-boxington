@@ -470,8 +470,11 @@ their output to the directory Cargo gives them before mbx makes the copy.
 `mbx cache stats` reports these copies as **generated source trees**. Automatic
 collection and `mbx gc` remove copies according to `target.max_age`, based on
 when mbx last used them for a compilation or cache lookup. The copies share
-`gc.incremental_max_size` with learned incremental state, least recently used
-first, and the remaining copies count toward `gc.max_total_size`. A compilation
+`gc.incremental_max_size` with learned incremental state. Generated trees are
+collected least recently used first, to the smaller of their current bytes or
+10% of that shared budget. Incremental units then get the budget left after
+the surviving generated trees, so busy incremental state cannot starve them.
+The remaining copies count toward `gc.max_total_size`. A compilation
 holds a lease on the copy it reads until rustc exits, and collection leaves a
 leased copy in place. A build Cargo considers fresh does not refresh the use
 timestamp. mbx recreates an evicted copy when a later compilation needs it, so

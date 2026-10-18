@@ -184,8 +184,10 @@ safeguard remain enabled.
 
 Collection reserves only the space the action store occupies, up to its limit,
 so an empty store does not force useful targets out. Learned incremental state
-and generated source trees use the remaining allowance up to their cap; managed
-targets use what remains after them. If protected state leaves less room, mbx
+and generated source trees use the remaining allowance up to their cap.
+Generated trees are collected first to the smaller of their current size or
+10% of that shared allowance; incremental units get what remains after them.
+Managed targets use what remains after both. If protected state leaves less room, mbx
 collects the action store to fit the remaining budget. This order favors shared cached
 results and incremental state over older target directories; allocation is not
 based on measured rebuild cost.

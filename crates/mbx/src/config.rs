@@ -625,7 +625,9 @@ struct RawGc {
     ///
     /// Over budget, mbx collects inactive incremental units least recently
     /// used first, using rustc session directory modification times.
-    /// Generated source trees get whatever budget incremental state leaves.
+    /// Generated source trees are collected first, capped at their current
+    /// size or 10% of this shared budget, whichever is smaller. Incremental
+    /// units get the remaining budget.
     /// With `gc.max_total_size`, defaults to 10% of that total, at least
     /// 10 GiB but never above the total.
     #[usage(

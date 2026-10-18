@@ -90,9 +90,16 @@ pub(super) fn run(
     // a combined budget must not prevent independent target collection when
     // the action store is damaged.
     let mut accounting_complete = true;
+    let generated = collect_generated_first(
+        config,
+        incremental_limit,
+        retention.target_max_age,
+        dry_run,
+        &mut accounting_complete,
+    );
     let incremental = match crate::incremental::collect(
         &config.cache_dir.join("incremental"),
-        incremental_limit,
+        incremental_limit.map(|share| share.saturating_sub(generated.remaining_bytes)),
         retention.incremental_max_age,
         dry_run,
     ) {
@@ -113,16 +120,6 @@ pub(super) fn run(
             }
         }
     };
-    // Generated source trees share the learned incremental budget: both are
-    // per-checkout state that a compilation reads, and both come back on
-    // their own when evicted.
-    let generated = collect_generated(
-        config,
-        incremental_limit.map(|budget| budget.saturating_sub(incremental.remaining_bytes)),
-        retention.target_max_age,
-        dry_run,
-        &mut accounting_complete,
-    );
     // What survives counts against the combined budget the same as learned
     // incremental state: bytes on the disk the limit was set for.
     let reserved_bytes = incremental
@@ -361,6 +358,24 @@ fn merged_target_report(
         remaining_bytes: last.remaining_bytes,
         kept_active_directories: last.kept_active_views,
     }
+}
+
+/// Generated trees get the first, small claim on the shared incremental
+/// budget: at most their current bytes or one tenth of the share. Incremental
+/// units then use the remainder, so busy incremental state cannot starve them.
+fn collect_generated_first(
+    config: &Config,
+    share: Option<u64>,
+    max_age: Option<Duration>,
+    dry_run: bool,
+    accounting_complete: &mut bool,
+) -> crate::out_dir::PruneOutcome {
+    let budget = share.map(|share| {
+        let cap = share / 10;
+        crate::out_dir::stats(&config.cache_dir.join(crate::out_dir::ROOT))
+            .map_or(cap, |stats| stats.remaining_bytes.min(cap))
+    });
+    collect_generated(config, budget, max_age, dry_run, accounting_complete)
 }
 
 /// Collect the stable copies of build-script output nothing has used lately.
@@ -939,13 +954,20 @@ pub(super) fn prune_targets(
     let mut low_disk = None;
     let store_reserve = occupied_store_budget(config, retention, store_reserve);
     let incremental_limit = incremental_limit(config, retention, store_reserve, &mut low_disk);
+    let mut accounting_complete = true;
+    let generated = collect_generated_first(
+        config,
+        incremental_limit,
+        retention.target_max_age,
+        false,
+        &mut accounting_complete,
+    );
     let incremental = crate::incremental::collect(
         &config.cache_dir.join("incremental"),
-        incremental_limit,
+        incremental_limit.map(|share| share.saturating_sub(generated.remaining_bytes)),
         retention.incremental_max_age,
         false,
     );
-    let mut accounting_complete = true;
     let (incremental_bytes, incremental_remaining) = match incremental {
         Ok(outcome) => (outcome.removed_bytes, outcome.remaining_bytes),
         Err(error) => {
@@ -961,13 +983,6 @@ pub(super) fn prune_targets(
             (0, remaining)
         }
     };
-    let generated = collect_generated(
-        config,
-        incremental_limit.map(|budget| budget.saturating_sub(incremental_remaining)),
-        retention.target_max_age,
-        false,
-        &mut accounting_complete,
-    );
     if generated.removed_directories > 0 {
         crate::session::note(&format!(
             "mbx[gc]: {}",
