@@ -41,7 +41,7 @@
 - [`mbx clean [--under <ROOT>] [WORKSPACE]`](/cli/clean.md)
 - [`mbx adopt [-r --recursive] [--dry-run] [PATH]…`](/cli/adopt.md)
 - [`mbx tui [--once]`](/cli/tui.md)
-- [`mbx stats [--json]`](/cli/stats.md)
+- [`mbx stats [--json] [--scheduler]`](/cli/stats.md)
 - [`mbx prefetch <CARGO_ARGS>…`](/cli/prefetch.md)
 - [`mbx exec [--project-root <DIR>] <COMMAND>…`](/cli/exec.md)
 - [`mbx reserve [FLAGS] <COMMAND>…`](/cli/reserve.md)

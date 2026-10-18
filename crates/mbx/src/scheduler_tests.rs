@@ -1758,14 +1758,19 @@ fn compile_mode_keys_cover_effective_rustc_settings() {
     let mode = |args: &[&str]| compile_demand("crate", args).compile_mode.unwrap();
     assert_eq!(
         mode(&[]),
-        "crate [compile codegen opt0 lto-default cgu- debug0 incremental-off]"
+        "crate [compile emit=link crate-type= opt0 lto-default cgu- debug0 incremental-off]"
     );
     assert_eq!(
         mode(&["--emit=dep-info,metadata"]),
-        "crate [compile metadata opt0 lto-default cgu- debug0 incremental-off]"
+        "crate [compile emit=metadata crate-type= opt0 lto-default cgu- debug0 incremental-off]"
     );
-    assert!(mode(&["--emit", "metadata=out,dep-info=dep"]).contains("compile metadata"));
-    assert!(mode(&["--emit=metadata,llvm-ir"]).contains("compile codegen"));
+    assert!(
+        mode(&["--emit", "metadata=out,dep-info=dep"])
+            .contains("compile emit=metadata crate-type=")
+    );
+    assert!(
+        mode(&["--emit=metadata,llvm-ir"]).contains("compile emit=llvm-ir,metadata crate-type=")
+    );
     assert_eq!(
         mode(&[
             "--emit=metadata",
@@ -1791,7 +1796,7 @@ fn compile_mode_keys_cover_effective_rustc_settings() {
             "-Z",
             "threads=2"
         ]),
-        "crate [compile metadata test opt0 lto-off cgu1 debugline-tables-only incremental-off threads=2]"
+        "crate [compile emit=link,metadata crate-type= test opt0 lto-off cgu1 debugline-tables-only incremental-off threads=2]"
     );
     assert!(mode(&["-C", "incremental=second"]).contains("incremental-on"));
     for args in [
@@ -1950,7 +1955,8 @@ fn old_ledgers_drop_compile_trust_but_keep_the_fallback() {
 #[test]
 fn evicted_compile_peaks_cannot_reuse_old_sample_counts() {
     let mut ledger = MemoryLedger::default();
-    let key = "heavy [compile metadata opt0 lto-default cgu- debug0 incremental-off]";
+    let key =
+        "heavy [compile emit=metadata crate-type= opt0 lto-default cgu- debug0 incremental-off]";
     ledger.crates.insert("heavy".into(), 1000);
     ledger.crates.insert(key.into(), 200);
     ledger.compile_samples.insert(key.into(), 3);
@@ -2019,13 +2025,13 @@ fn scheduler_stats_read_old_records_without_locking_or_reclaiming_them() {
     let snapshot = scheduler_snapshot(directory.path(), 100, 100, true);
     let text = snapshot.text();
     assert!(
-        text.contains("samples=3, charge=122 bytes / 2 permits (mode)"),
+        text.contains("samples=3, charge=122 B / 2 permits (mode)"),
         "{text}"
     );
     assert!(text.contains("lease unknown: mode=unknown, build=unknown, domain=unknown"));
     assert!(text.contains("waiter unknown: mode=unknown, build=unknown, domain=old-domain"));
-    assert!(text.contains("lease heavy: mode=heavy [compile metadata"));
-    assert!(text.contains("waiter heavy: mode=heavy [compile metadata"));
+    assert!(text.contains("lease heavy: mode=heavy [compile emit=metadata crate-type="));
+    assert!(text.contains("waiter heavy: mode=heavy [compile emit=metadata crate-type="));
     assert!(text.contains("age="));
     assert!(leases.join("stale").exists());
     assert!(waiters.join("stale").exists());
@@ -2038,7 +2044,7 @@ fn scheduler_stats_read_old_records_without_locking_or_reclaiming_them() {
     assert_eq!(json["entries"][1]["source"], "mode");
     assert_eq!(json["activity"].as_array().unwrap().len(), 4);
     let cpu = scheduler_snapshot(directory.path(), 100, 0, true);
-    assert_eq!(cpu.entries[1].charge_permits, 1);
+    assert_eq!(cpu.entries[1].charge_permits, None);
     assert_eq!(cpu.entries[1].charge_bytes, None);
     let mut ledger = read_ledger(&pool.ledger_path());
     ledger.compile_samples.clear();
@@ -2047,12 +2053,12 @@ fn scheduler_stats_read_old_records_without_locking_or_reclaiming_them() {
     assert!(
         fallback
             .text()
-            .contains("charge=1000 bytes / 10 permits (crate-wide fallback)")
+            .contains("charge=1000 B / 10 permits (crate-wide fallback)")
     );
 }
 
 #[test]
-fn scheduler_stats_preserve_link_and_test_cpu_weights() {
+fn scheduler_stats_defer_link_and_test_charges_to_admission() {
     let directory = tempfile::tempdir().unwrap();
     let pool = pool_at(directory.path(), 10, 100);
     pool.record_peak("crate [link]", 200, true).unwrap();
@@ -2060,12 +2066,170 @@ fn scheduler_stats_preserve_link_and_test_cpu_weights() {
     pool.record_peak("crate [test, 3 threads]", 200, false)
         .unwrap();
     pool.record_cpu("crate [test]", 4).unwrap();
-    let cpu = scheduler_snapshot(directory.path(), 10, 0, true);
-    for (entry, weight) in cpu.entries.iter().zip([2, 3, 4]) {
-        assert_eq!(entry.charge_permits, weight, "{}", entry.key);
+    for unit in [0, 100] {
+        let report = scheduler_snapshot(directory.path(), 10, unit, true);
+        for entry in &report.entries {
+            assert_eq!(entry.charge_bytes, None, "{}", entry.key);
+            assert_eq!(entry.charge_permits, None, "{}", entry.key);
+            assert_eq!(entry.recorded_peak_bytes, 200);
+        }
+        assert!(
+            report
+                .text()
+                .contains("peak=200 B, samples=0, charge=see admission")
+        );
+        assert!(!report.text().contains("see admission (see admission)"));
     }
-    let memory = scheduler_snapshot(directory.path(), 10, 100, true);
-    for (entry, weight) in memory.entries.iter().zip([2, 3, 4]) {
-        assert_eq!(entry.charge_permits, weight, "{}", entry.key);
+}
+
+#[test]
+fn compile_emit_sets_combine_normalize_and_distinguish_codegen_outputs() {
+    let mode = |args: &[&str]| compile_demand("crate", args).compile_mode.unwrap();
+    assert_eq!(mode(&[]), mode(&["--emit=link"]));
+    assert_eq!(
+        mode(&["--emit=metadata"]),
+        mode(&["--emit", "dep-info=dep,metadata=one", "--emit=metadata=two"])
+    );
+    assert_eq!(
+        mode(&["--emit=link", "--emit", "metadata"]),
+        mode(&["--emit=metadata,link,link"])
+    );
+    assert!(mode(&["--emit=link", "--emit=metadata"]).contains("emit=link,metadata "));
+    assert_ne!(
+        mode(&["--emit=link", "--emit=metadata"]),
+        mode(&["--emit=metadata"])
+    );
+    let mut keys = std::collections::BTreeSet::new();
+    for emit in [
+        "metadata", "link", "mir", "obj", "asm", "llvm-ir", "llvm-bc", "dep-info",
+    ] {
+        assert!(keys.insert(mode(&[&format!("--emit={emit}")])), "{emit}");
+    }
+    assert!(mode(&["--emit=dep-info"]).contains("emit= crate-type="));
+}
+
+#[test]
+fn compile_modes_include_all_crate_types_and_the_effective_target() {
+    let mode = |args: &[&str]| compile_demand("crate", args).compile_mode.unwrap();
+    let types = mode(&["--crate-type=rlib,bin", "--crate-type", "rlib,cdylib"]);
+    assert!(types.contains("crate-type=bin,cdylib,rlib "));
+    assert_eq!(types, mode(&["--crate-type", "cdylib,bin,rlib"]));
+    assert_ne!(mode(&["--crate-type=rlib"]), mode(&["--crate-type=bin"]));
+    assert_eq!(
+        mode(&["--target", "first", "--target=wasm32-unknown-unknown"]),
+        mode(&["--target=wasm32-unknown-unknown"])
+    );
+    assert!(
+        mode(&["--target=wasm32-unknown-unknown"]).contains("target=\"wasm32-unknown-unknown\"")
+    );
+    assert_ne!(mode(&[]), mode(&["--target=wasm32-unknown-unknown"]));
+    assert_ne!(
+        mode(&["--target=host test"]),
+        mode(&["--target=host", "--test"])
+    );
+}
+
+#[test]
+fn materially_different_compiles_cannot_reuse_a_trained_light_mode() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 100, 100);
+    pool.record_peak("crate", 1000, false).unwrap();
+    let metadata = compile_demand("crate", &["--crate-type=rlib", "--emit=metadata"]);
+    let mir = compile_demand("crate", &["--crate-type=rlib", "--emit=mir"]);
+    for _ in 0..3 {
+        pool.record_compile(&metadata, 100, false, true).unwrap();
+        pool.record_compile(&mir, 100, false, true).unwrap();
+    }
+    assert_eq!(pool.plan(&metadata), (2, Some(150)));
+    for args in [
+        vec!["--crate-type=rlib", "--emit=link", "--emit=metadata"],
+        vec!["--crate-type=rlib", "--emit=link"],
+        vec![
+            "--crate-type=bin",
+            "--emit=metadata",
+            "--target=wasm32-unknown-unknown",
+        ],
+        vec![
+            "--crate-type=rlib",
+            "--emit=metadata",
+            "--target=wasm32-unknown-unknown",
+        ],
+        vec!["--crate-type=bin", "--emit=metadata"],
+    ] {
+        assert_eq!(
+            pool.plan(&compile_demand("crate", &args)),
+            (10, Some(1000)),
+            "{args:?}"
+        );
+    }
+}
+
+#[test]
+fn wrapper_observations_raise_peaks_but_never_train_a_light_mode() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 100, 100);
+    pool.record_peak("crate", 1000, false).unwrap();
+    let args = vec![std::ffi::OsString::from("--emit=metadata")];
+    let wrapped = Demand::new("crate", false).with_compiler_execution(&args, None, true);
+    let direct = Demand::new("crate", false).with_compiler_execution(&args, None, false);
+    let key = direct.compile_mode.as_ref().unwrap();
+    assert_eq!(wrapped.compile_mode, direct.compile_mode);
+    for _ in 0..3 {
+        pool.record_compile(&wrapped, 81, false, true).unwrap();
+    }
+    let ledger = read_ledger(&pool.ledger_path());
+    assert_eq!(ledger.crates[key], 81);
+    assert!(!ledger.compile_samples.contains_key(key));
+    assert_eq!(pool.plan(&direct), (10, Some(1000)));
+    pool.record_compile(&direct, 81, false, true).unwrap();
+    pool.record_compile(&wrapped, 1200, false, true).unwrap();
+    let ledger = read_ledger(&pool.ledger_path());
+    assert_eq!(ledger.compile_samples[key], 1);
+    assert_eq!(ledger.crates[key], 1200);
+    assert_eq!(ledger.crates["crate"], 1200);
+    pool.record_compile(&wrapped, 800, true, false).unwrap();
+    let ledger = read_ledger(&pool.ledger_path());
+    assert_eq!(ledger.compile_samples[key], 1);
+    assert_eq!(ledger.crates[key], 1600);
+    assert_eq!(ledger.crates["crate"], 1600);
+}
+
+#[test]
+fn compile_keys_do_not_reuse_legacy_classification_samples() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 100, 100);
+    let mut ledger = MemoryLedger::default();
+    let old = "crate [compile metadata opt0 lto-default cgu- debug0 incremental-off]";
+    ledger.crates.insert("crate".into(), 1000);
+    ledger.crates.insert(old.into(), 100);
+    ledger.compile_samples.insert(old.into(), 3);
+    std::fs::write(pool.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
+    assert_eq!(
+        pool.plan(&compile_demand("crate", &["--emit=metadata"])),
+        (10, Some(1000))
+    );
+}
+
+#[test]
+fn scheduler_stats_compile_charges_match_admission_predictions() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 100, 100);
+    let demand = compile_demand("crate", &["--emit=metadata"]);
+    pool.record_peak("crate", 1000, false).unwrap();
+    for _ in 0..4 {
+        let snapshot = scheduler_snapshot(directory.path(), 100, 100, true);
+        let planned = pool.plan(&demand);
+        for entry in &snapshot.entries {
+            if entry.key == demand.compile_mode.as_ref().unwrap().as_str() {
+                assert_eq!(
+                    (entry.charge_permits, entry.charge_bytes),
+                    (Some(planned.0), planned.1)
+                );
+            } else if entry.key == "crate" {
+                assert_eq!(entry.charge_bytes, Some(1000));
+                assert_eq!(entry.charge_permits, Some(10));
+            }
+        }
+        pool.record_compile(&demand, 81, false, true).unwrap();
     }
 }

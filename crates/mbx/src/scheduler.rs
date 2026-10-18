@@ -239,6 +239,8 @@ pub(crate) struct Demand {
     /// A nextest test whose measurements belong in its separate history file.
     per_test: Option<TestIdentity>,
     compile_mode: Option<String>,
+    /// Another wrapper may have returned a cache hit without running rustc.
+    count_compile_samples: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -260,6 +262,7 @@ impl Demand {
             learns_cpu: false,
             profile: None,
             compile_mode: None,
+            count_compile_samples: true,
             per_test: None,
         }
     }
@@ -284,6 +287,31 @@ impl Demand {
             ));
         }
         self
+    }
+
+    /// Build the mode from the effective compiler flags, including a private
+    /// flag appended by mbx after argument parsing. Wrapper RSS can raise a
+    /// peak, but cannot establish a successful real-compiler sample.
+    pub(crate) fn with_compiler_execution(
+        mut self,
+        arguments: &[std::ffi::OsString],
+        appended_flag: Option<&std::ffi::OsStr>,
+        wrapped: bool,
+    ) -> Self {
+        let mut effective = arguments.to_vec();
+        effective.extend(appended_flag.map(std::ffi::OsStr::to_os_string));
+        self.count_compile_samples = !wrapped;
+        self.with_link_profile(&effective)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn compile_mode_key(&self) -> Option<&str> {
+        self.compile_mode.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn counts_compile_samples(&self) -> bool {
+        self.count_compile_samples
     }
 
     /// A test binary, remembered apart from the crate that compiled it.
@@ -311,6 +339,7 @@ impl Demand {
             learns_cpu: true,
             profile: None,
             compile_mode: None,
+            count_compile_samples: true,
             per_test: None,
         }
     }
@@ -324,6 +353,7 @@ impl Demand {
             learns_cpu: true,
             profile: None,
             compile_mode: None,
+            count_compile_samples: true,
             per_test: Some(TestIdentity {
                 binary: binary.to_owned(),
                 test: test.to_owned(),
@@ -1502,6 +1532,7 @@ impl Pool {
         if self.bytes_per_permit == 0 {
             return Ok(());
         }
+        let succeeded = succeeded && demand.count_compile_samples;
         let peak = ledger_peak(measured, oom, false, succeeded, self.bytes_per_permit);
         // Ordinary light crates need no ledger lock. A concurrent first heavy
         // sample may be missed here; that only delays trusting the light mode.
@@ -1798,7 +1829,10 @@ fn link_profile(arguments: &[std::ffi::OsString]) -> String {
 /// Compile suffixes start with `[compile `, unlike link/profile and test
 /// suffixes. Rust crate identifiers contain neither spaces nor brackets.
 fn compile_profile(arguments: &[std::ffi::OsString]) -> String {
-    let mut emit = None;
+    let mut emits = std::collections::BTreeSet::new();
+    let mut saw_emit = false;
+    let mut crate_types = std::collections::BTreeSet::new();
+    let mut target = None;
     let mut test = false;
     let mut incremental = false;
     let mut threads = None;
@@ -1808,12 +1842,35 @@ fn compile_profile(arguments: &[std::ffi::OsString]) -> String {
             test = true;
             continue;
         }
-        if arg == "--emit" {
-            emit = args.next();
+        let emit = if arg == "--emit" {
+            args.next()
+        } else {
+            arg.strip_prefix("--emit=")
+        };
+        if let Some(value) = emit {
+            saw_emit = true;
+            emits.extend(value.split(',').filter_map(|kind| {
+                let kind = kind.split('=').next()?;
+                (kind != "dep-info").then_some(kind)
+            }));
             continue;
         }
-        if let Some(value) = arg.strip_prefix("--emit=") {
-            emit = Some(value);
+        let types = if arg == "--crate-type" {
+            args.next()
+        } else {
+            arg.strip_prefix("--crate-type=")
+        };
+        if let Some(value) = types {
+            crate_types.extend(value.split(','));
+            continue;
+        }
+        let triple = if arg == "--target" {
+            args.next()
+        } else {
+            arg.strip_prefix("--target=")
+        };
+        if let Some(value) = triple {
+            target = Some(value);
             continue;
         }
         let setting = match arg {
@@ -1833,17 +1890,14 @@ fn compile_profile(arguments: &[std::ffi::OsString]) -> String {
             threads = Some(value);
         }
     }
-    let class = if emit.is_some_and(|value| {
-        value
-            .split(',')
-            .all(|kind| matches!(kind.split('=').next(), Some("dep-info" | "metadata")))
-    }) {
-        "metadata"
-    } else {
-        "codegen"
-    };
+    if !saw_emit {
+        emits.insert("link");
+    }
     format!(
-        "{class}{} {} incremental-{}{}",
+        "emit={} crate-type={}{}{} {} incremental-{}{}",
+        emits.into_iter().collect::<Vec<_>>().join(","),
+        crate_types.into_iter().collect::<Vec<_>>().join(","),
+        target.map(|t| format!(" target={t:?}")).unwrap_or_default(),
         if test { " test" } else { "" },
         link_profile(arguments),
         if incremental { "on" } else { "off" },
@@ -1899,7 +1953,7 @@ struct SchedulerEntry {
     recorded_peak_bytes: u64,
     successful_samples: u8,
     charge_bytes: Option<u64>,
-    charge_permits: u64,
+    charge_permits: Option<u64>,
     source: &'static str,
 }
 
@@ -1937,21 +1991,12 @@ fn scheduler_snapshot(
         .iter()
         .map(|(key, &peak)| {
             let mode = key.split_once(" [compile ");
-            let (charge, trusted) = mode.map_or((Some(peak), false), |(name, _)| {
-                compile_prediction(&ledger, name, key)
-            });
-            let threads = ledger.cpus.get(key).copied().unwrap_or_else(|| {
-                key.strip_suffix(" threads]")
-                    .and_then(|s| s.rsplit_once(" [test, "))
-                    .and_then(|(_, n)| n.parse().ok())
-                    .unwrap_or_else(|| {
-                        if key.ends_with(" [test]") {
-                            capacity.div_ceil(2)
-                        } else {
-                            1
-                        }
-                    })
-            });
+            let predictable = mode.is_some() || !key.contains(" [");
+            let (charge, trusted) = if predictable {
+                compile_prediction(&ledger, mode.map_or(key.as_str(), |(name, _)| name), key)
+            } else {
+                (None, false)
+            };
             let charge_bytes = (bytes_per_permit > 0).then_some(charge).flatten();
             SchedulerEntry {
                 key: key.clone(),
@@ -1959,24 +2004,15 @@ fn scheduler_snapshot(
                 successful_samples: ledger.compile_samples.get(key).copied().unwrap_or(0),
                 charge_bytes,
                 charge_permits: charge_bytes
-                    .map_or(
-                        if key.ends_with(" [link]") {
-                            LINK_WEIGHT
-                        } else {
-                            1
-                        },
-                        |b| b.div_ceil(bytes_per_permit),
-                    )
-                    .max(threads)
-                    .clamp(1, capacity),
-                source: if bytes_per_permit == 0 {
+                    .map(|bytes| bytes.div_ceil(bytes_per_permit).clamp(1, capacity)),
+                source: if !predictable {
+                    "see admission"
+                } else if bytes_per_permit == 0 {
                     "CPU-only"
                 } else if trusted {
                     "mode"
-                } else if mode.is_some() {
-                    "crate-wide fallback"
                 } else {
-                    "recorded"
+                    "crate-wide fallback"
                 },
             }
         })
@@ -2049,21 +2085,28 @@ fn scheduler_snapshot(
 impl SchedulerReport {
     pub(crate) fn text(&self) -> String {
         let mut lines = vec![format!(
-            "Scheduler: {} ({} permits, {} bytes/permit)",
+            "Scheduler: {} ({} permits, {}/permit)",
             if self.enabled { "enabled" } else { "disabled" },
             self.capacity,
-            self.bytes_per_permit
+            crate::stats::size(self.bytes_per_permit)
         )];
         for e in &self.entries {
+            let charge = e.charge_bytes.zip(e.charge_permits).map_or_else(
+                || "see admission".to_owned(),
+                |(bytes, permits)| format!("{} / {permits} permits", crate::stats::size(bytes)),
+            );
+            let source = if e.source == "see admission" {
+                String::new()
+            } else {
+                format!(" ({})", e.source)
+            };
             lines.push(format!(
-                "  {}: peak={} bytes, samples={}, charge={} bytes / {} permits ({})",
+                "  {}: peak={}, samples={}, charge={}{}",
                 e.key,
-                e.recorded_peak_bytes,
+                crate::stats::size(e.recorded_peak_bytes),
                 e.successful_samples,
-                e.charge_bytes
-                    .map_or_else(|| "unknown".to_string(), |b| b.to_string()),
-                e.charge_permits,
-                e.source
+                charge,
+                source
             ));
         }
         if self.entries.is_empty() {
@@ -2074,13 +2117,13 @@ impl SchedulerReport {
         );
         for a in &self.activity {
             lines.push(format!(
-                "  {} {}: mode={}, build={}, domain={}, charge={} bytes / {} permits, age={}s",
+                "  {} {}: mode={}, build={}, domain={}, charge={} / {} permits, age={}s",
                 a.kind,
                 a.name,
                 a.mode_key,
                 a.build_id,
                 a.pressure_domain,
-                a.charged_bytes,
+                crate::stats::size(a.charged_bytes),
                 a.charged_permits,
                 a.age_secs
                     .map_or_else(|| "unknown".into(), |s| s.to_string())

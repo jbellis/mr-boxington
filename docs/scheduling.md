@@ -61,22 +61,27 @@ starting weights. Set `scheduler.memory = "none"` to use CPU permits without
 memory weighting.
 
 For non-link compiles of a crate already measured above one memory permit,
-mbx learns separate peaks for metadata-only checks and code generation. The
-mode also includes test compilation, optimization, LTO, codegen units, debug
-info, incremental compilation, and explicit compiler thread settings. After
-three successful samples of a mode (the stored count is capped at three), its
-estimate is the mode's highest peak plus 50% headroom, capped at the crate-wide
-highest peak. Until then, mbx uses the crate-wide peak. Peaks never decrease;
-failed compiles do not count as
-successful samples, and OOM kills raise both peaks. An older shim that drops
-sample counts makes modes return to the crate-wide fallback.
+mbx learns separate peaks for each set of emitted outputs, crate types, and
+explicit target. Repeated emit and crate-type flags are combined, sorted, and
+deduplicated; output paths and dep-info do not distinguish modes. With no
+emit flag, rustc emits a link output. The mode also includes test compilation,
+optimization, LTO, codegen units, debug info, incremental compilation
+(including flags added by mbx), and explicit compiler thread settings.
+After three successful samples of a mode (the stored count is capped at
+three), its estimate is the mode's highest peak plus 50% headroom, capped at
+the crate-wide highest peak. Until then, mbx uses the crate-wide peak. Peaks
+never decrease; failed compiles and compiles through another wrapper do not
+count as successful samples, and OOM kills raise both peaks. An older shim
+that drops sample counts makes modes return to the crate-wide fallback.
 
-`mbx stats` shows scheduler peaks, successful sample counts, estimated charges
-in bytes and permits, and whether each mode uses its own estimate or the
-crate-wide fallback. Its JSON report includes the same scheduler section.
-The read-only activity snapshot shows lease and waiter names, mode keys,
-build IDs, pressure domains, charges, and ages. Older records show unknown
-names; abandoned records can remain visible until an admission reclaims them.
+`mbx stats --scheduler` shows scheduler peaks, successful sample counts, and
+compile charges in readable sizes and permits, with their mode or crate-wide
+fallback source. Link and test-run entries show recorded peaks and defer
+charges to admission. Add `--json` for raw byte counts. Without `--scheduler`,
+the stats output omits this section. The read-only activity snapshot shows
+lease and waiter names, mode keys, build IDs, pressure domains, charges, and
+ages. Older records show unknown names; abandoned records can remain visible
+until an admission reclaims them.
 
 When a compilation cannot fit, it queues before newer requests. New requests
 stop filling the capacity it needs, so a large compilation can run even while

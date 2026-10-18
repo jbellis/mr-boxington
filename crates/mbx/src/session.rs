@@ -1841,6 +1841,27 @@ fn executable_stem(executable: &OsStr) -> Option<&str> {
     Path::new(executable).file_stem()?.to_str()
 }
 
+pub(crate) fn compiler_has_previous_wrapper() -> bool {
+    compiler_has_previous_wrapper_using(|name| std::env::var_os(name))
+}
+
+fn compiler_has_previous_wrapper_using(get: impl Fn(&str) -> Option<OsString>) -> bool {
+    get(PREVIOUS_RUSTC_WRAPPER_ENV).is_some() || get(PREVIOUS_RUSTC_WORKSPACE_WRAPPER_ENV).is_some()
+}
+
+fn transparent_compiler_demand(
+    name: &str,
+    described: &[OsString],
+    incremental_flag: Option<&OsStr>,
+    wrapped: bool,
+) -> crate::scheduler::Demand {
+    crate::scheduler::Demand::new(name, links_natively(described)).with_compiler_execution(
+        described,
+        incremental_flag,
+        wrapped,
+    )
+}
+
 /// Run the compiler without caching. `described` is `arguments` with any
 /// `@argfile` expanded, which is where to look for what is being compiled;
 /// rustc itself is given `arguments` unchanged.
@@ -1866,8 +1887,17 @@ fn run_transparent_rustc(
                 .to_str()
                 .is_some_and(|argument| argument.starts_with("--print"))
     });
+    let incremental_flag = bypassed
+        .then(|| crate::rustc::bypassed_library_incremental_flag(described))
+        .flatten();
     let demand = crate_name.as_deref().filter(|_| !is_query).map(|name| {
-        crate::scheduler::Demand::new(name, links_natively(described)).with_link_profile(described)
+        transparent_compiler_demand(
+            name,
+            described,
+            incremental_flag.as_deref(),
+            compiler_has_previous_wrapper()
+                || workspace_wrapper_arguments(&rustc, &arguments).0.is_some(),
+        )
     });
     let permit = demand
         .as_ref()
@@ -1885,7 +1915,7 @@ fn run_transparent_rustc(
         Command::new(&rustc)
     };
     command.args(&arguments);
-    if bypassed && let Some(flag) = crate::rustc::bypassed_library_incremental_flag(described) {
+    if let Some(flag) = incremental_flag {
         command.arg(flag);
     }
     command.env_remove(PREVIOUS_RUSTC_WRAPPER_ENV);

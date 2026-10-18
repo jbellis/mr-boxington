@@ -2113,3 +2113,48 @@ fn configured_rustc_wrapper_is_recognized() {
     assert!(!is_rustc_wrapper_invocation(os("mbx"), &[os("build")]));
     assert!(!is_rustc_wrapper_invocation(os("cargo"), &[rustc]));
 }
+
+#[test]
+fn bypassed_incremental_flag_is_in_the_transparent_compiler_demand() {
+    let args = vec![
+        OsString::from("--crate-type=rlib"),
+        OsString::from("--emit=metadata"),
+    ];
+    let demand = transparent_compiler_demand(
+        "crate",
+        &args,
+        Some(OsStr::new("-Cincremental=private-state")),
+        false,
+    );
+    assert!(
+        demand
+            .compile_mode_key()
+            .unwrap()
+            .contains("incremental-on")
+    );
+    let cold = transparent_compiler_demand("crate", &args, None, false);
+    assert!(cold.compile_mode_key().unwrap().contains("incremental-off"));
+    assert_ne!(demand.compile_mode_key(), cold.compile_mode_key());
+}
+
+#[test]
+fn either_previous_wrapper_disables_transparent_compile_samples() {
+    let args = vec![
+        OsString::from("--crate-type=rlib"),
+        OsString::from("--emit=metadata"),
+    ];
+    for wrapper in [
+        PREVIOUS_RUSTC_WRAPPER_ENV,
+        PREVIOUS_RUSTC_WORKSPACE_WRAPPER_ENV,
+    ] {
+        let wrapped = compiler_has_previous_wrapper_using(|name| {
+            (name == wrapper).then(|| OsString::from("cache-wrapper"))
+        });
+        assert!(wrapped, "{wrapper}");
+        let demand = transparent_compiler_demand("crate", &args, None, wrapped);
+        assert!(!demand.counts_compile_samples(), "{wrapper}");
+    }
+    let wrapped = compiler_has_previous_wrapper_using(|_| None);
+    assert!(!wrapped);
+    assert!(transparent_compiler_demand("crate", &args, None, wrapped).counts_compile_samples());
+}

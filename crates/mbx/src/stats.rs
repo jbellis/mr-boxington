@@ -125,7 +125,7 @@ impl From<&savings::Tally> for Lifetime {
     }
 }
 
-fn size(bytes: u64) -> String {
+pub(crate) fn size(bytes: u64) -> String {
     ByteSize::b(bytes).display().iec().to_string()
 }
 
@@ -313,7 +313,7 @@ mod tests {
         report.scheduler = Some(crate::scheduler::scheduler_report(&config));
         let text = report.text(false);
         assert!(
-            text.contains("Scheduler: enabled (4 permits, 1000 bytes/permit)"),
+            text.contains("Scheduler: enabled (4 permits, 1000 B/permit)"),
             "{text}"
         );
         assert!(text.contains("No recorded memory peaks."));
@@ -331,6 +331,8 @@ mod tests {
         let report = collect(&store, &root.path().join("targets")).unwrap();
         let json = serde_json::to_value(&report).unwrap();
         assert_eq!(json["version"], 1);
+        assert!(json.get("scheduler").is_none());
+        assert!(!report.text(false).contains("Scheduler:"));
         assert!(json["savings"]["since_unix_secs"].is_null());
         assert_eq!(json["cache"]["bytes"], 0);
         assert!(report.text(true).contains("no savings recorded yet"));

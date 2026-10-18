@@ -499,9 +499,13 @@ pub(crate) fn compile(
     // The machine-wide permit is taken after every chance to hit the cache,
     // and before anything expensive starts. The timer starts afterwards: time
     // spent waiting for the machine is not time this compilation cost.
-    let demand =
-        crate::scheduler::Demand::new(invocation.crate_name(), invocation.links_natively())
-            .with_link_profile(&profile_arguments(&arguments));
+    let (demand, incremental_flag) = compiler_demand(
+        invocation.crate_name(),
+        invocation.links_natively(),
+        &arguments,
+        learned.directory.as_deref(),
+        wrapper_argument,
+    );
     let permit = crate::scheduler::pool().and_then(|pool| pool.admit(&demand));
     // Capture these after admission: an edit while this compile waits for
     // capacity happened before rustc ran and belongs to the valid compilation
@@ -517,12 +521,9 @@ pub(crate) fn compile(
     let mut command = compiler_command(rustc, wrapper_argument);
     command.args(&arguments).current_dir(&working_dir);
     let private_outputs = private_inputs || learned.engaged();
-    if let Some(directory) = learned.directory.as_deref() {
-        // Appended here rather than to the parsed argument vector: the parser
-        // treats incremental state as uncacheable and would bypass the whole
-        // compilation, which is the opposite of what this is for.
-        let mut flag = OsString::from("-Cincremental=");
-        flag.push(directory);
+    if let Some(flag) = incremental_flag {
+        // Keep private incremental state out of cacheability parsing, while
+        // admission above still sees the command that actually runs.
         command.arg(flag);
     }
     if private_outputs {
@@ -1007,6 +1008,22 @@ fn profile_arguments(arguments: &[OsString]) -> Vec<OsString> {
     RustcInvocation::expand_arguments(arguments).unwrap_or_else(|_| arguments.to_vec())
 }
 
+fn compiler_demand(
+    name: &str,
+    links: bool,
+    arguments: &[OsString],
+    incremental_directory: Option<&Path>,
+    wrapper_argument: Option<&OsStr>,
+) -> (crate::scheduler::Demand, Option<OsString>) {
+    let flag = incremental_directory.map(private_incremental_flag);
+    let demand = crate::scheduler::Demand::new(name, links).with_compiler_execution(
+        &profile_arguments(arguments),
+        flag.as_deref(),
+        session::compiler_has_previous_wrapper() || wrapper_argument.is_some(),
+    );
+    (demand, flag)
+}
+
 /// Compile a build script whose native link cannot be action-cached, then
 /// install the execution-cache launcher keyed by its compilation action.
 fn compile_execution_only_build_script(
@@ -1018,8 +1035,13 @@ fn compile_execution_only_build_script(
     outputs: &RustcOutputs,
     portable: &Portable,
 ) -> Result<ExitCode> {
-    let demand = crate::scheduler::Demand::new(invocation.crate_name(), true)
-        .with_link_profile(&profile_arguments(arguments));
+    let (demand, _) = compiler_demand(
+        invocation.crate_name(),
+        true,
+        arguments,
+        None,
+        wrapper_argument,
+    );
     let permit = crate::scheduler::pool().and_then(|pool| pool.admit(&demand));
     let required_inputs = invocation.required_inputs_in(working_dir);
     let source = working_dir.join(invocation.source());
@@ -1321,6 +1343,12 @@ pub(crate) fn incremental_directory(invocation: &CacheDigest, crate_name: &str) 
     }
 }
 
+fn private_incremental_flag(directory: &Path) -> OsString {
+    let mut flag = OsString::from("-Cincremental=");
+    flag.push(directory);
+    flag
+}
+
 /// The incremental flag for a workspace library that mbx cannot cache.
 ///
 /// A `staticlib`, `cdylib`, or `dylib` bypasses the cache before any learned
@@ -1366,9 +1394,7 @@ pub(crate) fn bypassed_library_incremental_flag(arguments: &[OsString]) -> Optio
         identity.push(0);
     }
     let directory = incremental_directory(&CacheDigest::blake3(&identity), &crate_name)?;
-    let mut flag = OsString::from("-Cincremental=");
-    flag.push(directory);
-    Some(flag)
+    Some(private_incremental_flag(&directory))
 }
 
 /// Make sure the unit's state directory exists and is inside its budget.
