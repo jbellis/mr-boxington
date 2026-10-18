@@ -212,6 +212,9 @@ fn append(dir: &Path, mut observation: Observation) -> Result<()> {
     compact(&mut observation.name)?;
     compact(&mut observation.key)?;
     compact(&mut observation.pressure_domain)?;
+    if let Some(build_id) = &mut observation.build_id {
+        compact(build_id)?;
+    }
     let mut line = serde_json::to_vec(&observation)?;
     line.push(b'\n');
     eyre::ensure!(line.len() < 1024, "observation exceeds line size limit");
@@ -879,6 +882,17 @@ mod tests {
         let summary = Summary::read(dir.path());
         assert_eq!(summary.keys[0].median_peak_predicted_ratio, Some(2.5));
         assert_eq!(summary.keys[0].p90_peak_predicted_ratio, Some(4.0));
+    }
+
+    #[test]
+    fn a_long_build_id_is_shortened_instead_of_dropping_the_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut long = observation(Some(1), "success", 1);
+        long.build_id = Some("b".repeat(2000));
+        append(dir.path(), long).unwrap();
+        let summary = Summary::read(dir.path());
+        assert_eq!(summary.keys.len(), 1);
+        assert_eq!(summary.keys[0].counts.n, 1);
     }
 
     #[test]
