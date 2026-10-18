@@ -88,9 +88,10 @@ key, build ID, pressure domain, age, and the charge it was really admitted or
 queued with. Older records show unknown names; abandoned records can remain
 visible until an admission reclaims them.
 
-When a compilation cannot fit, it queues before newer requests. Newer requests
-may use capacity a waiting request cannot use when it next becomes able to
-start. Within one scope this never delays an older request. When a request
+When a compilation cannot fit, it queues before newer requests, so a large
+compilation still runs while other builds keep submitting small ones. Newer
+requests may use capacity a waiting request cannot use when it next becomes
+able to start. Within one scope this never delays an older request. When a request
 waits on its own build or container limit, the existing rule already lets
 other builds or containers start, which can rarely delay the waiting request
 after a pass. Cancelling a waiter or killing its process releases its queue
