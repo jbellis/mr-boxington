@@ -65,32 +65,23 @@ name paths under `/src` instead of the checkout.
 mbx keeps the state and its records under `incremental/` in the cache
 directory, separately for each checkout. `cargo clean` does not remove this
 state. `mbx clean` and `mbx cache remove` remove it for the selected workspace.
-[Collection](/managed-targets#collection) removes it for expired or
-least-recently-used checkouts, but never removes state a running build is using.
-A deleted checkout's state stays until then too, so that a new checkout can
-start from it.
+[Collection](/managed-targets#collection) collects individual compilation units
+across all checkouts. A deleted checkout can still seed a new checkout until
+its units expire or the budget needs their space. Each profile, target kind,
+feature set, or dependency identity can have its own unit. Units age by the
+newest rustc session directory's modification time, falling back to the unit
+directory's modification time when there are no sessions. Building another
+unit in the same checkout does not refresh old units. Active checkout leases
+and held rustc session locks protect state currently in use.
 
-### Bound the storage
+### Storage and collection
 
-`learned_incremental_max_size` limits each crate to 8 GiB by default. Once a
-crate exceeds that limit, mbx warns and discards its state before the next
-compilation. Raise it with:
-
-```sh
-mbx settings set learned_incremental_max_size 12GiB
-```
-
-The environment equivalent is `MBX_LEARNED_INCREMENTAL_MAX_SIZE`; `"none"`
-disables the limit. rustc normally removes superseded sessions, so the limit is
-a backstop, but a large crate in a debug build can need several GiB. If the
-warning appears on every edit, raise the limit; otherwise mbx keeps discarding
-the state and the crate recompiles in full on every edit.
-
-Collection also bounds private state across all checkouts with
-`gc.incremental_max_size`, which defaults to 5% of the cache disk, between
-10 GiB and 100 GiB. `gc.incremental_max_age` defaults to 30 days. Collection
-removes the least-recently-used checkouts first, but keeps the most recent one
-even when it alone exceeds the aggregate budget. To change either limit:
+`gc.incremental_max_size` bounds private state across all checkouts. It
+defaults to 5% of the cache disk, between 10 GiB and 100 GiB.
+`gc.incremental_max_age` defaults to 30 days. Collection removes expired units
+first, then remaining units least recently used first until the budget is met.
+Live checkouts retain their bookkeeping even when all their units are removed.
+To change either limit:
 
 ```sh
 mbx settings set gc.incremental_max_size 30GiB   # or none
@@ -100,9 +91,14 @@ mbx settings set gc.incremental_max_age 14d      # or none
 When set, `gc.max_total_size` is one combined budget for the action store,
 [managed target directories](/managed-targets), learned incremental state, and
 generated source trees. The aggregate incremental cap defaults to 10% of that
-total, at least 10 GiB but never above the total; the per-crate limit stays at
-8 GiB. Explicit incremental limits still apply. See
-[Single cache budget](/configuration#single-cache-budget).
+total, at least 10 GiB but never above the total. Explicit incremental limits
+still apply. See [Single cache budget](/configuration#single-cache-budget).
+
+The former `learned_incremental_max_size` setting is removed; existing config
+files containing it warn and continue. As an internal backstop, a learned unit
+whose existing state exceeds half the resolved aggregate incremental budget
+takes the shared compilation path for that compile. Its state remains for GC;
+with no aggregate budget, this backstop is disabled.
 
 ## Eager incremental reuse
 
@@ -147,7 +143,7 @@ Measure the initial cost and later edits on your workload before you enable it:
 - Fresh CI runners with no retained state pay the initial cost without the
   next-build benefit.
 
-The state uses the same [storage limits and cleanup](#bound-the-storage) as
+The state uses the same [storage limits and cleanup](#storage-and-collection) as
 learned incremental reuse. For useful reuse, keep the same checkout and target
 paths, toolchain, and build flags. Eager incremental reuse also interacts with
 other features:

@@ -138,7 +138,7 @@ enum Commands {
     Settings(settings::SettingsArgs),
     /// Collect build state and evict store objects to fit the size budgets.
     ///
-    /// mbx collects learned incremental state and managed targets first, then
+    /// mbx collects learned incremental units and managed targets first, then
     /// evicts store objects until the action store fits its budget
     /// (`--max-size`, or `gc.max_size` by default, lowered when
     /// `gc.max_total_size` leaves less room). Under a combined budget,
@@ -147,8 +147,9 @@ enum Commands {
     /// When a disk has less free space than `gc.min_free_size`, mbx also
     /// collects past those budgets to free
     /// the shortfall: private state and managed targets go first, then shared
-    /// store objects, even below `gc.max_size`. Active and most recently used
-    /// state stays, so a disk filled by something else can remain short.
+    /// store objects, even below `gc.max_size`. Active state, held incremental
+    /// locks, and the most recent target stay, so a disk filled by something
+    /// else can remain short.
     ///
     /// An evicted object is rebuilt when a build needs it again.
     Gc(gc::GcArgs),

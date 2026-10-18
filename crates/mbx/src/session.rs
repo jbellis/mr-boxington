@@ -107,7 +107,7 @@ pub(crate) const GC_CACHE_DIR_ENV: &str = "MBX_SESSION_GC_CACHE_DIR";
 pub(crate) const GC_TARGET_ROOT_ENV: &str = "MBX_SESSION_GC_TARGET_ROOT";
 pub(crate) const GC_EXECUTABLE_ENV: &str = "MBX_SESSION_GC_EXECUTABLE";
 pub(crate) const LEARNED_INCREMENTAL_ENV: &str = "MBX_LEARNED_INCREMENTAL";
-pub(crate) const LEARNED_INCREMENTAL_MAX_SIZE_ENV: &str = "MBX_LEARNED_INCREMENTAL_MAX_SIZE";
+pub(crate) const INCREMENTAL_BUDGET_ENV: &str = "MBX_SESSION_INCREMENTAL_BUDGET";
 pub(crate) const INCREMENTAL_ROOT_ENV: &str = "MBX_INCREMENTAL_ROOT";
 pub(crate) const MANAGED_TARGET_LINKERS_ENV: &str = "MBX_MANAGED_TARGET_LINKERS";
 pub(crate) const MANAGED_LINKER_ENV: &str = "MBX_MANAGED_LINKER";
@@ -2315,19 +2315,16 @@ pub(crate) fn eager_incremental_requested() -> bool {
     std::env::var_os(EAGER_INCREMENTAL_ENV).is_some_and(|value| value == "1")
 }
 
-/// How much incremental state one crate may keep before the shim discards it;
-/// `None` is no limit. The session writes the resolved setting, but a shim
-/// running without one may inherit the user's own spelling, so both a byte
-/// count and a size with a unit are accepted. Anything unreadable falls back
-/// to the declared default rather than to no limit or to zero.
-pub(crate) fn learned_incremental_max_size() -> Option<u64> {
-    let default = Some(crate::config::DEFAULT_LEARNED_INCREMENTAL_MAX_SIZE);
-    match std::env::var(LEARNED_INCREMENTAL_MAX_SIZE_ENV) {
-        Ok(value) if !value.trim().is_empty() => {
-            crate::config::parse_optional_byte_size(&value).unwrap_or(default)
-        }
-        _ => default,
-    }
+/// The resolved aggregate incremental budget, forwarded by the session.
+/// A standalone shim without a budget applies no backstop.
+pub(crate) fn incremental_budget() -> Option<u64> {
+    std::env::var(INCREMENTAL_BUDGET_ENV)
+        .ok()
+        .and_then(|value| {
+            crate::config::parse_optional_byte_size(&value)
+                .ok()
+                .flatten()
+        })
 }
 
 /// Tell the session that this compilation was not cacheable.

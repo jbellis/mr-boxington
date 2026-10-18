@@ -76,6 +76,12 @@ impl LearnedPlan {
                 compilation.invocation.crate_name(),
                 shares_incremental_state(compilation.rustc, compilation.invocation),
             );
+            if self.directory.as_ref().is_some_and(|directory| {
+                incremental_state_exceeds_backstop(directory, session::incremental_budget())
+            }) {
+                self.hot = false;
+                self.directory = None;
+            }
         }
         self
     }
@@ -1485,22 +1491,12 @@ pub(crate) fn incremental_directory(
             "incremental state for {crate_name} was not seeded: {error:#}"
         ));
     }
-    match prepare_incremental_directory(&directory, session::learned_incremental_max_size()) {
-        Ok(discarded) => {
-            if let Some(bytes) = discarded {
-                // Said out loud: the build goes on to report this compilation
-                // as incremental, and a crate whose state is discarded on
-                // every edit is indistinguishable from the outside from
-                // incremental compilation that simply does not help.
-                session::report_shim_warning(&format!(
-                    "discarded {} of incremental state for {crate_name}: it passed learned_incremental_max_size, which can be raised to keep it",
-                    bytesize::ByteSize::b(bytes).display().iec()
-                ));
-            }
-            Some(directory)
-        }
+    match std::fs::create_dir_all(&directory) {
+        Ok(()) => Some(directory),
         Err(error) => {
-            session::report_shim_warning(&format!("incremental state was not prepared: {error:#}"));
+            session::report_shim_warning(&format!(
+                "incremental state was not prepared for {crate_name}: {error:#}"
+            ));
             None
         }
     }
@@ -1560,26 +1556,10 @@ pub(crate) fn bypassed_library_incremental_flag(arguments: &[OsString]) -> Optio
     Some(private_incremental_flag(&directory))
 }
 
-/// Make sure the unit's state directory exists and is inside its budget.
-///
-/// rustc keeps about one session's worth of state per crate and removes the
-/// sessions it has superseded, so the state is proportional to the crate rather
-/// than to how long it has been edited. The budget is a backstop against state
-/// rustc could not clean up, not a ceiling ordinary crates should reach: state
-/// discarded before every compile is a full recompilation reported as
-/// incremental, the opposite of what it is for. Returns how many bytes were
-/// discarded, if any.
-fn prepare_incremental_directory(directory: &Path, budget: Option<u64>) -> Result<Option<u64>> {
-    let discarded = budget.and_then(|budget| {
-        let bytes = directory_bytes(directory);
-        (bytes > budget).then_some(bytes)
-    });
-    if discarded.is_some() {
-        std::fs::remove_dir_all(directory)
-            .wrap_err("failed to discard oversized incremental state")?;
-    }
-    std::fs::create_dir_all(directory).wrap_err("failed to create the incremental directory")?;
-    Ok(discarded)
+/// Oversized learned state takes the shared compilation path this time.
+/// Leave it intact for collection instead of rewriting it on every edit.
+fn incremental_state_exceeds_backstop(directory: &Path, budget: Option<u64>) -> bool {
+    budget.is_some_and(|budget| directory_bytes(directory) > budget / 2)
 }
 
 fn directory_bytes(directory: &Path) -> u64 {

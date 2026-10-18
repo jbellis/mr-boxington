@@ -75,7 +75,7 @@ accept values such as `30s`, `15m`, `1h`, and `30d`.
 | Pin a linker per profile or target | [Managed linkers](/linkers) |
 | Tune the shared compiler pool | [Parallel builds](/scheduling) |
 | Keep private incremental state from the first compilation | `mbx settings set eager_incremental true`; [incremental builds](/incremental#eager-incremental-reuse) |
-| Bound learned incremental state per crate | `mbx settings set learned_incremental_max_size 12GiB`; [incremental builds](/incremental#bound-the-storage) |
+| Bound private incremental state across checkouts | `mbx settings set gc.incremental_max_size 30GiB`; [incremental builds](/incremental#storage-and-collection) |
 | Compare restored outputs with fresh compilations | `MBX_VERIFY=1`; [troubleshooting](/troubleshooting#verify-mode) |
 
 <span id="managed-linkers"></span>
@@ -176,7 +176,8 @@ incremental state, and [generated source trees](/limits#out-dir-sharing).
 These components share the budget without the usual disk-scaled size caps;
 learned incremental state and generated source trees default to a cap of 10%
 of the total, at least 10 GiB but never above the total.
-The per-crate learned incremental limit still defaults to 8 GiB.
+Incremental units are collected individually by age and least recent use;
+a build in the same checkout does not refresh unused units.
 Explicit component limits still apply; remove those settings if you want mbx
 to manage the allocation. Age limits and the automatic disk-free-space
 safeguard remain enabled.
@@ -192,8 +193,8 @@ based on measured rebuild cost.
 The budget is a **logical-byte collection target**, not a physical disk quota.
 Shared blocks can make physical usage smaller, while metadata, session history,
 and temporary files add overhead outside the budget. Builds can exceed the
-budget between sweeps. Active builds, the most recently used state, explicitly
-kept targets, and untracked state can also prevent collection from reaching it;
+budget between sweeps. Active builds, held incremental session locks, the most recently used target,
+explicitly kept targets, and untracked state can also prevent collection from reaching it;
 mbx warns when the combined remainder exceeds the budget. If a component cannot
 be measured, mbx reports that the combined budget could not be verified and
 conservatively gives the action store no remaining allowance. Use
@@ -225,7 +226,6 @@ checked-in `.mbx.toml`, which rejects them; see
 cache_dir = "/var/cache/mbx"
 incremental = false
 eager_incremental = false  # opt-in state from the first compilation
-learned_incremental_max_size = "8GiB"  # or "none"
 share_out_dir = true
 share_workspace_root = false
 build_script_execution = true
