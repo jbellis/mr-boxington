@@ -1753,7 +1753,14 @@ fn relative_external_native_paths_are_mapped_from_the_working_directory() {
 fn learned_incremental_demand_uses_the_flag_appended_to_the_command() {
     let args = vec![OsString::from("--emit=metadata")];
     let directory = Path::new("private-incremental");
-    let (demand, flag) = compiler_demand("crate", false, &args, Some(directory), None);
+    let (demand, flag) = compiler_demand(
+        "crate",
+        false,
+        OsStr::new("rustc"),
+        &args,
+        Some(directory),
+        None,
+    );
     assert_eq!(
         flag,
         Some(OsString::from("-Cincremental=private-incremental"))
@@ -1764,17 +1771,26 @@ fn learned_incremental_demand_uses_the_flag_appended_to_the_command() {
             .unwrap()
             .contains("incremental-on")
     );
-    let (cold, flag) = compiler_demand("crate", false, &args, None, None);
+    let (cold, flag) = compiler_demand("crate", false, OsStr::new("rustc"), &args, None, None);
     assert!(flag.is_none());
     assert!(cold.compile_mode_key().unwrap().contains("incremental-off"));
     assert_ne!(demand.compile_mode_key(), cold.compile_mode_key());
 }
 
 #[test]
-fn prior_wrapper_arguments_disable_samples_for_both_cached_launch_paths() {
+fn cached_clippy_compiles_count_samples_under_their_own_mode() {
     let args = vec![OsString::from("--emit=metadata")];
-    for links in [false, true] {
-        let (demand, _) = compiler_demand("crate", links, &args, None, Some(OsStr::new("rustc")));
-        assert!(!demand.counts_compile_samples());
-    }
+    let clippy_driver = OsStr::new("clippy-driver");
+    let (clippy, _) = compiler_demand(
+        "crate",
+        false,
+        clippy_driver,
+        &args,
+        None,
+        Some(OsStr::new("rustc")),
+    );
+    let (check, _) = compiler_demand("crate", false, OsStr::new("rustc"), &args, None, None);
+    assert!(clippy.counts_compile_samples());
+    assert!(check.counts_compile_samples());
+    assert_ne!(clippy.compile_mode_key(), check.compile_mode_key());
 }

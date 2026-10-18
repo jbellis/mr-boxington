@@ -502,6 +502,7 @@ pub(crate) fn compile(
     let (demand, incremental_flag) = compiler_demand(
         invocation.crate_name(),
         invocation.links_natively(),
+        rustc,
         &arguments,
         learned.directory.as_deref(),
         wrapper_argument,
@@ -1008,9 +1009,12 @@ fn profile_arguments(arguments: &[OsString]) -> Vec<OsString> {
     RustcInvocation::expand_arguments(arguments).unwrap_or_else(|_| arguments.to_vec())
 }
 
+/// `wrapper_argument` is set only when `rustc` is clippy-driver, which is
+/// handed the real rustc and compiles in its own process.
 fn compiler_demand(
     name: &str,
     links: bool,
+    rustc: &OsStr,
     arguments: &[OsString],
     incremental_directory: Option<&Path>,
     wrapper_argument: Option<&OsStr>,
@@ -1019,7 +1023,8 @@ fn compiler_demand(
     let demand = crate::scheduler::Demand::new(name, links).with_compiler_execution(
         &profile_arguments(arguments),
         flag.as_deref(),
-        session::compiler_has_previous_wrapper() || wrapper_argument.is_some(),
+        session::compiler_runs_through_wrapper(rustc),
+        wrapper_argument.is_some(),
     );
     (demand, flag)
 }
@@ -1038,6 +1043,7 @@ fn compile_execution_only_build_script(
     let (demand, _) = compiler_demand(
         invocation.crate_name(),
         true,
+        rustc,
         arguments,
         None,
         wrapper_argument,

@@ -2109,16 +2109,16 @@ fn compile_emit_sets_combine_normalize_and_distinguish_codegen_outputs() {
 }
 
 #[test]
-fn compile_modes_include_all_crate_types_and_the_effective_target() {
+fn compile_modes_include_all_crate_types_and_every_target() {
     let mode = |args: &[&str]| compile_demand("crate", args).compile_mode.unwrap();
     let types = mode(&["--crate-type=rlib,bin", "--crate-type", "rlib,cdylib"]);
     assert!(types.contains("crate-type=bin,cdylib,rlib "));
     assert_eq!(types, mode(&["--crate-type", "cdylib,bin,rlib"]));
     assert_ne!(mode(&["--crate-type=rlib"]), mode(&["--crate-type=bin"]));
-    assert_eq!(
-        mode(&["--target", "first", "--target=wasm32-unknown-unknown"]),
-        mode(&["--target=wasm32-unknown-unknown"])
-    );
+    let repeated = mode(&["--target", "first", "--target=wasm32-unknown-unknown"]);
+    assert_ne!(repeated, mode(&["--target=wasm32-unknown-unknown"]));
+    assert_ne!(repeated, mode(&["--target=first"]));
+    assert!(repeated.contains("targets=[\"first\", \"wasm32-unknown-unknown\"]"));
     assert!(
         mode(&["--target=wasm32-unknown-unknown"]).contains("target=\"wasm32-unknown-unknown\"")
     );
@@ -2170,8 +2170,8 @@ fn wrapper_observations_raise_peaks_but_never_train_a_light_mode() {
     let pool = pool_at(directory.path(), 100, 100);
     pool.record_peak("crate", 1000, false).unwrap();
     let args = vec![std::ffi::OsString::from("--emit=metadata")];
-    let wrapped = Demand::new("crate", false).with_compiler_execution(&args, None, true);
-    let direct = Demand::new("crate", false).with_compiler_execution(&args, None, false);
+    let wrapped = Demand::new("crate", false).with_compiler_execution(&args, None, true, false);
+    let direct = Demand::new("crate", false).with_compiler_execution(&args, None, false, false);
     let key = direct.compile_mode.as_ref().unwrap();
     assert_eq!(wrapped.compile_mode, direct.compile_mode);
     for _ in 0..3 {

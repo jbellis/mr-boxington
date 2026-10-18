@@ -2125,6 +2125,7 @@ fn bypassed_incremental_flag_is_in_the_transparent_compiler_demand() {
         &args,
         Some(OsStr::new("-Cincremental=private-state")),
         false,
+        false,
     );
     assert!(
         demand
@@ -2132,29 +2133,69 @@ fn bypassed_incremental_flag_is_in_the_transparent_compiler_demand() {
             .unwrap()
             .contains("incremental-on")
     );
-    let cold = transparent_compiler_demand("crate", &args, None, false);
+    let cold = transparent_compiler_demand("crate", &args, None, false, false);
     assert!(cold.compile_mode_key().unwrap().contains("incremental-off"));
     assert_ne!(demand.compile_mode_key(), cold.compile_mode_key());
 }
 
 #[test]
-fn either_previous_wrapper_disables_transparent_compile_samples() {
+fn only_a_compiler_run_through_another_program_is_wrapped() {
+    let rustc = OsStr::new("/toolchain/bin/rustc");
+    let clippy = OsStr::new("/toolchain/bin/clippy-driver");
+    let other = OsStr::new("/usr/bin/cache-wrapper");
+    let env = |cache: Option<&OsStr>, workspace: Option<&OsStr>| {
+        let cache = cache.map(OsStr::to_os_string);
+        let workspace = workspace.map(OsStr::to_os_string);
+        move |name: &str| match name {
+            PREVIOUS_RUSTC_WRAPPER_ENV => cache.clone(),
+            PREVIOUS_RUSTC_WORKSPACE_WRAPPER_ENV => workspace.clone(),
+            _ => None,
+        }
+    };
+    // Cargo's RUSTC_WRAPPER runs in front of every compiler call.
+    assert!(compiler_runs_through_wrapper_using(
+        rustc,
+        env(Some(other), None)
+    ));
+    assert!(compiler_runs_through_wrapper_using(
+        clippy,
+        env(Some(other), None)
+    ));
+    // A workspace wrapper other than clippy-driver runs in place of rustc.
+    assert!(compiler_runs_through_wrapper_using(
+        other,
+        env(None, Some(other))
+    ));
+    // Under `cargo clippy`, dependencies still run rustc, and clippy-driver
+    // compiles in its own process.
+    assert!(!compiler_runs_through_wrapper_using(
+        rustc,
+        env(None, Some(clippy))
+    ));
+    assert!(!compiler_runs_through_wrapper_using(
+        clippy,
+        env(None, Some(clippy))
+    ));
+    assert!(!compiler_runs_through_wrapper_using(rustc, env(None, None)));
+}
+
+#[test]
+fn transparent_wrapped_compiles_do_not_count_samples_and_clippy_has_its_own_mode() {
     let args = vec![
         OsString::from("--crate-type=rlib"),
         OsString::from("--emit=metadata"),
     ];
-    for wrapper in [
-        PREVIOUS_RUSTC_WRAPPER_ENV,
-        PREVIOUS_RUSTC_WORKSPACE_WRAPPER_ENV,
-    ] {
-        let wrapped = compiler_has_previous_wrapper_using(|name| {
-            (name == wrapper).then(|| OsString::from("cache-wrapper"))
-        });
-        assert!(wrapped, "{wrapper}");
-        let demand = transparent_compiler_demand("crate", &args, None, wrapped);
-        assert!(!demand.counts_compile_samples(), "{wrapper}");
-    }
-    let wrapped = compiler_has_previous_wrapper_using(|_| None);
-    assert!(!wrapped);
-    assert!(transparent_compiler_demand("crate", &args, None, wrapped).counts_compile_samples());
+    let wrapped = transparent_compiler_demand("crate", &args, None, true, false);
+    assert!(!wrapped.counts_compile_samples());
+    let check = transparent_compiler_demand("crate", &args, None, false, false);
+    let clippy = transparent_compiler_demand("crate", &args, None, false, true);
+    assert!(check.counts_compile_samples());
+    assert!(clippy.counts_compile_samples());
+    assert_ne!(check.compile_mode_key(), clippy.compile_mode_key());
+    assert!(
+        clippy
+            .compile_mode_key()
+            .unwrap()
+            .contains("[compile clippy ")
+    );
 }

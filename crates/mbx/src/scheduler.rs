@@ -297,11 +297,22 @@ impl Demand {
         arguments: &[std::ffi::OsString],
         appended_flag: Option<&std::ffi::OsStr>,
         wrapped: bool,
+        clippy: bool,
     ) -> Self {
         let mut effective = arguments.to_vec();
         effective.extend(appended_flag.map(std::ffi::OsStr::to_os_string));
         self.count_compile_samples = !wrapped;
-        self.with_link_profile(&effective)
+        let mut demand = self.with_link_profile(&effective);
+        // Clippy runs lint passes a plain check does not, so it learns its own
+        // estimate rather than borrowing one from `cargo check`.
+        if clippy && demand.compile_mode.is_some() {
+            demand.compile_mode = Some(format!(
+                "{} [compile clippy {}]",
+                demand.name,
+                compile_profile(&effective)
+            ));
+        }
+        demand
     }
 
     #[cfg(test)]
@@ -1832,7 +1843,7 @@ fn compile_profile(arguments: &[std::ffi::OsString]) -> String {
     let mut emits = std::collections::BTreeSet::new();
     let mut saw_emit = false;
     let mut crate_types = std::collections::BTreeSet::new();
-    let mut target = None;
+    let mut targets = Vec::new();
     let mut test = false;
     let mut incremental = false;
     let mut threads = None;
@@ -1870,7 +1881,7 @@ fn compile_profile(arguments: &[std::ffi::OsString]) -> String {
             arg.strip_prefix("--target=")
         };
         if let Some(value) = triple {
-            target = Some(value);
+            targets.push(value);
             continue;
         }
         let setting = match arg {
@@ -1897,7 +1908,14 @@ fn compile_profile(arguments: &[std::ffi::OsString]) -> String {
         "emit={} crate-type={}{}{} {} incremental-{}{}",
         emits.into_iter().collect::<Vec<_>>().join(","),
         crate_types.into_iter().collect::<Vec<_>>().join(","),
-        target.map(|t| format!(" target={t:?}")).unwrap_or_default(),
+        // Every target, in order, when there is more than one: such a compile
+        // must not share a key with any single-target compile, whichever
+        // target a rustc would honor.
+        match targets.as_slice() {
+            [] => String::new(),
+            [target] => format!(" target={target:?}"),
+            targets => format!(" targets={targets:?}"),
+        },
         if test { " test" } else { "" },
         link_profile(arguments),
         if incremental { "on" } else { "off" },
@@ -1941,6 +1959,9 @@ fn trim_compile_ledger(ledger: &mut MemoryLedger) {
 #[derive(Debug, Serialize)]
 pub(crate) struct SchedulerReport {
     enabled: bool,
+    /// The workspace `.mbx.toml` applied to these settings; `None` means the
+    /// global configuration alone.
+    settings: Option<String>,
     capacity: u64,
     bytes_per_permit: u64,
     entries: Vec<SchedulerEntry>,
@@ -1969,14 +1990,16 @@ struct SchedulerActivity {
     age_secs: Option<u64>,
 }
 
-pub(crate) fn scheduler_report(config: &Config) -> SchedulerReport {
+pub(crate) fn scheduler_report(config: &Config, settings: Option<&Path>) -> SchedulerReport {
     let capacity = config.scheduler.permits();
-    scheduler_snapshot(
+    let mut report = scheduler_snapshot(
         &config.cache_dir.join(SCHEDULER_DIR),
         capacity,
         bytes_per_permit(config.scheduler.memory_bytes, capacity),
         config.scheduler.enabled,
-    )
+    );
+    report.settings = settings.map(|path| path.display().to_string());
+    report
 }
 
 fn scheduler_snapshot(
@@ -2075,6 +2098,7 @@ fn scheduler_snapshot(
     }
     SchedulerReport {
         enabled,
+        settings: None,
         capacity,
         bytes_per_permit,
         entries,
@@ -2085,10 +2109,11 @@ fn scheduler_snapshot(
 impl SchedulerReport {
     pub(crate) fn text(&self) -> String {
         let mut lines = vec![format!(
-            "Scheduler: {} ({} permits, {}/permit)",
+            "Scheduler: {} ({} permits, {}/permit; settings: {})",
             if self.enabled { "enabled" } else { "disabled" },
             self.capacity,
-            crate::stats::size(self.bytes_per_permit)
+            crate::stats::size(self.bytes_per_permit),
+            self.settings.as_deref().unwrap_or("global configuration")
         )];
         for e in &self.entries {
             let charge = e.charge_bytes.zip(e.charge_permits).map_or_else(
@@ -2117,7 +2142,7 @@ impl SchedulerReport {
         );
         for a in &self.activity {
             lines.push(format!(
-                "  {} {}: mode={}, build={}, domain={}, charge={} / {} permits, age={}s",
+                "  {} {}: mode={}, build={}, domain={}, charge={} / {} permits, age={}",
                 a.kind,
                 a.name,
                 a.mode_key,
@@ -2126,7 +2151,7 @@ impl SchedulerReport {
                 crate::stats::size(a.charged_bytes),
                 a.charged_permits,
                 a.age_secs
-                    .map_or_else(|| "unknown".into(), |s| s.to_string())
+                    .map_or_else(|| "unknown".into(), |s| format!("{s}s"))
             ));
         }
         if self.activity.is_empty() {

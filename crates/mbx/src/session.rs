@@ -1841,12 +1841,27 @@ fn executable_stem(executable: &OsStr) -> Option<&str> {
     Path::new(executable).file_stem()?.to_str()
 }
 
-pub(crate) fn compiler_has_previous_wrapper() -> bool {
-    compiler_has_previous_wrapper_using(|name| std::env::var_os(name))
+/// Whether running `compiler` really runs some other program whose memory
+/// is not the compile's: Cargo's earlier `RUSTC_WRAPPER`, which wraps every
+/// compiler call, or a workspace wrapper other than clippy-driver. Under
+/// `cargo clippy` the workspace wrapper is recorded for the whole build, but
+/// dependencies still run the real rustc, and clippy-driver compiles in its
+/// own process, so both measure a real compile.
+pub(crate) fn compiler_runs_through_wrapper(compiler: &OsStr) -> bool {
+    compiler_runs_through_wrapper_using(compiler, |name| std::env::var_os(name))
 }
 
-fn compiler_has_previous_wrapper_using(get: impl Fn(&str) -> Option<OsString>) -> bool {
-    get(PREVIOUS_RUSTC_WRAPPER_ENV).is_some() || get(PREVIOUS_RUSTC_WORKSPACE_WRAPPER_ENV).is_some()
+fn compiler_runs_through_wrapper_using(
+    compiler: &OsStr,
+    get: impl Fn(&str) -> Option<OsString>,
+) -> bool {
+    get(PREVIOUS_RUSTC_WRAPPER_ENV).is_some()
+        || (!is_clippy_driver(compiler)
+            && get(PREVIOUS_RUSTC_WORKSPACE_WRAPPER_ENV).is_some_and(|wrapper| wrapper == compiler))
+}
+
+pub(crate) fn is_clippy_driver(compiler: &OsStr) -> bool {
+    executable_stem(compiler) == Some("clippy-driver")
 }
 
 fn transparent_compiler_demand(
@@ -1854,11 +1869,13 @@ fn transparent_compiler_demand(
     described: &[OsString],
     incremental_flag: Option<&OsStr>,
     wrapped: bool,
+    clippy: bool,
 ) -> crate::scheduler::Demand {
     crate::scheduler::Demand::new(name, links_natively(described)).with_compiler_execution(
         described,
         incremental_flag,
         wrapped,
+        clippy,
     )
 }
 
@@ -1895,8 +1912,8 @@ fn run_transparent_rustc(
             name,
             described,
             incremental_flag.as_deref(),
-            compiler_has_previous_wrapper()
-                || workspace_wrapper_arguments(&rustc, &arguments).0.is_some(),
+            compiler_runs_through_wrapper(&rustc),
+            is_clippy_driver(&rustc),
         )
     });
     let permit = demand

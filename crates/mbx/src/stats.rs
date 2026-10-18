@@ -310,10 +310,12 @@ mod tests {
         config.scheduler.reserve_cpus = 0;
         config.scheduler.memory_bytes = Some(4000);
         let mut report = collect(&config.store_dir(), &config.target.root).unwrap();
-        report.scheduler = Some(crate::scheduler::scheduler_report(&config));
+        report.scheduler = Some(crate::scheduler::scheduler_report(&config, None));
         let text = report.text(false);
         assert!(
-            text.contains("Scheduler: enabled (4 permits, 1000 B/permit)"),
+            text.contains(
+                "Scheduler: enabled (4 permits, 1000 B/permit; settings: global configuration)"
+            ),
             "{text}"
         );
         assert!(text.contains("No recorded memory peaks."));
@@ -322,6 +324,24 @@ mod tests {
         assert_eq!(json["scheduler"]["capacity"], 4);
         assert_eq!(json["scheduler"]["entries"], serde_json::json!([]));
         assert!(!root.path().join("scheduler").exists());
+    }
+
+    #[test]
+    fn scheduler_section_uses_and_names_the_workspace_settings() {
+        let root = tempfile::tempdir().unwrap();
+        let workspace = root.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let settings = workspace.join(".mbx.toml");
+        std::fs::write(&settings, "[scheduler]\ncpus = 2\n").unwrap();
+        let mut config = crate::config::Config::for_test(root.path());
+        config.scheduler.enabled = true;
+        config.scheduler.cpus = 4;
+        config.scheduler.reserve_cpus = 0;
+        config.apply_workspace_policy(&workspace).unwrap();
+        let report = crate::scheduler::scheduler_report(&config, Some(&settings));
+        let text = report.text();
+        assert!(text.contains("(2 permits"), "{text}");
+        assert!(text.contains(&settings.display().to_string()), "{text}");
     }
 
     #[test]
