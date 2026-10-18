@@ -315,31 +315,34 @@ impl Summary {
         fn ratio(value: Option<f64>) -> String {
             value.map_or_else(|| "unknown".into(), |r| format!("{r:.2}x"))
         }
+        let overall = &self.overall;
         let mut lines = vec![
             format!(
-                "Estimate accuracy: {} observations, {} exceeded reservation; worst {} for {} ({}) at {} ms (Unix); span {}–{} ms (Unix).",
-                self.overall.n,
-                self.overall.exceeded,
-                ratio(self.overall.worst_peak_reserved_ratio),
-                self.overall.worst_key.as_deref().unwrap_or("unknown"),
-                self.overall.worst_outcome.as_deref().unwrap_or("unknown"),
-                self.overall
-                    .worst_ts_ms
-                    .map_or_else(|| "unknown".into(), |ts| ts.to_string()),
-                self.start_ts_ms.unwrap_or(0),
-                self.end_ts_ms.unwrap_or(0)
+                "Estimate accuracy, {} to {}: {} observations, {} exceeded their reservation.",
+                utc(self.start_ts_ms),
+                utc(self.end_ts_ms),
+                overall.n,
+                overall.exceeded,
             ),
             format!(
-                "  Outcomes: {} success, {} failed, {} OOM-killed, {} other; exceedances: {} success, {} failed, {} OOM-killed, {} other. Median/p90 and unused bytes use successful unwrapped samples.",
-                self.overall.success,
-                self.overall.failed,
-                self.overall.oom_killed,
-                self.overall.other,
-                self.overall.success_exceeded,
-                self.overall.failed_exceeded,
-                self.overall.oom_killed_exceeded,
-                self.overall.other_exceeded
+                "  Worst: {} of its reservation, {} ({}), at {}.",
+                ratio(overall.worst_peak_reserved_ratio),
+                overall.worst_key.as_deref().unwrap_or("unknown"),
+                overall.worst_outcome.as_deref().unwrap_or("unknown"),
+                utc(overall.worst_ts_ms),
             ),
+            format!(
+                "  Outcomes: {} success, {} failed, {} OOM-killed, {} other. Exceeded: {} success, {} failed, {} OOM-killed, {} other.",
+                overall.success,
+                overall.failed,
+                overall.oom_killed,
+                overall.other,
+                overall.success_exceeded,
+                overall.failed_exceeded,
+                overall.oom_killed_exceeded,
+                overall.other_exceeded,
+            ),
+            "  Median, p90 and unused memory count only successful compiles that ran without another wrapper.".into(),
         ];
         let mut keys: Vec<_> = self.keys.iter().collect();
         keys.sort_by(|a, b| {
@@ -350,10 +353,45 @@ impl Summary {
                 .then_with(|| a.key.cmp(&b.key))
         });
         for k in keys.into_iter().take(20) {
-            lines.push(format!("  {}: n={} (failed={}, OOM={}), exceeded={} (success={}, failed={}, OOM={}), worst={} at {} ms, median/p90 peak/predicted={}/{}, peak={}, unused avg={}", k.key, k.counts.n, k.counts.failed, k.counts.oom_killed, k.counts.exceeded, k.counts.success_exceeded, k.counts.failed_exceeded, k.counts.oom_killed_exceeded, ratio(k.counts.worst_peak_reserved_ratio), k.counts.worst_ts_ms.map_or_else(|| "unknown".into(), |ts| ts.to_string()), ratio(k.median_peak_predicted_ratio), ratio(k.p90_peak_predicted_ratio), k.counts.highest_peak_bytes.map_or_else(|| "unknown".into(), crate::stats::size), k.average_reserved_unused_bytes.map_or_else(|| "unknown".into(), |bytes| crate::stats::size(bytes as u64))));
+            let counts = &k.counts;
+            lines.push(format!("  {}:", k.key));
+            lines.push(format!(
+                "    n={} (failed={}, OOM={}), exceeded={} (success={}, failed={}, OOM={}), worst={} at {}",
+                counts.n,
+                counts.failed,
+                counts.oom_killed,
+                counts.exceeded,
+                counts.success_exceeded,
+                counts.failed_exceeded,
+                counts.oom_killed_exceeded,
+                ratio(counts.worst_peak_reserved_ratio),
+                utc(counts.worst_ts_ms),
+            ));
+            lines.push(format!(
+                "    peak/predicted median={} p90={}, highest peak={}, unused on average={}",
+                ratio(k.median_peak_predicted_ratio),
+                ratio(k.p90_peak_predicted_ratio),
+                counts
+                    .highest_peak_bytes
+                    .map_or_else(|| "unknown".into(), crate::stats::size),
+                k.average_reserved_unused_bytes.map_or_else(
+                    || "unknown".into(),
+                    |bytes| crate::stats::size(bytes as u64)
+                ),
+            ));
         }
         lines.join("\n")
     }
+}
+
+/// A UTC time to the second, for reading observation spans at a glance.
+fn utc(ms: Option<u64>) -> String {
+    ms.and_then(|ms| i64::try_from(ms).ok())
+        .and_then(|ms| jiff::Timestamp::from_millisecond(ms).ok())
+        .map_or_else(
+            || "an unknown time".into(),
+            |timestamp| timestamp.strftime("%Y-%m-%d %H:%M:%S UTC").to_string(),
+        )
 }
 
 #[cfg(test)]
@@ -594,8 +632,12 @@ mod tests {
         let json = serde_json::to_value(&summary).unwrap();
         assert_eq!(json["n"], 8);
         assert_eq!(json["keys"][0]["failed"], 1);
-        assert!(summary.text().contains("span 1000–8000"));
-        println!("{}", summary.text());
+        let text = summary.text();
+        assert!(
+            text.contains("1970-01-01 00:00:01 UTC to 1970-01-01 00:00:08 UTC"),
+            "{text}"
+        );
+        assert!(text.contains("at 1970-01-01 00:00:07 UTC"), "{text}");
     }
 
     #[test]
