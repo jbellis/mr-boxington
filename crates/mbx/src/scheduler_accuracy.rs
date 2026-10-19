@@ -255,7 +255,8 @@ pub(super) fn append_line(
 
 fn write_line(file: &mut impl Write, line: &[u8]) -> Result<()> {
     if file.write(line)? != line.len() {
-        // Do not retry the record; salvage framing for the next append.
+        // Do not retry the record. This newline is a separate append, so a
+        // concurrent writer's line can still land before it and be lost.
         let _ = file.write(b"\n");
         eyre::bail!("short scheduler event write");
     }

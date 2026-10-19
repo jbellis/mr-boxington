@@ -172,17 +172,22 @@ is locked, then encoded and appended after the registrar is released. Concurrent
 writers can therefore append events in a different order from their decisions;
 use their timestamps and tickets to follow a request.
 
-A graceful release empties its waiter file before unlocking it, so it is skipped
-rather than reported as abandoned. This truncation is best effort: Windows uses
-a one-byte file lock, and if truncation fails there or an I/O error prevents it,
-a graceful release can still be mislabelled. Abandoned events are incomplete:
-an older mbx, or a process with `events = false`, can reclaim a dead waiter without
-logging it. Logging errors and rotation can also lose events.
+A waiter that releases its place empties its waiter file before unlocking it, so
+a scan skips it instead of reporting it as abandoned. An abandoned event therefore
+means the waiting process ended without releasing its place: it was killed,
+exited without unwinding, or panicked (release builds abort on panic). Emptying
+the file is best effort and has not been tested on Windows; if it fails, a normal
+release can still be reported as abandoned. Abandoned events are incomplete: an
+older mbx, or a process with `events = false`, can reclaim a dead waiter without
+logging it. Logging errors and rotation can also lose events. With `events =
+false`, admission does no decision-log work; the only remaining cost is emptying
+the waiter file on release.
 
 Transitions are under 1 KiB; admission records fit within 4 KiB including the
 newline and retain at most 16 overtaken waiters, oldest first. The total and
-logged counts expose truncation. A normal append uses one write; after a short
-write, the writer makes a best-effort newline write to separate the next record.
+logged counts expose truncation. A normal append uses one write. After a short
+write, the writer appends a newline to end the partial line; this is a separate
+write, so a line from another process can still land in between and be lost.
 `mbx stats --scheduler` summarizes admissions, overtakes, dequeues, gate reasons,
 and abandoned waits over 15 minutes; its JSON retains all recorded ranked
 overtakes. Missing entries make overtake reason counts and rankings incomplete.

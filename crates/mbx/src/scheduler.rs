@@ -477,8 +477,9 @@ impl QueueEntry {
     fn mark_released(&self) {
         // fslock unlocks before truncating. Empty the record while we still
         // hold its lock so a graceful release cannot look like a dead holder.
-        // Windows locks a one-byte range with LockFileEx; if truncation fails
-        // there (or on another I/O error), the old classification race remains.
+        // On Windows fslock locks a range far beyond the record's bytes, so
+        // truncating through another handle should work there too, but that is
+        // untested. If truncation fails, the old classification race remains.
         if let Ok(file) = std::fs::OpenOptions::new()
             .write(true)
             .open(&self._guard.path)
