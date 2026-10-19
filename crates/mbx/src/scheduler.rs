@@ -247,6 +247,8 @@ pub(crate) struct Demand {
     observation: std::cell::Cell<Option<accuracy::Admission>>,
     /// Frozen before waiting; completion residuals must use the prediction’s features.
     memory_features: std::cell::Cell<Option<memory::Features>>,
+    /// Frozen only for sibling-sourced admissions; never own-window features.
+    sibling_features: std::cell::Cell<Option<memory::Features>>,
 }
 
 #[derive(Debug, Clone)]
@@ -271,6 +273,7 @@ impl Demand {
             count_compile_samples: true,
             observation: std::cell::Cell::new(None),
             memory_features: std::cell::Cell::new(None),
+            sibling_features: std::cell::Cell::new(None),
             per_test: None,
         }
     }
@@ -361,6 +364,7 @@ impl Demand {
             count_compile_samples: true,
             observation: std::cell::Cell::new(None),
             memory_features: std::cell::Cell::new(None),
+            sibling_features: std::cell::Cell::new(None),
             per_test: None,
         }
     }
@@ -377,6 +381,7 @@ impl Demand {
             count_compile_samples: true,
             observation: std::cell::Cell::new(None),
             memory_features: std::cell::Cell::new(None),
+            sibling_features: std::cell::Cell::new(None),
             per_test: Some(TestIdentity {
                 binary: binary.to_owned(),
                 test: test.to_owned(),
@@ -1117,7 +1122,7 @@ fn flight_at(pool_dir: &Path, adapter: &'static str, invocation: &str) -> Result
 ///
 /// Read the way the savings tally is: anything unreadable is an empty ledger,
 /// because refusing to schedule over a corrupt file would help nobody.
-#[derive(Debug, Default, Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct MemoryLedger {
     version: u8,
     crates: BTreeMap<String, u64>,
@@ -1139,9 +1144,33 @@ struct MemoryLedger {
     /// Causal standardized residuals, newest last, independently per kind.
     #[serde(default)]
     memory_residuals: BTreeMap<String, Vec<f64>>,
+    /// Independent causal calibration for previously unsampled compile modes.
+    #[serde(default)]
+    sibling_residuals: Vec<f64>,
+    /// Between-mode spread, recomputed from the surviving windows on read.
+    #[serde(default = "memory::default_sibling_spread")]
+    sibling_spread: f64,
     /// Derived once per read, never persisted alongside the raw observations.
     #[serde(skip)]
     pooled_spreads: BTreeMap<String, f64>,
+}
+
+impl Default for MemoryLedger {
+    fn default() -> Self {
+        Self {
+            version: 0,
+            crates: BTreeMap::new(),
+            link_peaks: Vec::new(),
+            cpus: BTreeMap::new(),
+            profile_link_peaks: BTreeMap::new(),
+            compile_samples: BTreeMap::new(),
+            memory_windows: BTreeMap::new(),
+            memory_residuals: BTreeMap::new(),
+            sibling_residuals: Vec::new(),
+            sibling_spread: memory::default_sibling_spread(),
+            pooled_spreads: BTreeMap::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1763,7 +1792,15 @@ impl Pool {
                     .map_or(memory::Features::COLD, |e| e.features),
             ));
             // One permit is what an unmeasured compile is charged.
-            memory::compile_prediction(&ledger, &demand.name, mode, self.bytes_per_permit)
+            let prediction =
+                memory::compile_prediction(&ledger, &demand.name, mode, self.bytes_per_permit);
+            demand.sibling_features.set(if prediction.1 == "sibling" {
+                memory::sibling_estimate(&ledger, &demand.name, self.bytes_per_permit)
+                    .map(|e| e.features)
+            } else {
+                None
+            });
+            prediction
         } else if demand.learns_cpu {
             let peak = ledger.crates.get(&key).copied();
             (
@@ -2140,6 +2177,12 @@ impl Pool {
         lock.lock()?;
         let mut ledger = read_ledger(&self.ledger_path());
         if let Some(sample) = sample {
+            memory::record_sibling(
+                &mut ledger,
+                sample,
+                demand.sibling_features.take(),
+                succeeded && !oom,
+            );
             let features = demand
                 .memory_features
                 .take()
@@ -2698,59 +2741,6 @@ fn scheduler_snapshot(
     enabled: bool,
 ) -> SchedulerReport {
     let ledger = read_ledger(&dir.join(LEDGER_FILE));
-    let keys: std::collections::BTreeSet<_> = ledger
-        .crates
-        .keys()
-        .chain(ledger.memory_windows.keys())
-        .collect();
-    let entries = keys
-        .into_iter()
-        .map(|key| {
-            let mode = key.split_once(" [compile ");
-            let kind = memory::kind(key);
-            let predictable = mode.is_some() || !key.contains(" [") || kind == "link";
-            let estimate = (mode.is_some() || kind == "link")
-                .then(|| memory::estimate(&ledger, key, kind))
-                .flatten();
-            let (charge, source) = if kind == "link" {
-                let profile = key
-                    .strip_suffix(" [link]")
-                    .and_then(|name| name.split_once(" ["))
-                    .map(|(_, profile)| profile.trim_end_matches(']'));
-                memory::link_prediction(
-                    &ledger,
-                    key,
-                    profile,
-                    LINK_WEIGHT.saturating_mul(bytes_per_permit),
-                )
-            } else if let Some((name, _)) = mode {
-                memory::compile_prediction(&ledger, name, key, bytes_per_permit)
-            } else if predictable {
-                (ledger.crates.get(key).copied(), "legacy")
-            } else {
-                (None, "see admission")
-            };
-            let charge_bytes = (bytes_per_permit > 0).then_some(charge).flatten();
-            SchedulerEntry {
-                key: key.clone(),
-                recorded_peak_bytes: ledger.crates.get(key).copied().unwrap_or(0),
-                successful_samples: ledger.compile_samples.get(key).copied().unwrap_or(0),
-                n: estimate.map_or(0, |e| e.n),
-                window_max_bytes: estimate.map(|e| e.window_max),
-                bound_bytes: estimate.map(|e| e.bound),
-                q: estimate.map(|e| e.q),
-                charge_bytes,
-                charge_cpu: predictable.then_some(1),
-                charge_permits: charge_bytes
-                    .map(|bytes| bytes.div_ceil(bytes_per_permit).clamp(1, capacity)),
-                source: if bytes_per_permit == 0 && predictable {
-                    "CPU-only"
-                } else {
-                    source
-                },
-            }
-        })
-        .collect();
     let memory_calibration = memory::KINDS
         .into_iter()
         .map(|kind| {
@@ -2764,6 +2754,14 @@ fn scheduler_snapshot(
                 calibrated: residual_count >= 50,
             }
         })
+        .chain(std::iter::once(MemoryCalibration {
+            kind: "compile-sibling",
+            target_p: memory::TARGET_P,
+            sigma_pool: ledger.sibling_spread,
+            residual_count: ledger.sibling_residuals.len(),
+            q: memory::sibling_quantile(&ledger, 1),
+            calibrated: ledger.sibling_residuals.len() >= 50,
+        }))
         .collect();
     let mut activity = Vec::new();
     for (subdir, kind) in [(LEASES_DIR, "lease"), (WAITERS_DIR, "waiter")] {
@@ -2825,6 +2823,74 @@ fn scheduler_snapshot(
             }
         }
     }
+    let keys: std::collections::BTreeSet<_> = ledger
+        .crates
+        .keys()
+        .chain(ledger.memory_windows.keys())
+        .chain(
+            activity
+                .iter()
+                .filter(|a| a.mode_key.contains(" [compile "))
+                .map(|a| &a.mode_key),
+        )
+        .collect();
+    let entries = keys
+        .into_iter()
+        .map(|key| {
+            let mode = key.split_once(" [compile ");
+            let kind = memory::kind(key);
+            let predictable = mode.is_some() || !key.contains(" [") || kind == "link";
+            let estimate = (mode.is_some() || kind == "link")
+                .then(|| memory::estimate(&ledger, key, kind))
+                .flatten();
+            let (charge, source) = if kind == "link" {
+                let profile = key
+                    .strip_suffix(" [link]")
+                    .and_then(|name| name.split_once(" ["))
+                    .map(|(_, profile)| profile.trim_end_matches(']'));
+                memory::link_prediction(
+                    &ledger,
+                    key,
+                    profile,
+                    LINK_WEIGHT.saturating_mul(bytes_per_permit),
+                )
+            } else if let Some((name, _)) = mode {
+                memory::compile_prediction(&ledger, name, key, bytes_per_permit)
+            } else if predictable {
+                (ledger.crates.get(key).copied(), "legacy")
+            } else {
+                (None, "see admission")
+            };
+            let estimate = estimate.or_else(|| {
+                if source == "sibling" {
+                    mode.and_then(|(name, _)| {
+                        memory::sibling_estimate(&ledger, name, bytes_per_permit)
+                    })
+                } else {
+                    None
+                }
+            });
+            let charge_bytes = (bytes_per_permit > 0).then_some(charge).flatten();
+            SchedulerEntry {
+                key: key.clone(),
+                recorded_peak_bytes: ledger.crates.get(key).copied().unwrap_or(0),
+                successful_samples: ledger.compile_samples.get(key).copied().unwrap_or(0),
+                n: estimate.map_or(0, |e| e.n),
+                window_max_bytes: estimate.map(|e| e.window_max),
+                bound_bytes: estimate.map(|e| e.bound),
+                q: estimate.map(|e| e.q),
+                charge_bytes,
+                charge_cpu: predictable.then_some(1),
+                charge_permits: charge_bytes
+                    .map(|bytes| bytes.div_ceil(bytes_per_permit).clamp(1, capacity)),
+                source: if bytes_per_permit == 0 && predictable {
+                    "CPU-only"
+                } else {
+                    source
+                },
+            }
+        })
+        .collect();
     SchedulerReport {
         enabled,
         capacity,
@@ -2877,8 +2943,13 @@ impl SchedulerReport {
             lines.push("  No recorded memory peaks.".into());
         }
         for calibration in &self.memory_calibration {
+            let spread_label = if calibration.kind == "compile-sibling" {
+                "between_mode_spread"
+            } else {
+                "sigma_pool"
+            };
             lines.push(format!(
-                "  {}: sigma_pool={:.6}, residuals={}, p={}, q={:.6}{}",
+                "  {}: {spread_label}={:.6}, residuals={}, p={}, q={:.6}{}",
                 calibration.kind,
                 calibration.sigma_pool,
                 calibration.residual_count,

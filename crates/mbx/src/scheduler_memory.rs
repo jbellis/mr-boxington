@@ -120,14 +120,14 @@ fn conformal_rank(n: usize) -> usize {
 }
 
 pub(super) fn quantile(ledger: &MemoryLedger, kind: &str, n: usize) -> f64 {
-    let mut residuals: Vec<_> = ledger
-        .memory_residuals
-        .get(kind)
-        .into_iter()
-        .flatten()
-        .copied()
-        .filter(|r| r.is_finite())
-        .collect();
+    history_quantile(
+        ledger.memory_residuals.get(kind).map_or(&[], Vec::as_slice),
+        n,
+    )
+}
+
+fn history_quantile(history: &[f64], n: usize) -> f64 {
+    let mut residuals: Vec<_> = history.iter().copied().filter(|r| r.is_finite()).collect();
     if residuals.len() >= MIN_RESIDUALS {
         residuals.sort_by(f64::total_cmp);
         // Finite-sample conformal rank, clamped to the available history.
@@ -238,19 +238,106 @@ pub(super) fn compile_prediction(
     if ledger.crates.contains_key(key) {
         return (previous_compile_charge(ledger, name, key), "legacy");
     }
-    let prefix = format!("{name} [compile ");
-    if let Some(charge) = ledger
-        .memory_windows
-        .keys()
-        .filter(|key| key.starts_with(&prefix))
-        .filter_map(|key| compile_window_charge(ledger, name, key, default))
-        .max()
-    {
-        return (Some(charge), "sibling");
+    if let Some(estimate) = sibling_estimate(ledger, name, default) {
+        return (Some(estimate.charge), "sibling");
     }
     match ledger.crates.get(name).copied() {
         Some(peak) => (Some(peak), "legacy"),
         None => (None, "default"),
+    }
+}
+
+/// A new mode is another draw from the crate's mode maxima, rather than
+/// another run of whichever sibling happens to have the largest charge.
+pub(super) fn sibling_estimate(
+    ledger: &MemoryLedger,
+    name: &str,
+    default: u64,
+) -> Option<Estimate> {
+    let prefix = format!("{name} [compile ");
+    let mut maxima = Vec::new();
+    let mut floor = 0;
+    for (key, window) in &ledger.memory_windows {
+        if key.starts_with(&prefix)
+            && let Some(maximum) = window.iter().max()
+            && let Some(charge) = compile_window_charge(ledger, name, key, default)
+        {
+            maxima.push(*maximum);
+            floor = floor.max(charge);
+        }
+    }
+    let window_max = *maxima.iter().max()?;
+    let n = maxima.len();
+    let (mean, variance) = moments(&maxima);
+    let spread = ((NU0 as f64 * ledger.sibling_spread.powi(2) + (n - 1) as f64 * variance)
+        / (NU0 + n - 1) as f64)
+        .sqrt();
+    let features = Features {
+        mean,
+        scale: spread * (1.0 + 1.0 / n as f64).sqrt(),
+    };
+    let q = sibling_quantile(ledger, n);
+    let bound = (mean + q * features.scale).exp().ceil() as u64;
+    let charge = floor.max(bound);
+    // Apply the old crate-wide fallback last, including when a calibrated
+    // sibling itself has grown beyond it. With no bare entry there is no cap.
+    let charge = ledger
+        .crates
+        .get(name)
+        .map_or(charge, |cap| charge.min(*cap));
+    Some(Estimate {
+        n,
+        window_max,
+        bound,
+        charge,
+        q,
+        features,
+    })
+}
+
+pub(super) fn sibling_quantile(ledger: &MemoryLedger, n: usize) -> f64 {
+    history_quantile(&ledger.sibling_residuals, n)
+}
+
+pub(super) fn default_sibling_spread() -> f64 {
+    DEFAULT_SIGMA_POOL
+}
+
+fn pooled_median(values: &mut [f64]) -> f64 {
+    if values.len() < MIN_POOL_KEYS {
+        return DEFAULT_SIGMA_POOL;
+    }
+    values.sort_by(f64::total_cmp);
+    let mid = values.len() / 2;
+    if values.len().is_multiple_of(2) {
+        (values[mid - 1] + values[mid]) / 2.0
+    } else {
+        values[mid]
+    }
+}
+
+fn sanitize_residuals(history: &mut Vec<f64>) {
+    history.retain(|r| r.is_finite());
+    history.drain(..history.len().saturating_sub(MAX_RESIDUALS));
+}
+
+/// Sibling calibration is separate from the requested mode's own window.
+pub(super) fn record_sibling(
+    ledger: &mut MemoryLedger,
+    peak: u64,
+    features: Option<Features>,
+    calibrate: bool,
+) {
+    if calibrate
+        && peak > 0
+        && let Some(features) = features
+        && features.scale > 0.0
+    {
+        let residual = ((peak as f64).ln() - features.mean) / features.scale;
+        if residual.is_finite() {
+            ledger.sibling_residuals.push(residual);
+            sanitize_residuals(&mut ledger.sibling_residuals);
+        }
     }
 }
 
@@ -312,9 +399,24 @@ pub(super) fn prepare(ledger: &mut MemoryLedger) {
         .memory_residuals
         .retain(|kind, _| KINDS.contains(&kind.as_str()));
     for residuals in ledger.memory_residuals.values_mut() {
-        residuals.retain(|r| r.is_finite());
-        residuals.drain(..residuals.len().saturating_sub(MAX_RESIDUALS));
+        sanitize_residuals(residuals);
     }
+    sanitize_residuals(&mut ledger.sibling_residuals);
+    let mut modes: BTreeMap<&str, Vec<u64>> = BTreeMap::new();
+    for (key, window) in &ledger.memory_windows {
+        if let Some((name, _)) = key.split_once(" [compile ") {
+            modes
+                .entry(name)
+                .or_default()
+                .push(*window.iter().max().expect("nonempty window"));
+        }
+    }
+    let mut between: Vec<_> = modes
+        .values()
+        .filter(|v| v.len() >= 2)
+        .map(|v| moments(v).1.sqrt())
+        .collect();
+    ledger.sibling_spread = pooled_median(&mut between);
     let mut spreads: BTreeMap<&str, Vec<f64>> = BTreeMap::new();
     for (key, values) in &ledger.memory_windows {
         if values.len() >= 4 {
@@ -328,17 +430,7 @@ pub(super) fn prepare(ledger: &mut MemoryLedger) {
         .into_iter()
         .map(|kind| {
             let values = spreads.entry(kind).or_default();
-            let sigma = if values.len() < MIN_POOL_KEYS {
-                DEFAULT_SIGMA_POOL
-            } else {
-                values.sort_by(f64::total_cmp);
-                let mid = values.len() / 2;
-                if values.len().is_multiple_of(2) {
-                    (values[mid - 1] + values[mid]) / 2.0
-                } else {
-                    values[mid]
-                }
-            };
+            let sigma = pooled_median(values);
             (kind.to_string(), sigma)
         })
         .collect();
@@ -377,6 +469,150 @@ pub(super) fn record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn siblings(values: &[u64]) -> MemoryLedger {
+        let mut ledger = MemoryLedger::default();
+        for (i, value) in values.iter().enumerate() {
+            ledger
+                .memory_windows
+                .insert(format!("crate [compile {i}]"), vec![*value; 4]);
+        }
+        ledger
+    }
+
+    #[test]
+    fn sibling_fixed_vectors_and_shrinkage() {
+        for (values, expected) in [
+            (vec![100], 452),
+            (vec![100, 200], 484),
+            (vec![100, 200, 300, 400], 704),
+        ] {
+            let mut ledger = siblings(&values);
+            let e = sibling_estimate(&ledger, "crate", 0).unwrap();
+            assert_eq!(e.bound, expected);
+            assert_eq!(e.n, values.len());
+            assert!((e.features.mean - moments(&values).0).abs() < 1e-12);
+            ledger.sibling_spread = 0.25;
+            let shrunk = sibling_estimate(&ledger, "crate", 0).unwrap();
+            let k = values.len();
+            let variance = moments(&values).1;
+            let expected_scale =
+                ((4.0 * 0.25_f64.powi(2) + (k - 1) as f64 * variance) / (4 + k - 1) as f64).sqrt()
+                    * (1.0 + 1.0 / k as f64).sqrt();
+            assert!((shrunk.features.scale - expected_scale).abs() < 1e-12);
+            assert!(shrunk.features.scale < e.features.scale);
+        }
+    }
+
+    #[test]
+    fn sibling_quantile_switches_independently_and_charge_has_floor_then_cap() {
+        let mut ledger = siblings(&[100, 200]);
+        ledger
+            .memory_residuals
+            .insert("compile".into(), vec![99.0; 50]);
+        ledger.sibling_residuals = vec![9.0; 49];
+        assert_eq!(sibling_quantile(&ledger, 2), T_QUANTILES[4]);
+        ledger.sibling_residuals = (0..50).map(|x| x as f64).collect();
+        assert_eq!(sibling_quantile(&ledger, 2), 48.0);
+        ledger.sibling_residuals = vec![-10.0; 50];
+        ledger
+            .memory_residuals
+            .insert("compile".into(), vec![-10.0; 50]);
+        assert_eq!(sibling_estimate(&ledger, "crate", 0).unwrap().charge, 200);
+        ledger.crates.insert("crate".into(), 150);
+        // Cap takes precedence even when a sibling's own peak exceeds it.
+        assert_eq!(sibling_estimate(&ledger, "crate", 0).unwrap().charge, 150);
+        ledger.sibling_residuals.clear();
+        ledger.crates.insert("crate".into(), 300);
+        assert_eq!(sibling_estimate(&ledger, "crate", 0).unwrap().charge, 300);
+        ledger.crates.remove("crate");
+        let estimate = sibling_estimate(&ledger, "crate", 0).unwrap();
+        assert!(estimate.bound > 300);
+        assert_eq!(estimate.charge, estimate.bound);
+    }
+
+    #[test]
+    fn sibling_live_heavier_mode_is_covered() {
+        let gib = (1_u64 << 30) as f64;
+        let mut ledger = siblings(&[(0.10 * gib) as u64, (0.36 * gib) as u64]);
+        ledger
+            .memory_residuals
+            .insert("compile".into(), vec![0.0; 50]);
+        ledger.crates.insert("crate".into(), gib as u64);
+        let e = sibling_estimate(&ledger, "crate", 0).unwrap();
+        assert!(e.charge as f64 > 0.52 * gib);
+        assert_eq!(
+            compile_prediction(&ledger, "crate", "crate [compile opt3]", 0),
+            (Some(e.charge), "sibling")
+        );
+    }
+
+    #[test]
+    fn sibling_residuals_roll_and_do_not_touch_own_histories() {
+        let mut ledger = MemoryLedger::default();
+        let features = Features {
+            mean: 100.0_f64.ln(),
+            scale: 1.0,
+        };
+        for _ in 0..MAX_RESIDUALS + 20 {
+            record_sibling(&mut ledger, 100, Some(features), true);
+        }
+        assert_eq!(ledger.sibling_residuals, vec![0.0; MAX_RESIDUALS]);
+        record_sibling(&mut ledger, 200, Some(features), false);
+        record_sibling(&mut ledger, 200, None, true);
+        record_sibling(&mut ledger, 200, Some(Features::COLD), true);
+        record_sibling(&mut ledger, 0, Some(features), true);
+        assert_eq!(ledger.sibling_residuals, vec![0.0; MAX_RESIDUALS]);
+        assert!(ledger.memory_windows.is_empty());
+        assert!(ledger.memory_residuals.is_empty());
+    }
+
+    #[test]
+    fn sibling_pool_prepare_eviction_and_serde_preserve_new_history() {
+        let mut ledger = MemoryLedger::default();
+        for i in 0..MIN_POOL_KEYS {
+            ledger
+                .memory_windows
+                .insert(format!("crate{i} [compile a]"), vec![100]);
+            ledger
+                .memory_windows
+                .insert(format!("crate{i} [compile b]"), vec![200]);
+        }
+        ledger.sibling_residuals = vec![1.0; MAX_RESIDUALS + 20];
+        ledger.sibling_residuals.push(f64::NAN);
+        prepare(&mut ledger);
+        let expected = 2.0_f64.ln() / 2.0_f64.sqrt();
+        assert!((ledger.sibling_spread - expected).abs() < 1e-12);
+        assert_eq!(ledger.sibling_residuals, vec![1.0; MAX_RESIDUALS]);
+        let encoded = serde_json::to_vec(&ledger).unwrap();
+        let mut decoded: MemoryLedger = serde_json::from_slice(&encoded).unwrap();
+        assert_eq!(decoded.sibling_spread, ledger.sibling_spread);
+        prepare(&mut decoded);
+        assert_eq!(decoded.sibling_spread, ledger.sibling_spread);
+        assert_eq!(decoded.sibling_residuals, ledger.sibling_residuals);
+        // Eviction does not erase global calibration. The derived pool must
+        // still reflect only the surviving crates, falling back below ten.
+        for i in 0..MAX_LEDGER_ENTRIES {
+            record(
+                &mut decoded,
+                &format!("heavy{i} [compile a]"),
+                "compile",
+                1000,
+                None,
+                true,
+            );
+        }
+        assert_eq!(decoded.sibling_residuals, ledger.sibling_residuals);
+        assert_eq!(decoded.sibling_spread, ledger.sibling_spread);
+        prepare(&mut decoded);
+        assert_eq!(decoded.sibling_spread, DEFAULT_SIGMA_POOL);
+        let mut old: MemoryLedger =
+            serde_json::from_str(r#"{"version":1,"crates":{},"link_peaks":[]}"#).unwrap();
+        assert_eq!(old.sibling_spread, DEFAULT_SIGMA_POOL);
+        assert!(old.sibling_residuals.is_empty());
+        prepare(&mut old);
+        assert_eq!(old.sibling_spread, DEFAULT_SIGMA_POOL);
+    }
 
     fn calibrate(ledger: &mut MemoryLedger, kind_name: &str) {
         for index in 0..MIN_POOL_KEYS {

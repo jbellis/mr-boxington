@@ -2232,7 +2232,7 @@ fn compile_modes_include_all_crate_types_and_every_target() {
 }
 
 #[test]
-fn unsampled_compile_modes_use_the_largest_sibling_charge() {
+fn unsampled_compile_modes_use_the_sibling_bound_above_the_charge_floor() {
     let directory = tempfile::tempdir().unwrap();
     let pool = pool_at(directory.path(), 100, 100);
     pool.record_peak("crate", 1000, false).unwrap();
@@ -2260,7 +2260,7 @@ fn unsampled_compile_modes_use_the_largest_sibling_charge() {
     ] {
         assert_eq!(
             pool.plan(&compile_demand("crate", &args)),
-            (2, Some(150)),
+            (4, Some(302)),
             "{args:?}"
         );
     }
@@ -4443,4 +4443,108 @@ fn an_old_writer_rewrite_preserves_at_least_f47d416_mode_and_link_charges() {
         assert_eq!(entry.charge_bytes, plan.predicted);
     }
     assert!(read_ledger(&pool.ledger_path()).memory_windows.is_empty());
+}
+
+#[test]
+fn sibling_residuals_only_use_frozen_successful_unwrapped_admissions() {
+    for (succeeded, oom, wrapped) in [
+        (true, false, false),
+        (false, false, false),
+        (false, true, false),
+        (true, false, true),
+    ] {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool_at(dir.path(), 100, 100);
+        let sibling = compile_demand("crate", &["--emit=metadata"]);
+        pool.record_compile(&sibling, 200, false, true).unwrap();
+        let mut demand = compile_demand("crate", &[]);
+        demand.count_compile_samples = !wrapped;
+        assert_eq!(pool.demand_vector(&demand).source, "sibling");
+        let features = demand.sibling_features.get().unwrap();
+        assert_eq!(demand.memory_features.get().unwrap().scale, 0.0);
+        // A concurrent completion changes both windows before this admission
+        // finishes. Neither residual history may use those newer features.
+        pool.record_compile(&sibling, 1000, false, true).unwrap();
+        let concurrent = compile_demand("crate", &[]);
+        pool.record_compile(&concurrent, 250, false, true).unwrap();
+        let own_residual_count = read_ledger(&pool.ledger_path())
+            .memory_residuals
+            .get("compile")
+            .map_or(0, Vec::len);
+        pool.record_compile(&demand, 300, oom, succeeded).unwrap();
+        let ledger = read_ledger(&pool.ledger_path());
+        assert_eq!(
+            ledger.memory_residuals.get("compile").map_or(0, Vec::len),
+            own_residual_count
+        );
+        if succeeded && !oom && !wrapped {
+            assert_eq!(ledger.sibling_residuals.len(), 1);
+            assert!(
+                (ledger.sibling_residuals[0] - (300.0_f64.ln() - features.mean) / features.scale)
+                    .abs()
+                    < 1e-12
+            );
+            assert_eq!(
+                ledger.memory_windows[demand.compile_mode.as_ref().unwrap()].last(),
+                Some(&300)
+            );
+        } else {
+            assert!(ledger.sibling_residuals.is_empty());
+        }
+        // Direct recording and an own-window admission do not train siblings.
+        let count = ledger.sibling_residuals.len();
+        let own = compile_demand("crate", &[]);
+        assert_eq!(pool.demand_vector(&own).source, "window");
+        assert!(own.sibling_features.get().is_none());
+        pool.record_compile(&own, 400, false, true).unwrap();
+        assert_eq!(
+            read_ledger(&pool.ledger_path()).sibling_residuals.len(),
+            count
+        );
+        let report = scheduler_snapshot(dir.path(), 100, 100, true);
+        let calibration = report
+            .memory_calibration
+            .iter()
+            .find(|c| c.kind == "compile-sibling")
+            .unwrap();
+        assert_eq!(calibration.residual_count, count);
+        assert_eq!(calibration.sigma_pool, 0.5);
+        assert!(
+            report
+                .text()
+                .contains("compile-sibling: between_mode_spread=0.500000")
+        );
+    }
+}
+
+#[test]
+fn sibling_stats_include_the_bound_for_an_unsampled_active_mode() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool_at(dir.path(), 100, 100);
+    let sibling = compile_demand("crate", &["--emit=metadata"]);
+    pool.record_compile(&sibling, 200, false, true).unwrap();
+    let demand = compile_demand("crate", &[]);
+    let mode = demand.compile_mode.as_ref().unwrap();
+    // Active modes need not have a ledger key yet.
+    std::fs::create_dir_all(dir.path().join(WAITERS_DIR)).unwrap();
+    std::fs::write(
+        dir.path().join(WAITERS_DIR).join("active.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "pid": std::process::id(), "weight": 2, "ticket": 1,
+            "name": "crate", "mode_key": mode,
+            "bytes_per_permit": 100, "domain": "test",
+            "domain_capacity": 100, "priority": "background", "build": null
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let report = scheduler_snapshot(dir.path(), 100, 100, true);
+    let entry = report.entries.iter().find(|e| &e.key == mode).unwrap();
+    let ledger = read_ledger(&pool.ledger_path());
+    let estimate = memory::sibling_estimate(&ledger, "crate", 100).unwrap();
+    assert_eq!(entry.source, "sibling");
+    assert_eq!(entry.bound_bytes, Some(estimate.bound));
+    assert_eq!(entry.q, Some(estimate.q));
+    assert_eq!(entry.charge_bytes, Some(estimate.charge));
+    assert!(report.text().contains("(sibling)"));
 }
