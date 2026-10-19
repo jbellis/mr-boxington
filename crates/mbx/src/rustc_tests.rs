@@ -1971,7 +1971,7 @@ fn incremental_seed_injection_respects_compiler_and_user_policy() {
             "{release}, enabled={enabled}, private={private}, remap={user_remap}, bootstrap={bootstrap_set}"
         );
         let mut command = Command::new("rustc");
-        command.args(["src/lib.rs", "-Zallow-features=some_feature"]);
+        command.arg("src/lib.rs");
         if user_remap {
             command.arg("-Zremap-cwd-prefix=/chosen");
         }
@@ -2052,4 +2052,112 @@ fn incremental_seed_probe_checks_flags_and_fails_closed() {
         &directory.path().join("missing"),
         "1.100.0"
     ));
+}
+
+#[test]
+fn incremental_seed_respects_unstable_flags_on_stable_and_beta() {
+    for release in ["1.99.0", "1.99.0-beta.1", "1.99.0-nightly", "1.99.0-dev"] {
+        for flags in [
+            vec!["-Zallow-features=some_feature"],
+            vec!["-Z", "allow-features=some_feature"],
+            vec!["-Zshare-generics=y"],
+        ] {
+            let args = flags.into_iter().map(OsString::from).collect::<Vec<_>>();
+            let original = seed_mode_for(&format!("rustc {release}"), true, true, false, false);
+            let mode = injection_for_invocation(original, &args, false);
+            if release.contains("nightly") || release.contains("dev") {
+                assert_eq!(mode, IncrementalSeedMode::Inject { bootstrap: false });
+            } else {
+                assert_eq!(mode, IncrementalSeedMode::Disabled);
+            }
+            let mut command = Command::new("rustc");
+            command.args(&args);
+            mode.apply(&mut command);
+            assert_eq!(
+                &command.get_args().map(OsStr::to_owned).collect::<Vec<_>>()[..args.len()],
+                args
+            );
+            assert!(command.get_envs().next().is_none());
+        }
+    }
+}
+
+#[test]
+fn incremental_seed_keeps_private_build_script_arguments_and_environment() {
+    let args = [
+        "--crate-name=build_script_main",
+        "--crate-type=bin",
+        "/checkout/build/main.rs",
+    ]
+    .map(OsString::from);
+    assert!(session::compiles_only_a_binary(&args));
+    for bootstrap in [false, true] {
+        let mode = injection_for_invocation(IncrementalSeedMode::Inject { bootstrap }, &args, true);
+        assert_eq!(mode, IncrementalSeedMode::Disabled);
+        let command = private_compiler_command(
+            OsStr::new("rustc"),
+            None,
+            &args,
+            Path::new("/checkout"),
+            Some(OsStr::new("-Cincremental=/state")),
+            mode,
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            args.iter()
+                .map(OsString::as_os_str)
+                .chain([OsStr::new("-Cincremental=/state")])
+                .collect::<Vec<_>>()
+        );
+        assert!(command.get_envs().next().is_none());
+    }
+    // Explicit remapping retains its original behavior, including on build scripts.
+    assert_eq!(
+        injection_for_invocation(IncrementalSeedMode::UserRemap, &args, true),
+        IncrementalSeedMode::UserRemap
+    );
+}
+
+#[test]
+fn incremental_seed_bootstrap_dep_info_disables_later_injection() {
+    let state = tempfile::tempdir().unwrap();
+    let dep_info = state.path().join("crate.d");
+    let bootstrap = IncrementalSeedMode::Inject { bootstrap: true };
+    for record in ["# env-dep:RUSTC_BOOTSTRAP=1", "# env-dep:RUSTC_BOOTSTRAP"] {
+        std::fs::write(&dep_info, format!("out: src/lib.rs\n{record}\n")).unwrap();
+        assert!(bootstrap_dep_info_requires_retry(bootstrap, &dep_info).unwrap());
+        assert!(
+            !bootstrap_dep_info_requires_retry(
+                IncrementalSeedMode::Inject { bootstrap: false },
+                &dep_info
+            )
+            .unwrap()
+        );
+    }
+    std::fs::write(&dep_info, "out: src/lib.rs\n# env-dep:OTHER=1\n").unwrap();
+    assert!(!bootstrap_dep_info_requires_retry(bootstrap, &dep_info).unwrap());
+    assert_eq!(
+        mode_in_state_directory(bootstrap, Some(state.path())),
+        bootstrap
+    );
+    std::fs::write(state.path().join(BOOTSTRAP_ENV_DEP_MARKER), b"").unwrap();
+    assert_eq!(
+        mode_in_state_directory(bootstrap, Some(state.path())),
+        IncrementalSeedMode::Disabled
+    );
+    assert_eq!(
+        mode_in_state_directory(IncrementalSeedMode::UserRemap, Some(state.path())),
+        IncrementalSeedMode::UserRemap
+    );
+    let args = [OsString::from("/checkout/src/lib.rs")];
+    let command = private_compiler_command(
+        OsStr::new("rustc"),
+        None,
+        &args,
+        Path::new("/checkout"),
+        Some(OsStr::new("-Cincremental=/state")),
+        IncrementalSeedMode::Disabled,
+    );
+    assert_eq!(command.get_args().next().unwrap(), args[0]);
+    assert!(command.get_envs().next().is_none());
 }

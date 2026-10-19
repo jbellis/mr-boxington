@@ -71,12 +71,18 @@ impl LearnedPlan {
     /// checkout's; see [`incremental::seed`].
     fn resolved(mut self, compilation: &Compilation<'_>, unit: &CacheDigest) -> Self {
         if self.hot {
-            let mode = incremental_seed_mode(compilation.rustc, compilation.invocation, true);
+            let mode = incremental_seed_mode(
+                compilation.rustc,
+                compilation.invocation,
+                compilation.arguments,
+                true,
+            );
             let unit = incremental_state_identity(unit, mode);
             self.directory = incremental_directory(
                 &unit,
                 compilation.invocation.crate_name(),
-                mode.shares_state(),
+                mode_in_state_directory(mode, incremental_unit_path(&unit).as_deref())
+                    .shares_state(),
             );
         }
         self
@@ -151,6 +157,7 @@ struct BuildScriptBinaryIdentity<'a> {
 /// What every step of one compilation needs to identify it.
 struct Compilation<'a> {
     rustc: &'a OsStr,
+    arguments: &'a [OsString],
     invocation: &'a RustcInvocation,
     working_dir: &'a Path,
     portable: &'a Portable,
@@ -270,6 +277,7 @@ pub(crate) fn compile(
     // nobody counts.
     let compilation = Compilation {
         rustc,
+        arguments: &arguments,
         invocation: &invocation,
         working_dir: &working_dir,
         portable: &portable,
@@ -527,21 +535,19 @@ pub(crate) fn compile(
     );
     let compilation_started = SystemTime::now();
     let compiler_timer = Instant::now();
-    let mut command = compiler_command(rustc, wrapper_argument);
-    let seed_mode = incremental_seed_mode(rustc, &invocation, incremental_flag.is_some());
-    if seed_mode.shares_state() {
-        command.args(paths_relative_to(&arguments, &working_dir));
-    } else {
-        command.args(&arguments);
-    }
-    command.current_dir(&working_dir);
+    let seed_mode = mode_in_state_directory(
+        incremental_seed_mode(rustc, &invocation, &arguments, incremental_flag.is_some()),
+        learned.directory.as_deref(),
+    );
+    let mut command = private_compiler_command(
+        rustc,
+        wrapper_argument,
+        &arguments,
+        &working_dir,
+        incremental_flag.as_deref(),
+        seed_mode,
+    );
     let private_outputs = private_inputs || learned.engaged();
-    if let Some(flag) = incremental_flag {
-        // Keep private incremental state out of cacheability parsing, while
-        // admission above still sees the command that actually runs.
-        command.arg(flag);
-    }
-    seed_mode.apply(&mut command);
     if private_outputs {
         // Before the compiler starts, so that a dependent Cargo pipelines
         // behind this unit's metadata already finds the marker in place.
@@ -574,14 +580,58 @@ pub(crate) fn compile(
             .chain(std::iter::once(&outputs.dep_info))
             .map(PathBuf::as_path),
     );
-    let output = crate::phase_timing::measure("compiler", || {
-        run_compiler(
-            &mut command,
-            forwarded,
-            wrapper_argument.is_none() && !invocation.crate_name().starts_with("build_script_"),
-        )
+    // Bootstrap may be visible to env!/option_env!. Hold notifications too:
+    // Cargo must not give dependents metadata that the retry will discard.
+    let held = seed_mode == IncrementalSeedMode::Inject { bootstrap: true };
+    let eligible =
+        wrapper_argument.is_none() && !invocation.crate_name().starts_with("build_script_");
+    let mut output = crate::phase_timing::measure("compiler", || {
+        run_compiler(&mut command, forwarded && !held, eligible)
     })
     .wrap_err("failed to execute rustc")?;
+    if output.status.success() && bootstrap_dep_info_requires_retry(seed_mode, &outputs.dep_info)? {
+        let retry = (|| -> Result<()> {
+            let directory = learned.directory.as_deref().ok_or_else(|| {
+                eyre::eyre!("bootstrap compilation has no private state directory")
+            })?;
+            std::fs::write(directory.join(BOOTSTRAP_ENV_DEP_MARKER), b"")
+                .wrap_err("failed to remember the compiler bootstrap dependency")?;
+            for path in outputs
+                .files
+                .iter()
+                .chain(std::iter::once(&outputs.dep_info))
+            {
+                match std::fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(error).wrap_err("failed to discard bootstrap compiler output");
+                    }
+                }
+            }
+            Ok(())
+        })();
+        if let Err(error) = retry {
+            session::report_shim_error(&format!(
+                "bootstrap compilation could not be discarded: {error:#}"
+            ));
+            return Ok(ExitCode::FAILURE);
+        }
+        let mut command = private_compiler_command(
+            rustc,
+            wrapper_argument,
+            &arguments,
+            &working_dir,
+            incremental_flag.as_deref(),
+            IncrementalSeedMode::Disabled,
+        );
+        output = crate::phase_timing::measure("compiler", || {
+            run_compiler(&mut command, forwarded, eligible)
+        })
+        .wrap_err("failed to execute rustc without bootstrap")?;
+    } else if forwarded && held {
+        let _ = replay_bytes(&output.stdout, &output.stderr);
+    }
     // Released before the outputs are read back and published: hashing and
     // storing cost I/O, not the CPU and memory the permit stands for.
     drop(permit);
@@ -1125,6 +1175,7 @@ fn compile_execution_only_build_script(
             let modeled = (|| -> Result<CacheDigest> {
                 let compilation = Compilation {
                     rustc,
+                    arguments,
                     invocation,
                     working_dir,
                     portable,
@@ -1493,6 +1544,7 @@ fn seed_mode_for(
 fn incremental_seed_mode(
     rustc: &OsStr,
     invocation: &RustcInvocation,
+    arguments: &[OsString],
     private: bool,
 ) -> IncrementalSeedMode {
     let enabled = session::seed_incremental_requested();
@@ -1504,17 +1556,91 @@ fn incremental_seed_mode(
     let Ok(identity) = compiler_identity(rustc) else {
         return IncrementalSeedMode::Disabled;
     };
-    let mode = seed_mode_for(
-        &identity.rustc_version,
-        enabled,
-        private,
-        user_remap,
-        bootstrap_set,
+    let mode = injection_for_invocation(
+        seed_mode_for(
+            &identity.rustc_version,
+            enabled,
+            private,
+            user_remap,
+            bootstrap_set,
+        ),
+        arguments,
+        session::is_cargo_build_script(invocation.crate_name())
+            && session::compiles_only_a_binary(arguments),
     );
     if matches!(mode, IncrementalSeedMode::Inject { .. }) && !remap_cwd_supported(rustc) {
         return IncrementalSeedMode::Disabled;
     }
     mode
+}
+
+/// Keep Cargo's unstable-feature choices and build-script execution keys intact.
+fn injection_for_invocation(
+    mode: IncrementalSeedMode,
+    arguments: &[OsString],
+    build_script: bool,
+) -> IncrementalSeedMode {
+    let unstable_flags = profile_arguments(arguments)
+        .iter()
+        .any(|arg| arg.as_encoded_bytes().starts_with(b"-Z"));
+    match mode {
+        IncrementalSeedMode::Inject { .. } if build_script => IncrementalSeedMode::Disabled,
+        IncrementalSeedMode::Inject { bootstrap: true } if unstable_flags => {
+            IncrementalSeedMode::Disabled
+        }
+        _ => mode,
+    }
+}
+
+const BOOTSTRAP_ENV_DEP_MARKER: &str = "bootstrap-env-dependency";
+
+fn incremental_unit_path(unit: &CacheDigest) -> Option<PathBuf> {
+    let key = unit.key();
+    Some(incremental_root()?.join(key.get(..16)?))
+}
+
+fn mode_in_state_directory(
+    mode: IncrementalSeedMode,
+    directory: Option<&Path>,
+) -> IncrementalSeedMode {
+    if matches!(mode, IncrementalSeedMode::Inject { .. })
+        && directory.is_some_and(|directory| directory.join(BOOTSTRAP_ENV_DEP_MARKER).exists())
+    {
+        IncrementalSeedMode::Disabled
+    } else {
+        mode
+    }
+}
+
+fn bootstrap_dep_info_requires_retry(mode: IncrementalSeedMode, path: &Path) -> Result<bool> {
+    if mode != (IncrementalSeedMode::Inject { bootstrap: true }) {
+        return Ok(false);
+    }
+    Ok(RustcDepInfo::read(path)?
+        .environment
+        .contains_key("RUSTC_BOOTSTRAP"))
+}
+
+fn private_compiler_command(
+    rustc: &OsStr,
+    wrapper_argument: Option<&OsStr>,
+    arguments: &[OsString],
+    working_dir: &Path,
+    incremental_flag: Option<&OsStr>,
+    mode: IncrementalSeedMode,
+) -> Command {
+    let mut command = compiler_command(rustc, wrapper_argument);
+    if mode.shares_state() {
+        command.args(paths_relative_to(arguments, working_dir));
+    } else {
+        command.args(arguments);
+    }
+    command.current_dir(working_dir);
+    if let Some(flag) = incremental_flag {
+        command.arg(flag);
+    }
+    mode.apply(&mut command);
+    command
 }
 
 /// Separate automatically remapped state from state compiled with Cargo's flags.

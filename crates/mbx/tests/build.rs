@@ -1474,6 +1474,71 @@ fn learned_incremental_state_seeds_another_checkout_by_default() {
     check_incremental_seeding(&[]);
 }
 
+#[test]
+fn incremental_seed_preserves_bootstrap_env_dependencies_across_edits() {
+    let version = Command::new("rustc").arg("-vV").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    if !rustc_relocates_incremental_state()
+        || version.lines().any(|line| {
+            line.starts_with("release:") && (line.contains("nightly") || line.contains("dev"))
+        })
+    {
+        return;
+    }
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    std::fs::write(
+        project.path().join("src/main.rs"),
+        "fn main() { println!(\"{:?}\", fixture::bootstrap()); }\n",
+    )
+    .unwrap();
+    let mut remembered = Vec::new();
+    for revision in 0..2 {
+        std::fs::write(project.path().join("src/lib.rs"), format!("pub fn bootstrap() -> Option<&'static str> {{ option_env!(\"RUSTC_BOOTSTRAP\") }}\npub fn revision() -> u32 {{ {revision} }}\n")).unwrap();
+        let mut command = mbx_command();
+        command.env_remove("RUSTC_BOOTSTRAP");
+        cargo_with_command(
+            command,
+            project.path(),
+            store.path(),
+            &reports.path().join(format!("{revision}.json")),
+            &["build", "--locked"],
+            &[("MBX_EAGER_INCREMENTAL", "1")],
+        );
+        let output = Command::new(project.path().join(format!(
+            "target/debug/fixture{}",
+            std::env::consts::EXE_SUFFIX
+        )))
+        .output()
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "None");
+        if revision == 0 {
+            remembered = find_files(
+                &incremental_checkout(store.path(), project.path()),
+                |path| file_name_is(path, |name| name == "bootstrap-env-dependency"),
+            );
+            assert!(
+                !remembered.is_empty(),
+                "the unit should remember its bootstrap dependency"
+            );
+            for path in &remembered {
+                std::fs::write(path, "remembered").unwrap();
+            }
+        } else {
+            for path in &remembered {
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    "remembered",
+                    "the next edit should not inject again"
+                );
+            }
+        }
+    }
+}
+
 fn check_incremental_seeding(remapped: &[(&str, &str)]) {
     const MARKER: &str = "seeded-from-first";
     let store = tempfile::tempdir().unwrap();
@@ -6932,4 +6997,55 @@ fn mbx_clean_under_rejects_relative_and_root_paths_and_conflicting_workspace() {
             String::from_utf8_lossy(&output.stdout)
         );
     }
+}
+
+#[test]
+fn private_build_script_rustc_keeps_absolute_source_paths() {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    std::fs::write(
+        project.path().join("build.rs"),
+        r#"include!(concat!(env!("CARGO_MANIFEST_DIR"), "/embedded.rs"));
+fn main() {
+    println!("cargo:rerun-if-changed=embedded.rs");
+    println!("cargo:rustc-env=WHERE={WHERE}");
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("embedded.rs"),
+        "const WHERE: &str = file!();\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("src/main.rs"),
+        "fn main() { println!(\"{}\", env!(\"WHERE\")); }\n",
+    )
+    .unwrap();
+    let stats = build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("build.json"),
+        &[
+            ("MBX_EAGER_INCREMENTAL", "1"),
+            ("MBX_BUILD_SCRIPT_EXECUTION", "1"),
+        ],
+    )
+    .0;
+    assert!(compiled_incrementally(&stats) >= 1, "{stats}");
+    let output = Command::new(project.path().join(format!(
+        "target/debug/fixture{}",
+        std::env::consts::EXE_SUFFIX
+    )))
+    .output()
+    .unwrap();
+    assert!(output.status.success());
+    let path = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(
+        Path::new(path.trim()),
+        project.path().canonicalize().unwrap().join("embedded.rs")
+    );
 }

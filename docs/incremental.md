@@ -43,7 +43,9 @@ edit in a new checkout can compile incrementally too.
 For these compilations only, mbx adds `-Zremap-cwd-prefix=.` and makes paths
 under the checkout relative. Cargo's arguments and shared cache keys stay the
 same. Debug info records `.` as the working directory for crates being edited,
-and backtrace frames show paths such as `./src/lib.rs`. Debuggers started from
+and backtrace frames show paths such as `./src/lib.rs`. For sources passed by
+absolute path, `file!()` and panic locations also change to that relative path.
+Build-script compilations are not affected. Debuggers started from
 the checkout can find those sources. When starting a debugger elsewhere, map
 that directory to the checkout:
 
@@ -58,8 +60,11 @@ On stable and beta compilers, mbx sets `RUSTC_BOOTSTRAP=1` only on the compiler
 processes using this private state. It appends `-Zallow-features=` so that
 `#![feature]` declarations remain rejected. Nightly and dev compilers need
 neither addition. If `RUSTC_BOOTSTRAP` is already set to any value, mbx leaves
-that choice in place and does not add the remap flag. It also checks that the
-compiler accepts the flag before adding it.
+that choice in place and does not add the remap flag. On stable and beta it
+also skips injection when the invocation has any `-Z` flag. If a crate reads
+`RUSTC_BOOTSTRAP` with `env!()` or `option_env!()`, mbx retries without injection
+and remembers that choice for the unit. It checks that the compiler accepts the
+flag before adding it.
 
 To turn off automatic seeding, run:
 
