@@ -158,6 +158,20 @@ The usual retention bound is two approximately 8 MiB files. A busy rotation lock
 can temporarily allow growth; concurrent appends and rotation can lose a few lines.
 Observation failures are debug-logged and do not prevent the workload from running.
 
+Admission transitions are recorded in `<cache_dir>/scheduler/decisions.jsonl`,
+also gated by `events`, with the same best-effort 8 MiB rotation to `.1`.
+Enqueue, dequeue (including gate or error reason), admission, and reclamation of
+dead waiters record identity, resources, and wait age. Admissions include the
+ordered/passing rule, free resources in each scope, and the oldest overtaken
+waiters with exception reasons or the actual CPU/memory slack bounds (legacy
+scalar checks include their permit size). Request arrival time survives requeues.
+Transitions are under 1 KiB; admission records fit within 4 KiB including the
+newline and retain at most 16 overtaken waiters, oldest first. The total and
+logged counts expose truncation. Both use one append write. `mbx stats --scheduler`
+summarizes admissions, overtakes, dequeues, and abandoned waits over 15 minutes;
+its JSON retains all recorded ranked overtakes. Missing entries make overtake
+reason counts and rankings incomplete. Logging never changes admission policy.
+
 The estimate-accuracy section of `mbx stats --scheduler` reads both generations,
 ignoring malformed lines, and shows the retained time span as UTC dates and
 times. Timestamp fields in `--json` are Unix milliseconds.

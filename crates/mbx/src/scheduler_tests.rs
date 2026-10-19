@@ -2476,6 +2476,8 @@ fn sim_request(
         arrival,
         duration,
         record: Waiting {
+            first_arrival_ms: None,
+            pid: None,
             name: None,
             mode_key: None,
             ticket,
@@ -2574,7 +2576,22 @@ impl<'a> AdmissionSimulation<'a> {
         request: &Waiting,
     ) -> AdmissionDecision {
         if !self.legacy_readers || request.cpu.is_some() || request.memory_bytes.is_some() {
-            return admission_decision(capacity, live, waiting, request);
+            let waiting: Vec<_> = waiting.collect();
+            let without_logging =
+                admission_decision(capacity, live, waiting.iter().copied(), request);
+            let trace = std::cell::RefCell::new(decisions::Trace::default());
+            let with_logging = admission_decision_traced(
+                capacity,
+                live,
+                waiting.iter().copied(),
+                request,
+                Some(&trace),
+            );
+            assert_eq!(
+                without_logging, with_logging,
+                "logging must not change admission"
+            );
+            return without_logging;
         }
         // Use the independent fe73826 reader for the legacy process itself,
         // including in both counterfactual forks and strict FIFO admission.
