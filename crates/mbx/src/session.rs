@@ -2313,7 +2313,18 @@ pub(crate) fn learned_incremental_requested() -> bool {
 
 /// Whether private state may be made portable automatically.
 pub(crate) fn seed_incremental_requested() -> bool {
-    std::env::var_os(SEED_INCREMENTAL_ENV).is_none_or(|value| value != "0" && value != "false")
+    seed_incremental_from_env(std::env::var_os(SEED_INCREMENTAL_ENV).as_deref())
+}
+
+fn seed_incremental_from_env(value: Option<&OsStr>) -> bool {
+    value.is_none_or(|value| {
+        value.to_str().is_some_and(|value| {
+            matches!(
+                usage_config::Ty::Bool.coerce(usage_config::Value::String(value.trim().to_owned())),
+                Ok(usage_config::Value::Bool(true))
+            )
+        })
+    })
 }
 
 /// Whether the session opted into private workspace state from the first compilation.

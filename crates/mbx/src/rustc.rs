@@ -539,14 +539,22 @@ pub(crate) fn compile(
         incremental_seed_mode(rustc, &invocation, &arguments, incremental_flag.is_some()),
         learned.directory.as_deref(),
     );
-    let mut command = private_compiler_command(
+    let (mut command, response_file) = match private_compiler_command(
         rustc,
         wrapper_argument,
         &arguments,
         &working_dir,
         incremental_flag.as_deref(),
         seed_mode,
-    );
+    ) {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            session::report_shim_error(&format!(
+                "compiler arguments could not be prepared: {error:#}"
+            ));
+            return Ok(ExitCode::FAILURE);
+        }
+    };
     let private_outputs = private_inputs || learned.engaged();
     if private_outputs {
         // Before the compiler starts, so that a dependent Cargo pipelines
@@ -590,6 +598,7 @@ pub(crate) fn compile(
         run_compiler(&mut command, forwarded && !held, eligible)
     })
     .wrap_err("failed to execute rustc")?;
+    drop(response_file);
     if bootstrap_dep_info_requires_retry(seed_mode, &outputs.dep_info) {
         let retry = (|| -> Result<()> {
             let directory = learned.directory.as_deref().ok_or_else(|| {
@@ -618,18 +627,19 @@ pub(crate) fn compile(
             ));
             return Ok(ExitCode::FAILURE);
         }
-        let mut command = private_compiler_command(
+        let (mut command, response_file) = private_compiler_command(
             rustc,
             wrapper_argument,
             &arguments,
             &working_dir,
             incremental_flag.as_deref(),
             IncrementalSeedMode::Disabled,
-        );
+        )?;
         output = crate::phase_timing::measure("compiler", || {
             run_compiler(&mut command, forwarded, eligible)
         })
         .wrap_err("failed to execute rustc without bootstrap")?;
+        drop(response_file);
     } else if forwarded && held {
         let _ = replay_bytes(&output.stdout, &output.stderr);
     }
@@ -1635,6 +1645,21 @@ fn bootstrap_dep_info_requires_retry(mode: IncrementalSeedMode, path: &Path) -> 
             .is_ok_and(|dep_info| dep_info.environment.contains_key("RUSTC_BOOTSTRAP"))
 }
 
+/// rustc reads one UTF-8 argument per line, without shell escaping. A trailing
+/// carriage return would become part of a CRLF terminator and lose that byte.
+fn response_file_contents(arguments: &[OsString]) -> Option<Vec<u8>> {
+    let mut contents = Vec::new();
+    for argument in arguments {
+        let argument = argument.to_str()?;
+        if argument.contains('\n') || argument.ends_with('\r') {
+            return None;
+        }
+        contents.extend_from_slice(argument.as_bytes());
+        contents.push(b'\n');
+    }
+    Some(contents)
+}
+
 fn private_compiler_command(
     rustc: &OsStr,
     wrapper_argument: Option<&OsStr>,
@@ -1642,10 +1667,42 @@ fn private_compiler_command(
     working_dir: &Path,
     incremental_flag: Option<&OsStr>,
     mode: IncrementalSeedMode,
-) -> Command {
+) -> Result<(Command, Option<tempfile::NamedTempFile>)> {
     let mut command = compiler_command(rustc, wrapper_argument);
+    let mut response_file = None;
     if mode.shares_state() {
-        command.args(paths_relative_to(arguments, working_dir));
+        if arguments
+            .iter()
+            .any(|argument| argument.as_encoded_bytes().starts_with(b"@"))
+        {
+            let expanded = RustcInvocation::expand_arguments(arguments)?;
+            // Check original arguments too: rewriting a checkout path could remove its newline.
+            let contents = if expanded
+                .iter()
+                .any(|argument| argument.as_encoded_bytes().contains(&b'\n'))
+            {
+                None
+            } else {
+                response_file_contents(&paths_relative_to(&expanded, working_dir))
+            };
+            if let Some(contents) = contents {
+                let mut file = tempfile::Builder::new()
+                    .prefix(&format!("mbx-rustc-args-{}-", std::process::id()))
+                    .tempfile()
+                    .wrap_err("failed to create the compiler response file")?;
+                file.write_all(&contents)
+                    .wrap_err("failed to write the compiler response file")?;
+                let mut argument = OsString::from("@");
+                argument.push(file.path());
+                command.arg(argument);
+                response_file = Some(file);
+            } else {
+                // Preserve arguments that rustc's line-based format cannot represent.
+                command.args(arguments);
+            }
+        } else {
+            command.args(paths_relative_to(arguments, working_dir));
+        }
     } else {
         command.args(arguments);
     }
@@ -1654,7 +1711,7 @@ fn private_compiler_command(
         command.arg(flag);
     }
     mode.apply(&mut command);
-    command
+    Ok((command, response_file))
 }
 
 /// Separate automatically remapped state from state compiled with Cargo's flags.

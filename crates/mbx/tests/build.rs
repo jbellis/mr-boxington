@@ -631,6 +631,8 @@ fn isolated_cargo_command(
         // defers to it, and `Swatinem/rust-cache` sets it to 0 for the whole
         // job, so leaving it would make this suite pass locally and fail in CI.
         .env_remove("MBX_INCREMENTAL")
+        .env_remove("MBX_SEED_INCREMENTAL")
+        .env_remove("RUSTC_BOOTSTRAP")
         .env_remove("CARGO_INCREMENTAL")
         .env_remove("CI")
         .env_remove("GITHUB_ACTIONS")
@@ -1537,6 +1539,11 @@ fn incremental_seed_preserves_bootstrap_env_dependencies_across_edits() {
             }
         }
     }
+}
+
+#[test]
+fn learned_incremental_state_reuses_donors_with_cargo_response_files() {
+    check_incremental_seeding(&[("__CARGO_TEST_FORCE_ARGFILE", "1")]);
 }
 
 fn check_incremental_seeding(remapped: &[(&str, &str)]) {

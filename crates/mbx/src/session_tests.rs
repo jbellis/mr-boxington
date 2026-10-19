@@ -2199,3 +2199,23 @@ fn transparent_wrapped_compiles_do_not_count_samples_and_clippy_has_its_own_mode
             .contains("[compile clippy ")
     );
 }
+
+#[test]
+fn seed_incremental_uses_config_boolean_spellings() {
+    assert!(seed_incremental_from_env(None));
+    for spelling in [
+        "", "0", "false", "no", "off", "n", " FALSE ", "NO", " Off ", "  ",
+    ] {
+        assert!(
+            !seed_incremental_from_env(Some(OsStr::new(spelling))),
+            "{spelling:?}"
+        );
+    }
+    for spelling in ["1", "true", "yes", "on", "y", " TRUE ", " YES ", " On "] {
+        assert!(
+            seed_incremental_from_env(Some(OsStr::new(spelling))),
+            "{spelling:?}"
+        );
+    }
+    assert!(!seed_incremental_from_env(Some(OsStr::new("invalid"))));
+}

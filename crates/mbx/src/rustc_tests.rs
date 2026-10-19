@@ -2094,14 +2094,15 @@ fn incremental_seed_keeps_private_build_script_arguments_and_environment() {
     for bootstrap in [false, true] {
         let mode = injection_for_invocation(IncrementalSeedMode::Inject { bootstrap }, &args, true);
         assert_eq!(mode, IncrementalSeedMode::Disabled);
-        let command = private_compiler_command(
+        let (command, _response_file) = private_compiler_command(
             OsStr::new("rustc"),
             None,
             &args,
             Path::new("/checkout"),
             Some(OsStr::new("-Cincremental=/state")),
             mode,
-        );
+        )
+        .unwrap();
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             args.iter()
@@ -2147,14 +2148,15 @@ fn incremental_seed_bootstrap_dep_info_disables_later_injection() {
         IncrementalSeedMode::UserRemap
     );
     let args = [OsString::from("/checkout/src/lib.rs")];
-    let command = private_compiler_command(
+    let (command, _response_file) = private_compiler_command(
         OsStr::new("rustc"),
         None,
         &args,
         Path::new("/checkout"),
         Some(OsStr::new("-Cincremental=/state")),
         IncrementalSeedMode::Disabled,
-    );
+    )
+    .unwrap();
     assert_eq!(command.get_args().next().unwrap(), args[0]);
     assert!(command.get_envs().next().is_none());
 }
@@ -2184,14 +2186,15 @@ fn incremental_seed_excludes_build_script_compiles_in_argfiles() {
         assert_eq!(mode, IncrementalSeedMode::Disabled);
         let state = project.path().join("state");
         let flag = private_incremental_flag(&state);
-        let mut command = private_compiler_command(
+        let (mut command, _response_file) = private_compiler_command(
             OsStr::new("rustc"),
             None,
             &args,
             project.path(),
             Some(&flag),
             mode,
-        );
+        )
+        .unwrap();
         assert_eq!(
             command.get_args().collect::<Vec<_>>(),
             vec![args[0].as_os_str(), flag.as_os_str()]
@@ -2242,4 +2245,190 @@ fn incremental_seed_retry_uses_only_current_dep_info() {
     assert!(!bootstrap_dep_info_requires_retry(mode, &path));
     std::fs::write(&path, "out: src/lib.rs\n# env-dep:RUSTC_BOOTSTRAP=1\n").unwrap();
     assert!(bootstrap_dep_info_requires_retry(mode, &path));
+}
+
+#[test]
+fn incremental_seed_response_file_rewrites_paths_without_shell_escaping() {
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path();
+    let input = root.join("cargo.args");
+    let arguments = [
+        root.join("src/lib.rs").display().to_string(),
+        format!("--out-dir={}", root.join("target/debug/deps").display()),
+        format!("-Ldependency={}", root.join("target/debug/deps").display()),
+        format!(
+            "--extern=dep={}",
+            root.join("target/debug/deps/libdep.rlib").display()
+        ),
+        "--cfg=message=\"spaces and quotes\"".to_owned(),
+        "literal\\backslash".to_owned(),
+        "日本語".to_owned(),
+        String::new(),
+    ]
+    .map(OsString::from);
+    std::fs::write(&input, response_file_contents(&arguments).unwrap()).unwrap();
+    let outer = [OsString::from(format!("@{}", input.display()))];
+    let prepare = || {
+        private_compiler_command(
+            OsStr::new("clippy-driver"),
+            Some(OsStr::new("rustc")),
+            &outer,
+            root,
+            Some(OsStr::new("-Cincremental=/state")),
+            IncrementalSeedMode::Inject { bootstrap: true },
+        )
+        .unwrap()
+    };
+    let (command, file) = prepare();
+    let file = file.unwrap();
+    let (other_command, other_file) = prepare();
+    let other_file = other_file.unwrap();
+    assert_ne!(
+        file.path(),
+        other_file.path(),
+        "concurrent commands need different files"
+    );
+    let expected = paths_relative_to(&arguments, root);
+    let contents = std::fs::read(file.path()).unwrap();
+    assert_eq!(contents, response_file_contents(&expected).unwrap());
+    let text = String::from_utf8(contents).unwrap();
+    let sep = std::path::MAIN_SEPARATOR;
+    assert!(text.contains(&format!("--out-dir=.{sep}target{sep}debug{sep}deps\n")));
+    assert!(text.contains(&format!("-Ldependency=.{sep}target{sep}debug{sep}deps\n")));
+    assert!(text.contains(&format!(
+        "--extern=dep=.{sep}target{sep}debug{sep}deps{sep}libdep.rlib\n"
+    )));
+    assert!(text.contains("--cfg=message=\"spaces and quotes\"\nliteral\\backslash\n日本語\n\n"));
+    let args = command.get_args().collect::<Vec<_>>();
+    assert_eq!(args[0], "rustc");
+    assert_eq!(
+        args[1],
+        OsString::from(format!("@{}", file.path().display()))
+    );
+    assert_eq!(
+        &args[2..],
+        [
+            "-Cincremental=/state",
+            "-Zremap-cwd-prefix=.",
+            "-Zallow-features="
+        ]
+    );
+    assert_eq!(
+        RustcInvocation::expand_arguments(&[args[1].to_owned()]).unwrap(),
+        expected
+    );
+    let path = file.path().to_owned();
+    drop(file);
+    assert!(!path.exists());
+    assert!(other_file.path().exists());
+    drop(other_command);
+}
+
+#[test]
+fn incremental_seed_response_file_keeps_newline_arguments_original() {
+    let project = tempfile::tempdir().unwrap();
+    let input = project.path().join("cargo.args");
+    std::fs::write(&input, "src/lib.rs\n").unwrap();
+    for value in ["message=\"first\nsecond\"", "trailing\r"] {
+        let arguments = [
+            OsString::from(format!("@{}", input.display())),
+            OsString::from(value),
+            OsString::from(format!(
+                "--out-dir={}",
+                project.path().join("target").display()
+            )),
+        ];
+        let (command, file) = private_compiler_command(
+            OsStr::new("rustc"),
+            None,
+            &arguments,
+            project.path(),
+            None,
+            IncrementalSeedMode::UserRemap,
+        )
+        .unwrap();
+        assert!(file.is_none());
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            arguments
+                .iter()
+                .map(OsString::as_os_str)
+                .collect::<Vec<_>>()
+        );
+    }
+    let newline_root = Path::new("/checkout\nroot");
+    let arguments = [
+        OsString::from(format!("@{}", input.display())),
+        OsString::from(format!(
+            "--out-dir={}",
+            newline_root.join("target").display()
+        )),
+    ];
+    let (command, file) = private_compiler_command(
+        OsStr::new("rustc"),
+        None,
+        &arguments,
+        newline_root,
+        None,
+        IncrementalSeedMode::UserRemap,
+    )
+    .unwrap();
+    assert!(
+        file.is_none(),
+        "a newline in the checkout path must also preserve the original arguments"
+    );
+    assert_eq!(
+        command.get_args().collect::<Vec<_>>(),
+        arguments
+            .iter()
+            .map(OsString::as_os_str)
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        response_file_contents(&[OsString::from("middle\rcarriage")]).unwrap(),
+        b"middle\rcarriage\n"
+    );
+}
+
+#[test]
+fn incremental_seed_response_file_is_removed_after_compiler_failure() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(
+        project.path().join("failed.rs"),
+        "compile_error!(\"expected compiler failure\");\n",
+    )
+    .unwrap();
+    let input = project.path().join("cargo.args");
+    std::fs::write(
+        &input,
+        "--crate-type=lib\n--emit=dep-info,link\nfailed.rs\n",
+    )
+    .unwrap();
+    let args = [OsString::from(format!("@{}", input.display()))];
+    let (mut command, file) = private_compiler_command(
+        OsStr::new("rustc"),
+        None,
+        &args,
+        project.path(),
+        None,
+        IncrementalSeedMode::Inject { bootstrap: true },
+    )
+    .unwrap();
+    let path = file.as_ref().unwrap().path().to_owned();
+    assert!(!command.output().unwrap().status.success());
+    drop(file);
+    assert!(!path.exists());
+    let (mut command, file) = private_compiler_command(
+        project.path().join("missing-compiler").as_os_str(),
+        None,
+        &args,
+        project.path(),
+        None,
+        IncrementalSeedMode::UserRemap,
+    )
+    .unwrap();
+    let path = file.as_ref().unwrap().path().to_owned();
+    assert!(command.output().is_err());
+    drop(file);
+    assert!(!path.exists());
 }
