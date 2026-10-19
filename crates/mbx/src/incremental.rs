@@ -1356,10 +1356,11 @@ mod tests {
         let inactive = unit(&state.directory, "inactive", 1);
         let mut lock = fslock::LockFile::open(&active.join("crate-id/s-session.lock")).unwrap();
         lock.lock().unwrap();
-        std::fs::File::open(active.join("crate-id/s-session.lock"))
-            .unwrap()
-            .set_modified(UNIX_EPOCH)
-            .unwrap();
+        filetime::set_file_mtime(
+            active.join("crate-id/s-session.lock"),
+            filetime::FileTime::from_unix_time(0, 0),
+        )
+        .unwrap();
         drop(state.lease);
         let preview = collect(cache.path(), Some(0), None, true).unwrap();
         assert_eq!(preview.removed_units, 2);
@@ -1390,10 +1391,7 @@ mod tests {
             let lock = directory.join("crate-id/s-session.lock");
             std::fs::write(&lock, b"").unwrap();
             if !fresh_lock {
-                std::fs::File::open(&lock)
-                    .unwrap()
-                    .set_modified(UNIX_EPOCH)
-                    .unwrap();
+                filetime::set_file_mtime(&lock, filetime::FileTime::from_unix_time(0, 0)).unwrap();
             }
             drop(state.lease);
             for dry_run in [true, false] {
