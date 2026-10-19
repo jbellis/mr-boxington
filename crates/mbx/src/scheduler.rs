@@ -247,7 +247,7 @@ pub(crate) struct Demand {
     /// Another wrapper may have returned a cache hit without running rustc.
     count_compile_samples: bool,
     observation: std::cell::Cell<Option<accuracy::Admission>>,
-    /// Frozen before waiting; completion residuals must use the prediction’s features.
+    /// Refreshed while waiting, then retained for completion calibration.
     memory_features: std::cell::Cell<Option<memory::Features>>,
     /// Frozen only for sibling-sourced admissions; never own-window features.
     sibling_features: std::cell::Cell<Option<memory::Features>>,
@@ -470,6 +470,7 @@ struct Waiting {
 struct QueueEntry {
     record: Option<Waiting>,
     ticket: u64,
+    serialized_record: Vec<u8>,
     _guard: Permit,
 }
 
@@ -1297,8 +1298,8 @@ struct MemoryLedger {
     /// Recent successful unwrapped peaks (plus doubled OOM peaks), newest last.
     #[serde(default)]
     memory_windows: BTreeMap<String, Vec<u64>>,
-    /// Causal standardized residuals, newest last, independently per kind.
-    #[serde(default)]
+    /// Log-ratio scores. The distinct field ignores old standardized scores.
+    #[serde(default, rename = "memory_log_ratios")]
     memory_residuals: BTreeMap<String, Vec<f64>>,
     /// Independent causal calibration for previously unsampled compile modes.
     #[serde(default)]
@@ -1724,18 +1725,24 @@ impl Pool {
     pub(crate) fn admit(&self, demand: &Demand) -> Option<Permit> {
         let _phase = crate::phase_timing::phase("permit_wait");
         demand.observation.set(None);
-        let Plan {
-            resources,
-            weight,
-            predicted,
-            source,
-        } = self.demand_vector(demand);
         let started = Instant::now();
         let mut state = AdmissionState::new(if self.events { (self.clock)() } else { 0 });
         let mut delay = POLL_INITIAL;
         let mut stamped: Option<Instant> = None;
         let mut complained = false;
+        let mut ledger_cache = LedgerCache::default();
         loop {
+            // Polls run every 2 to 25 ms. Reuse the plan until history reloads;
+            // its calibration features remain paired with the cached charge.
+            let Plan {
+                resources,
+                weight,
+                predicted,
+                source,
+            } = ledger_cache.prediction(&self.ledger_path(), |ledger| {
+                self.demand_vector_with_ledger(demand, ledger)
+            });
+            // Features are refreshed with the plan and retained on admission.
             // The gate stops applying at its deadline so a machine that stays
             // short of memory delays this compilation rather than starving it.
             let gate = predicted.filter(|_| started.elapsed() < GATE_DEADLINE);
@@ -1861,7 +1868,12 @@ impl Pool {
         (plan.weight, plan.predicted, plan.source)
     }
 
+    #[cfg(test)]
     fn demand_vector(&self, demand: &Demand) -> Plan {
+        self.demand_vector_with_ledger(demand, &read_ledger(&self.ledger_path()))
+    }
+
+    fn demand_vector_with_ledger(&self, demand: &Demand, ledger: &MemoryLedger) -> Plan {
         if let Some(identity) = &demand.per_test {
             let path = test_history_path(&self.dir.join(TEST_HISTORY_DIR), &identity.binary);
             let history = lookup_test_history(&path, &identity.binary, &identity.test);
@@ -1917,12 +1929,7 @@ impl Pool {
         // whether or not the tests keep them busy.
         let learned = demand
             .learns_cpu
-            .then(|| {
-                read_ledger(&self.ledger_path())
-                    .cpus
-                    .get(&demand.name)
-                    .copied()
-            })
+            .then(|| ledger.cpus.get(&demand.name).copied())
             .flatten();
         let threads = learned
             .or(demand.threads)
@@ -1940,18 +1947,17 @@ impl Pool {
                 source: "unmeasured",
             };
         }
-        let ledger = read_ledger(&self.ledger_path());
         let key = ledger_key(&demand.name, demand.links);
         let (predicted, source) = if let Some(mode) = &demand.compile_mode {
             demand.memory_features.set(Some(
-                memory::estimate(&ledger, mode, "compile")
+                memory::estimate(ledger, mode, "compile")
                     .map_or(memory::Features::COLD, |e| e.features),
             ));
             // One permit is what an unmeasured compile is charged.
             let prediction =
-                memory::compile_prediction(&ledger, &demand.name, mode, self.bytes_per_permit);
+                memory::compile_prediction(ledger, &demand.name, mode, self.bytes_per_permit);
             demand.sibling_features.set(if prediction.1 == "sibling" {
-                memory::sibling_estimate(&ledger, &demand.name, self.bytes_per_permit)
+                memory::sibling_estimate(ledger, &demand.name, self.bytes_per_permit)
                     .map(|e| e.features)
             } else {
                 None
@@ -1968,12 +1974,12 @@ impl Pool {
                 },
             )
         } else if demand.links {
-            let estimate = memory::estimate(&ledger, &key, "link");
+            let estimate = memory::estimate(ledger, &key, "link");
             demand.memory_features.set(Some(
                 estimate.map_or(memory::Features::COLD, |e| e.features),
             ));
             memory::link_prediction(
-                &ledger,
+                ledger,
                 &key,
                 demand.profile.as_deref(),
                 LINK_WEIGHT.saturating_mul(self.bytes_per_permit),
@@ -2158,7 +2164,18 @@ impl Pool {
         let decision =
             admission_decision_traced(capacity, &live, waiting.iter(), &request, trace.as_ref());
         if decision == AdmissionDecision::Waiting {
-            if state.queued.is_none() {
+            if let Some(entry) = &state.queued {
+                let serialized_record = serde_json::to_vec(&request)?;
+                if entry.serialized_record != serialized_record {
+                    let guard = self.lock_record(&waiters, &serialized_record)?;
+                    state.queued = Some(QueueEntry {
+                        ticket,
+                        _guard: guard,
+                        serialized_record,
+                        record: self.events.then(|| request.clone()),
+                    });
+                }
+            } else {
                 let ticket = waiting
                     .iter()
                     .map(|entry| entry.ticket)
@@ -2167,9 +2184,11 @@ impl Pool {
                     .checked_add(1)
                     .ok_or_else(|| eyre::eyre!("scheduler queue exhausted"))?;
                 let record = Waiting { ticket, ..request };
+                let serialized_record = serde_json::to_vec(&record)?;
                 state.queued = Some(QueueEntry {
                     ticket,
-                    _guard: self.lock_record(&waiters, &serde_json::to_vec(&record)?)?,
+                    _guard: self.lock_record(&waiters, &serialized_record)?,
+                    serialized_record,
                     record: self.events.then(|| record.clone()),
                 });
                 self.decision_event("enqueued", &record, None, events);
@@ -3220,6 +3239,67 @@ impl SchedulerReport {
         lines.push(self.accuracy.text());
         lines.push(self.decisions.text());
         lines.join("\n")
+    }
+}
+
+// Atomic ledger replacements have new file identities even if timestamp and
+// size match. A bounded lifetime also handles in-place writes and platforms
+// without a portable file identity.
+const LEDGER_CACHE_MAX_AGE: Duration = Duration::from_secs(1);
+
+#[derive(PartialEq, Eq)]
+struct LedgerStamp {
+    modified: std::time::SystemTime,
+    len: u64,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+}
+
+impl LedgerStamp {
+    fn read(path: &Path) -> Option<Self> {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some(Self {
+            modified: metadata.modified().ok()?,
+            len: metadata.len(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+        })
+    }
+}
+
+#[derive(Default)]
+struct LedgerCache {
+    stamp: Option<LedgerStamp>,
+    loaded_at: Option<Instant>,
+    ledger: MemoryLedger,
+    plan: Option<Plan>,
+}
+
+impl LedgerCache {
+    fn read(&mut self, path: &Path) -> &MemoryLedger {
+        let stamp = LedgerStamp::read(path);
+        if stamp != self.stamp
+            || self
+                .loaded_at
+                .is_none_or(|loaded| loaded.elapsed() >= LEDGER_CACHE_MAX_AGE)
+        {
+            self.ledger = read_ledger(path);
+            self.stamp = stamp;
+            self.loaded_at = Some(Instant::now());
+            self.plan = None;
+        }
+        &self.ledger
+    }
+
+    fn prediction(&mut self, path: &Path, predict: impl FnOnce(&MemoryLedger) -> Plan) -> Plan {
+        self.read(path);
+        *self.plan.get_or_insert_with(|| predict(&self.ledger))
     }
 }
 

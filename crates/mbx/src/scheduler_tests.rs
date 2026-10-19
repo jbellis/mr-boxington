@@ -4171,16 +4171,16 @@ fn calibrated_compile_oom_windows_roll_and_residual_features_are_frozen() {
         read_ledger(&pool.ledger_path()).memory_windows[key],
         vec![200]
     );
-    demand.memory_features.set(Some(memory::Features {
-        mean: 100.0_f64.ln(),
-        scale: 2.0,
-    }));
+    pool.demand_vector(&demand);
+    // A concurrent completion changes the window after this plan was admitted.
+    let concurrent = compile_demand("crate", &[]);
+    pool.record_compile(&concurrent, 100, false, true).unwrap();
     pool.record_compile(&demand, 400, false, true).unwrap();
     let ledger = read_ledger(&pool.ledger_path());
-    assert!((ledger.memory_residuals["compile"][0] - (4.0_f64.ln() / 2.0)).abs() < 1e-12);
+    assert!((ledger.memory_residuals["compile"].last().unwrap() - 2.0_f64.ln()).abs() < 1e-12);
     pool.record_compile(&demand, 900, true, false).unwrap();
     let ledger = read_ledger(&pool.ledger_path());
-    assert_eq!(ledger.memory_windows[key], vec![200, 400, 1800]);
+    assert_eq!(ledger.memory_windows[key], vec![200, 100, 400, 1800]);
     calibrate_kind(&pool, "compile");
     assert!(pool.demand_vector(&demand).resources.memory_bytes >= 1800);
     let mut wrapped = compile_demand("crate", &[]);
@@ -4188,7 +4188,7 @@ fn calibrated_compile_oom_windows_roll_and_residual_features_are_frozen() {
     pool.record_compile(&wrapped, 9999, false, true).unwrap();
     assert_eq!(
         read_ledger(&pool.ledger_path()).memory_windows[key],
-        vec![200, 400, 1800]
+        vec![200, 100, 400, 1800]
     );
     pool.record_compile(&wrapped, 2000, true, false).unwrap();
     assert_eq!(
@@ -4321,7 +4321,7 @@ fn native_filename_collisions_keep_the_legacy_maximum_and_never_teach_windows() 
                 .unwrap()
                 .contains_key(name)
         );
-        assert!(stored["memory_residuals"].as_object().unwrap().is_empty());
+        assert!(stored["memory_log_ratios"].as_object().unwrap().is_empty());
         // Even stale windows from the previous implementation must not retire
         // the filename's maximum or influence the pooled spread on read.
         let mut ledger = read_ledger(&pool.ledger_path());
@@ -4578,4 +4578,241 @@ fn sibling_stats_include_the_bound_for_an_unsampled_active_mode() {
     assert_eq!(entry.q, Some(estimate.q));
     assert_eq!(entry.charge_bytes, Some(estimate.charge));
     assert!(report.text().contains("(sibling)"));
+}
+
+#[test]
+fn waiting_prediction_refreshes_charge_and_admission_features() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool_at(dir.path(), 10, 100);
+    let demand = compile_demand("crate", &[]);
+    let key = demand.compile_mode.as_ref().unwrap();
+    let mut ledger = MemoryLedger::default();
+    ledger.memory_windows.insert(key.clone(), vec![500; 4]);
+    std::fs::write(pool.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let mut cache = LedgerCache::default();
+    let plan = pool.demand_vector_with_ledger(&demand, cache.read(&pool.ledger_path()));
+    let live = pool.try_admit(9, None).unwrap().unwrap();
+    let mut queued = None;
+    assert!(
+        pool.try_admit_named(
+            plan.resources,
+            plan.weight,
+            None,
+            &mut queued,
+            Some(&demand)
+        )
+        .unwrap()
+        .is_none()
+    );
+    let ticket = queued.as_ref().unwrap().ticket;
+    ledger.memory_windows.insert(key.clone(), vec![10; 4]);
+    std::fs::write(pool.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let refreshed = pool.demand_vector_with_ledger(&demand, cache.read(&pool.ledger_path()));
+    assert!(refreshed.resources.memory_bytes < plan.resources.memory_bytes);
+    // Still queued: publish the new charge while preserving queue order.
+    assert!(
+        pool.try_admit_named(
+            Resources {
+                cpu: 2,
+                ..refreshed.resources
+            },
+            10,
+            None,
+            &mut queued,
+            Some(&demand)
+        )
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(queued.as_ref().unwrap().ticket, ticket);
+    let waiting = scan_waiters(&dir.path().join(WAITERS_DIR)).unwrap();
+    assert_eq!(
+        waiting[0].memory_bytes,
+        Some(refreshed.resources.memory_bytes)
+    );
+    let permit = pool
+        .try_admit_named(
+            refreshed.resources,
+            refreshed.weight,
+            None,
+            &mut queued,
+            Some(&demand),
+        )
+        .unwrap()
+        .unwrap();
+    ledger.memory_windows.insert(key.clone(), vec![1000; 4]);
+    std::fs::write(pool.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
+    pool.record_compile(&demand, 20, false, true).unwrap();
+    let recorded = read_ledger(&pool.ledger_path());
+    assert!((recorded.memory_residuals["compile"].last().unwrap() - 2.0_f64.ln()).abs() < 1e-12);
+    drop((permit, live));
+}
+
+#[test]
+#[cfg(unix)]
+fn ledger_cache_notices_atomic_replacement_with_same_time_and_size() {
+    use std::io::Write;
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(LEDGER_FILE);
+    let mut ledger = MemoryLedger::default();
+    ledger.crates.insert("crate".into(), 100);
+    crate::util::write_advisory(&path, &serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let mut cache = LedgerCache::default();
+    assert_eq!(cache.read(&path).crates["crate"], 100);
+    ledger.crates.insert("crate".into(), 200);
+    let mut replacement = tempfile::NamedTempFile::new_in(dir.path()).unwrap();
+    replacement
+        .write_all(&serde_json::to_vec(&ledger).unwrap())
+        .unwrap();
+    filetime::set_file_mtime(
+        replacement.path(),
+        filetime::FileTime::from_last_modification_time(&metadata),
+    )
+    .unwrap();
+    replacement.persist(&path).unwrap();
+    let after = std::fs::metadata(&path).unwrap();
+    assert_eq!(metadata.len(), after.len());
+    assert_eq!(metadata.modified().unwrap(), after.modified().unwrap());
+    assert_eq!(cache.read(&path).crates["crate"], 200);
+}
+
+#[test]
+fn ledger_cache_bounds_staleness_when_file_metadata_does_not_change() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join(LEDGER_FILE);
+    let mut ledger = MemoryLedger::default();
+    ledger.crates.insert("crate".into(), 100);
+    std::fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+    let metadata = std::fs::metadata(&path).unwrap();
+    let mut cache = LedgerCache::default();
+    assert_eq!(cache.read(&path).crates["crate"], 100);
+    ledger.crates.insert("crate".into(), 200);
+    std::fs::write(&path, serde_json::to_vec(&ledger).unwrap()).unwrap();
+    filetime::set_file_mtime(
+        &path,
+        filetime::FileTime::from_last_modification_time(&metadata),
+    )
+    .unwrap();
+    assert!(cache.stamp == LedgerStamp::read(&path));
+    assert_eq!(cache.read(&path).crates["crate"], 100);
+    cache.loaded_at = Some(Instant::now() - LEDGER_CACHE_MAX_AGE);
+    assert_eq!(cache.read(&path).crates["crate"], 200);
+}
+
+#[test]
+fn waiting_prediction_is_reused_until_ledger_reload() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool_at(dir.path(), 10, 100);
+    let demand = compile_demand("crate", &[]);
+    let key = demand.compile_mode.as_ref().unwrap();
+    let mut ledger = MemoryLedger::default();
+    ledger.memory_windows.insert(key.clone(), vec![500; 4]);
+    crate::util::write_advisory(&pool.ledger_path(), &serde_json::to_vec(&ledger).unwrap())
+        .unwrap();
+    let mut cache = LedgerCache::default();
+    let predictions = std::cell::Cell::new(0);
+    let predict = |ledger: &MemoryLedger| {
+        predictions.set(predictions.get() + 1);
+        pool.demand_vector_with_ledger(&demand, ledger)
+    };
+    let first = cache.prediction(&pool.ledger_path(), predict);
+    let features = demand.memory_features.get().unwrap();
+    for _ in 0..10 {
+        let reused = cache.prediction(&pool.ledger_path(), predict);
+        assert_eq!(reused.resources, first.resources);
+        assert_eq!(reused.weight, first.weight);
+        assert_eq!(reused.predicted, first.predicted);
+        assert_eq!(reused.source, first.source);
+    }
+    assert_eq!(predictions.get(), 1);
+    // Expiry with identical content recomputes once without changing the plan
+    // or its admission-time calibration features.
+    cache.loaded_at = Some(Instant::now() - LEDGER_CACHE_MAX_AGE);
+    let same = cache.prediction(&pool.ledger_path(), predict);
+    assert_eq!(predictions.get(), 2);
+    assert_eq!(same.resources, first.resources);
+    assert_eq!(same.weight, first.weight);
+    assert_eq!(same.predicted, first.predicted);
+    assert_eq!(same.source, first.source);
+    assert_eq!(demand.memory_features.get().unwrap().mean, features.mean);
+    assert_eq!(demand.memory_features.get().unwrap().scale, features.scale);
+    cache.prediction(&pool.ledger_path(), predict);
+    assert_eq!(predictions.get(), 2);
+    // A changed ledger refreshes both the charge and the frozen denominator.
+    ledger.memory_windows.insert(key.clone(), vec![10; 4]);
+    crate::util::write_advisory(&pool.ledger_path(), &serde_json::to_vec(&ledger).unwrap())
+        .unwrap();
+    let changed = cache.prediction(&pool.ledger_path(), predict);
+    assert_eq!(predictions.get(), 3);
+    assert!(changed.resources.memory_bytes < first.resources.memory_bytes);
+    assert_eq!(demand.memory_features.get().unwrap().mean, 10.0_f64.ln());
+}
+
+#[test]
+fn repredicted_waiter_gate_logs_current_charge_and_dequeues_old_record() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pool = pool_at(dir.path(), 10, 100);
+    pool.events = true;
+    pool.clock = || 1_000;
+    let demand = compile_demand("crate", &[]);
+    let key = demand.compile_mode.as_ref().unwrap();
+    let mut ledger = MemoryLedger::default();
+    ledger.memory_windows.insert(key.clone(), vec![500; 4]);
+    let plan = pool.demand_vector_with_ledger(&demand, &ledger);
+    let held = pool.try_admit(9, None).unwrap().unwrap();
+    let mut state = AdmissionState::new(100);
+    assert!(
+        pool.try_admit_state(
+            plan.resources,
+            plan.weight,
+            plan.predicted,
+            &mut state,
+            Some(&demand)
+        )
+        .unwrap()
+        .is_none()
+    );
+    let ticket = state.queued.as_ref().unwrap().ticket;
+    ledger.memory_windows.insert(key.clone(), vec![10; 4]);
+    let refreshed = pool.demand_vector_with_ledger(&demand, &ledger);
+    assert!(refreshed.resources.memory_bytes < plan.resources.memory_bytes);
+    pool.available_memory = || Some(0);
+    for _ in 0..2 {
+        assert!(
+            pool.try_admit_state(
+                refreshed.resources,
+                refreshed.weight,
+                refreshed.predicted,
+                &mut state,
+                Some(&demand)
+            )
+            .unwrap()
+            .is_none()
+        );
+    }
+    assert!(state.queued.is_none());
+    let events: Vec<serde_json::Value> =
+        std::fs::read_to_string(dir.path().join("decisions.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+    let gated: Vec<_> = events
+        .iter()
+        .filter(|event| event["event"] == "gated")
+        .collect();
+    assert_eq!(gated.len(), 1, "same-reason retry is suppressed");
+    assert_eq!(gated[0]["memory_bytes"], refreshed.resources.memory_bytes);
+    assert_eq!(gated[0]["first_arrival_ms"], 100);
+    assert_eq!(gated[0]["reason"], "available-memory");
+    let dequeued = events
+        .iter()
+        .find(|event| event["event"] == "dequeued")
+        .unwrap();
+    assert_eq!(dequeued["memory_bytes"], plan.resources.memory_bytes);
+    assert_eq!(dequeued["ticket"], ticket);
+    assert_eq!(dequeued["first_arrival_ms"], 100);
+    assert_eq!(dequeued["waited_ms"], 900);
+    drop(held);
 }

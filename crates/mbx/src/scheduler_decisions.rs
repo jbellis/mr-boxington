@@ -271,13 +271,14 @@ impl Pool {
         events: &mut Vec<Event>,
         request: impl FnOnce() -> Waiting,
     ) {
-        if state.queued.is_some() {
-            self.dequeue(&mut state.queued, reason, events);
-        } else if self.events && state.last_gate != Some(reason) {
+        // The gate judged the current attempt, while dequeue describes the
+        // previously published queue record (which may carry an older charge).
+        if self.events && state.last_gate != Some(reason) {
             let mut event = Event::new(self, "gated", &request());
             event.reason = Some(reason.into());
             events.push(event);
         }
+        self.dequeue(&mut state.queued, reason, events);
         state.last_gate = Some(reason);
     }
 
@@ -1374,7 +1375,7 @@ mod tests {
         assert_eq!(
             summary.gated_by_reason,
             BTreeMap::from([
-                ("available-memory".into(), 2),
+                ("available-memory".into(), 3),
                 ("resumes-pending".into(), 1),
                 ("pressure".into(), 1)
             ])
@@ -1384,7 +1385,7 @@ mod tests {
         assert!(
             summary
                 .text()
-                .contains("Gated by reason: available-memory=2")
+                .contains("Gated by reason: available-memory=3")
         );
         assert_eq!(
             serde_json::to_value(&summary).unwrap()["gated_by_reason"]["pressure"],

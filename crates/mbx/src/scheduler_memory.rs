@@ -65,8 +65,8 @@ pub(super) struct Sample {
 }
 
 impl Features {
-    // A planned cold key has no residual. Preserve that fact even if another
-    // process records its first sample while this request waits in the queue.
+    // A key admitted without samples has no residual, even if another
+    // process records its first sample while this request runs.
     pub(super) const COLD: Self = Self {
         mean: 0.0,
         scale: 0.0,
@@ -120,10 +120,17 @@ fn conformal_rank(n: usize) -> usize {
 }
 
 pub(super) fn quantile(ledger: &MemoryLedger, kind: &str, n: usize) -> f64 {
-    history_quantile(
-        ledger.memory_residuals.get(kind).map_or(&[], Vec::as_slice),
-        n,
-    )
+    let scores = ledger
+        .memory_residuals
+        .get(kind)
+        .map_or(&[][..], Vec::as_slice);
+    let q = history_quantile(scores, n);
+    if scores.iter().filter(|r| r.is_finite()).count() < MIN_RESIDUALS {
+        // The kind summary has no key variance; report its cold-key log ratio.
+        q * sigma_pool(ledger, kind) * (1.0 + 1.0 / n.max(1) as f64).sqrt()
+    } else {
+        q
+    }
 }
 
 fn history_quantile(history: &[f64], n: usize) -> f64 {
@@ -147,13 +154,27 @@ pub(super) fn estimate(ledger: &MemoryLedger, key: &str, kind: &str) -> Option<E
     let s = ((NU0 as f64 * sigma_pool(ledger, kind).powi(2) + (n - 1) as f64 * variance)
         / (NU0 + n - 1) as f64)
         .sqrt();
+    let log_max = (window_max as f64).ln();
+    // Own-key features encode ln(peak / admission-time window maximum).
+    // Sibling features retain their independent standardized score.
     let features = Features {
-        mean,
-        scale: s * (1.0 + 1.0 / n as f64).sqrt(),
+        mean: log_max,
+        scale: 1.0,
     };
-    let q = quantile(ledger, kind, n);
+    let enough = ledger
+        .memory_residuals
+        .get(kind)
+        .is_some_and(|h| h.iter().filter(|r| r.is_finite()).count() >= MIN_RESIDUALS);
+    let q = if enough {
+        quantile(ledger, kind, n)
+    } else {
+        // Keep the existing Student-t bound until calibration has 50 scores.
+        // Its pooled spread allows an increase even with one observation. Express
+        // that bound as a log ratio, so q has the same units after warm-up.
+        mean + history_quantile(&[], n) * s * (1.0 + 1.0 / n as f64).sqrt() - log_max
+    };
     // Float-to-integer casts saturate at u64::MAX for an overflowing bound.
-    let bound = (mean + q * features.scale).exp().ceil() as u64;
+    let bound = (window_max as f64 * q.exp()).ceil() as u64;
     Some(Estimate {
         n,
         window_max,
@@ -460,7 +481,7 @@ pub(super) fn record(
         if residual.is_finite() {
             let history = ledger.memory_residuals.entry(kind.to_string()).or_default();
             history.push(residual);
-            history.drain(..history.len().saturating_sub(MAX_RESIDUALS));
+            sanitize_residuals(history);
         }
     }
     let window = ledger.memory_windows.entry(key.to_string()).or_default();
@@ -472,6 +493,73 @@ pub(super) fn record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn log_ratio_score_and_charge_ignore_key_spread() {
+        let mut ledger = MemoryLedger::default();
+        ledger.memory_windows.insert("narrow".into(), vec![100; 16]);
+        ledger.memory_windows.insert("wide".into(), vec![10, 100]);
+        ledger
+            .memory_residuals
+            .insert("compile".into(), vec![1.5_f64.ln(); 50]);
+        for key in ["narrow", "wide"] {
+            let e = estimate(&ledger, key, "compile").unwrap();
+            assert_eq!(e.charge, 150);
+            record(&mut ledger, key, "compile", 150, Some(e.features), true);
+            assert!(
+                (ledger.memory_residuals["compile"].last().unwrap() - 1.5_f64.ln()).abs() < 1e-12
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_key_scores_keep_the_latest_256_without_a_key_cap() {
+        let mut ledger = MemoryLedger::default();
+        let features = Features {
+            mean: 100.0_f64.ln(),
+            scale: 1.0,
+        };
+        for peak in 101..=400 {
+            record(&mut ledger, "repeat", "compile", peak, Some(features), true);
+        }
+        let history = &ledger.memory_residuals["compile"];
+        assert_eq!(history.len(), MAX_RESIDUALS);
+        assert!((history[0] - (145.0_f64 / 100.0).ln()).abs() < 1e-12);
+        assert!((history[MAX_RESIDUALS - 1] - 4.0_f64.ln()).abs() < 1e-12);
+        let encoded = serde_json::to_value(&ledger).unwrap();
+        assert_eq!(
+            encoded["memory_log_ratios"]["compile"]
+                .as_array()
+                .unwrap()
+                .len(),
+            MAX_RESIDUALS
+        );
+        assert!(encoded["memory_log_ratios"]["compile"][0].is_number());
+    }
+
+    #[test]
+    fn old_ledger_scores_are_ignored_without_losing_windows() {
+        let mut ledger: MemoryLedger = serde_json::from_str(
+            r#"{
+            "version":1,"crates":{"crate":100},"link_peaks":[],
+            "memory_windows":{"crate [compile a]":[100]},
+            "memory_residuals":{"compile":[7.0,8.0]},
+            "sibling_residuals":[2.0]
+        }"#,
+        )
+        .unwrap();
+        prepare(&mut ledger);
+        assert!(ledger.memory_residuals.is_empty());
+        assert_eq!(ledger.memory_windows["crate [compile a]"], vec![100]);
+        assert_eq!(ledger.crates["crate"], 100);
+        assert_eq!(ledger.sibling_residuals, vec![2.0]);
+        assert_eq!(
+            estimate(&ledger, "crate [compile a]", "compile")
+                .unwrap()
+                .charge,
+            452
+        );
+    }
 
     fn siblings(values: &[u64]) -> MemoryLedger {
         let mut ledger = MemoryLedger::default();
@@ -730,18 +818,30 @@ mod tests {
         let e = estimate(&ledger, "key", "compile").unwrap();
         let key_variance = 2.0_f64.ln().powi(2) / 2.0;
         let expected = ((4.0 * 0.25_f64.powi(2) + key_variance) / 5.0).sqrt() * 1.5_f64.sqrt();
-        assert!((e.features.scale - expected).abs() < 1e-12);
+        assert!(
+            (e.q - (moments(&[100, 200]).0 + T_QUANTILES[4] * expected - 200.0_f64.ln())).abs()
+                < 1e-12
+        );
     }
     #[test]
     fn t_fallback_nearest_rank_calibration_and_window_floor() {
         let mut ledger = MemoryLedger::default();
         ledger.memory_windows.insert("key".into(), vec![100]);
-        assert_eq!(quantile(&ledger, "compile", 1), T_QUANTILES[3]);
-        assert_eq!(quantile(&ledger, "compile", 40), NORMAL_QUANTILE);
+        assert_eq!(
+            quantile(&ledger, "compile", 1),
+            T_QUANTILES[3] * 0.5 * 2.0_f64.sqrt()
+        );
+        assert_eq!(
+            quantile(&ledger, "compile", 40),
+            NORMAL_QUANTILE * 0.5 * 1.025_f64.sqrt()
+        );
         ledger
             .memory_residuals
             .insert("compile".into(), vec![-10.0; 49]);
-        assert_eq!(quantile(&ledger, "compile", 1), T_QUANTILES[3]);
+        assert_eq!(
+            quantile(&ledger, "compile", 1),
+            T_QUANTILES[3] * 0.5 * 2.0_f64.sqrt()
+        );
         ledger
             .memory_residuals
             .insert("compile".into(), (0..50).map(|i| i as f64).collect());
@@ -752,7 +852,10 @@ mod tests {
         let e = estimate(&ledger, "key", "compile").unwrap();
         assert!(e.bound < 100);
         assert_eq!(e.charge, 100);
-        assert_eq!(quantile(&ledger, "link", 1), T_QUANTILES[3]);
+        assert_eq!(
+            quantile(&ledger, "link", 1),
+            T_QUANTILES[3] * 0.5 * 2.0_f64.sqrt()
+        );
     }
     #[test]
     fn finite_sample_rank_matches_review_scenario_and_clamps_to_history() {
@@ -762,7 +865,10 @@ mod tests {
             .memory_residuals
             .insert("compile".into(), (0..50).map(|i| i as f64 / 10.0).collect());
         assert_eq!(quantile(&ledger, "compile", 16), 4.8);
-        assert_eq!(estimate(&ledger, "key", "compile").unwrap().charge, 312);
+        assert_eq!(
+            estimate(&ledger, "key", "compile").unwrap().charge,
+            (100.0 * 4.8_f64.exp()).ceil() as u64
+        );
         ledger
             .memory_residuals
             .insert("compile".into(), (0..256).map(|i| i as f64).collect());
@@ -815,8 +921,8 @@ mod tests {
                 true,
             );
         }
-        assert_eq!(ledger.memory_residuals["compile"].len(), 256);
-        assert_eq!(ledger.memory_residuals["compile"], vec![0.0; 256]);
+        assert_eq!(ledger.memory_residuals["compile"].len(), MAX_RESIDUALS);
+        assert!(ledger.memory_residuals["compile"].iter().all(|r| *r == 0.0));
         record(
             &mut ledger,
             "key",
@@ -828,7 +934,7 @@ mod tests {
             }),
             true,
         );
-        assert_eq!(ledger.memory_residuals["compile"], vec![0.0; 256]);
+        assert!(ledger.memory_residuals["compile"].iter().all(|r| *r == 0.0));
     }
     #[test]
     fn a_calibrated_wide_spread_does_not_uncap_a_key_with_few_samples() {

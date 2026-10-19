@@ -86,21 +86,33 @@ compile mode or link identity also retain the legacy rule.
 
 Each Rust compile-mode or link key keeps the last **16 successful, unwrapped
 peak-RSS measurements**.
-Starting with the first sample, mbx estimates an upper bound in log space:
-`exp(mean(log peaks) + q * s * sqrt(1 + 1/n))`. The charge is the larger of
-that bound and the window maximum. The spread `s` shrinks the key's sample
-variance toward a pooled spread with four prior degrees of freedom. The
-pooled spread is the median log-space sample standard deviation over keys
-of the same kind with at least four samples; fewer than ten qualifying keys
-use a spread of 0.5. This is recomputed when the ledger is read.
+The charge is the larger of the window maximum and
+`window_max * exp(q)`. The calibration score is
+`ln(actual_peak / admission_time_window_max)`, so a given percentage increase
+has the same score for every key, regardless of its measured spread.
 
 The target probability is **0.95**, selected by causal admission replay.
-For each kind, the latest 256 standardized prediction residuals calibrate
-`q` using finite-sample rank `ceil(0.95 * (N + 1))`, clamped to the
-`N` available residuals. Before 50 residuals, mbx uses a one-sided Student-t multiplier with `4 + n - 1` degrees of freedom.
-Residuals use the prediction features frozen before admission waiting, and
-only successful, unwrapped runs calibrate them. Zero-spread predictions have
-no defined standardized residual and skip calibration for that sample.
+For each kind, the latest 256 scores calibrate `q` using finite-sample rank
+`ceil(0.95 * (N + 1))`, clamped to the `N` available scores. Only successful,
+unwrapped runs calibrate the estimate. Scores saved by older versions used a
+different scale and are discarded; peak windows and sibling calibration remain.
+
+Before 50 scores, mbx keeps its spread-based upper bound:
+`exp(mean(log peaks) + t * s * sqrt(1 + 1/n))`, with the same window maximum
+floor. Here `t` is a one-sided Student-t multiplier with `4 + n - 1` degrees
+of freedom. The spread `s` shrinks the key's sample variance toward a pooled
+spread with four prior degrees of freedom. The pool uses the median log-space
+sample standard deviation over keys of the same kind with at least four
+samples; fewer than ten qualifying keys use 0.5. This allows the bound to
+exceed the measured peak even for a key with just one measurement. The key's reported `q` expresses this
+bound as a log ratio to its window maximum.
+
+Waiting requests check history on every poll and re-predict their charge when
+the cached ledger reloads. The parsed ledger and prediction are reused until
+the file changes, for at most one second.
+On Unix, file identity also detects replacements with matching timestamps and sizes. When a request is admitted,
+its prediction features are retained for calibration after the run, even if
+other jobs update the ledger in the meantime.
 
 A compile mode without window samples first uses its retained legacy per-mode
 entry, preserving the old headroom and crate-wide fallback rules. If that entry
@@ -126,9 +138,10 @@ which makes new readers return to the cold-start hierarchy until they relearn.
 
 `mbx stats --scheduler` shows each key's window size, window maximum, bound,
 charge and source, alongside its legacy peak and sample count. It also shows
-pooled spreads, residual counts and quantile multipliers for each kind.
-Before calibration the kind summary shows the cold-key multiplier (n=1);
-JSON includes each measured key's actual multiplier. Test-run charges still
+pooled spreads, score counts and log-ratio quantiles for each kind.
+Before calibration the kind summary shows the cold-key log ratio (n=1);
+JSON includes each measured key's actual log ratio. Sibling summaries keep
+their standardized multipliers. Test-run charges still
 defer to admission. Add `--json` for raw bytes. Without `--scheduler`, the
 stats output omits this section. Charges use global scheduler settings;
 a workspace `.mbx.toml` can change them for that workspace's builds.
