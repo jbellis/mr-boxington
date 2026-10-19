@@ -585,11 +585,12 @@ pub(crate) fn compile(
     let held = seed_mode == IncrementalSeedMode::Inject { bootstrap: true };
     let eligible =
         wrapper_argument.is_none() && !invocation.crate_name().starts_with("build_script_");
+    clear_bootstrap_dep_info(seed_mode, &outputs.dep_info)?;
     let mut output = crate::phase_timing::measure("compiler", || {
         run_compiler(&mut command, forwarded && !held, eligible)
     })
     .wrap_err("failed to execute rustc")?;
-    if output.status.success() && bootstrap_dep_info_requires_retry(seed_mode, &outputs.dep_info)? {
+    if bootstrap_dep_info_requires_retry(seed_mode, &outputs.dep_info) {
         let retry = (|| -> Result<()> {
             let directory = learned.directory.as_deref().ok_or_else(|| {
                 eyre::eyre!("bootstrap compilation has no private state directory")
@@ -1565,8 +1566,7 @@ fn incremental_seed_mode(
             bootstrap_set,
         ),
         arguments,
-        session::is_cargo_build_script(invocation.crate_name())
-            && session::compiles_only_a_binary(arguments),
+        session::is_cargo_build_script(invocation.crate_name()),
     );
     if matches!(mode, IncrementalSeedMode::Inject { .. }) && !remap_cwd_supported(rustc) {
         return IncrementalSeedMode::Disabled;
@@ -1578,9 +1578,11 @@ fn incremental_seed_mode(
 fn injection_for_invocation(
     mode: IncrementalSeedMode,
     arguments: &[OsString],
-    build_script: bool,
+    build_script_name: bool,
 ) -> IncrementalSeedMode {
-    let unstable_flags = profile_arguments(arguments)
+    let arguments = profile_arguments(arguments);
+    let build_script = build_script_name && session::compiles_only_a_binary(&arguments);
+    let unstable_flags = arguments
         .iter()
         .any(|arg| arg.as_encoded_bytes().starts_with(b"-Z"));
     match mode {
@@ -1612,13 +1614,25 @@ fn mode_in_state_directory(
     }
 }
 
-fn bootstrap_dep_info_requires_retry(mode: IncrementalSeedMode, path: &Path) -> Result<bool> {
-    if mode != (IncrementalSeedMode::Inject { bootstrap: true }) {
-        return Ok(false);
+/// A failed compiler may leave no dep-info. Remove any previous attempt's
+/// file first so that only the current attempt can trigger a retry.
+fn clear_bootstrap_dep_info(mode: IncrementalSeedMode, path: &Path) -> Result<()> {
+    if mode == (IncrementalSeedMode::Inject { bootstrap: true }) {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).wrap_err("failed to remove previous bootstrap dep-info");
+            }
+        }
     }
-    Ok(RustcDepInfo::read(path)?
-        .environment
-        .contains_key("RUSTC_BOOTSTRAP"))
+    Ok(())
+}
+
+fn bootstrap_dep_info_requires_retry(mode: IncrementalSeedMode, path: &Path) -> bool {
+    mode == (IncrementalSeedMode::Inject { bootstrap: true })
+        && RustcDepInfo::read(path)
+            .is_ok_and(|dep_info| dep_info.environment.contains_key("RUSTC_BOOTSTRAP"))
 }
 
 fn private_compiler_command(

@@ -2125,17 +2125,14 @@ fn incremental_seed_bootstrap_dep_info_disables_later_injection() {
     let bootstrap = IncrementalSeedMode::Inject { bootstrap: true };
     for record in ["# env-dep:RUSTC_BOOTSTRAP=1", "# env-dep:RUSTC_BOOTSTRAP"] {
         std::fs::write(&dep_info, format!("out: src/lib.rs\n{record}\n")).unwrap();
-        assert!(bootstrap_dep_info_requires_retry(bootstrap, &dep_info).unwrap());
-        assert!(
-            !bootstrap_dep_info_requires_retry(
-                IncrementalSeedMode::Inject { bootstrap: false },
-                &dep_info
-            )
-            .unwrap()
-        );
+        assert!(bootstrap_dep_info_requires_retry(bootstrap, &dep_info));
+        assert!(!bootstrap_dep_info_requires_retry(
+            IncrementalSeedMode::Inject { bootstrap: false },
+            &dep_info
+        ));
     }
     std::fs::write(&dep_info, "out: src/lib.rs\n# env-dep:OTHER=1\n").unwrap();
-    assert!(!bootstrap_dep_info_requires_retry(bootstrap, &dep_info).unwrap());
+    assert!(!bootstrap_dep_info_requires_retry(bootstrap, &dep_info));
     assert_eq!(
         mode_in_state_directory(bootstrap, Some(state.path())),
         bootstrap
@@ -2160,4 +2157,89 @@ fn incremental_seed_bootstrap_dep_info_disables_later_injection() {
     );
     assert_eq!(command.get_args().next().unwrap(), args[0]);
     assert!(command.get_envs().next().is_none());
+}
+
+#[test]
+fn incremental_seed_excludes_build_script_compiles_in_argfiles() {
+    let project = tempfile::tempdir().unwrap();
+    std::fs::write(project.path().join("build.rs"), "fn main() {}\n").unwrap();
+    let argfile = project.path().join("build.args");
+    std::fs::write(
+        &argfile,
+        "--crate-name\nbuild_script_build\n--crate-type\nbin\n--emit=dep-info,link\nbuild.rs\n",
+    )
+    .unwrap();
+    let args = [OsString::from(format!("@{}", argfile.display()))];
+    let parsed =
+        RustcInvocation::parse_with(&args, ParseOptions::caching_native_links(true)).unwrap();
+    assert!(mbx_cache_rustc::is_build_script_crate_name(
+        parsed.crate_name()
+    ));
+    assert!(
+        !session::compiles_only_a_binary(&args),
+        "the original argv hides the crate type"
+    );
+    for bootstrap in [false, true] {
+        let mode = injection_for_invocation(IncrementalSeedMode::Inject { bootstrap }, &args, true);
+        assert_eq!(mode, IncrementalSeedMode::Disabled);
+        let state = project.path().join("state");
+        let flag = private_incremental_flag(&state);
+        let mut command = private_compiler_command(
+            OsStr::new("rustc"),
+            None,
+            &args,
+            project.path(),
+            Some(&flag),
+            mode,
+        );
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            vec![args[0].as_os_str(), flag.as_os_str()]
+        );
+        assert!(command.get_envs().next().is_none());
+        let output = command.output().unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    // Both crate-type detection and unstable-option policy use expanded argv.
+    std::fs::write(
+        &argfile,
+        "--crate-type\nlib\n-Z\nallow-features=some_feature\n",
+    )
+    .unwrap();
+    assert_eq!(
+        injection_for_invocation(
+            IncrementalSeedMode::Inject { bootstrap: true },
+            &args,
+            false
+        ),
+        IncrementalSeedMode::Disabled
+    );
+    assert_eq!(
+        injection_for_invocation(
+            IncrementalSeedMode::Inject { bootstrap: false },
+            &args,
+            false
+        ),
+        IncrementalSeedMode::Inject { bootstrap: false }
+    );
+}
+
+#[test]
+fn incremental_seed_retry_uses_only_current_dep_info() {
+    let project = tempfile::tempdir().unwrap();
+    let path = project.path().join("crate.d");
+    let mode = IncrementalSeedMode::Inject { bootstrap: true };
+    std::fs::write(&path, "out: src/lib.rs\n# env-dep:RUSTC_BOOTSTRAP=1\n").unwrap();
+    assert!(bootstrap_dep_info_requires_retry(mode, &path));
+    clear_bootstrap_dep_info(mode, &path).unwrap();
+    assert!(!path.exists());
+    assert!(!bootstrap_dep_info_requires_retry(mode, &path));
+    std::fs::write(&path, "out: src/lib.rs\n").unwrap();
+    assert!(!bootstrap_dep_info_requires_retry(mode, &path));
+    std::fs::write(&path, "out: src/lib.rs\n# env-dep:RUSTC_BOOTSTRAP=1\n").unwrap();
+    assert!(bootstrap_dep_info_requires_retry(mode, &path));
 }

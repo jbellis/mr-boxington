@@ -7049,3 +7049,97 @@ fn main() {
         project.path().canonicalize().unwrap().join("embedded.rs")
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn incremental_seed_retries_failed_bootstrap_const_but_not_genuine_rustc_errors() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let version = Command::new("rustc").arg("-vV").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    if !rustc_relocates_incremental_state()
+        || version.lines().any(|line| {
+            line.starts_with("release:") && (line.contains("nightly") || line.contains("dev"))
+        })
+    {
+        return;
+    }
+    let real_rustc = which::which("rustc").unwrap();
+    for (name, source, succeeds, attempts) in [
+        (
+            "bootstrap-const",
+            "const _: () = assert!(option_env!(\"RUSTC_BOOTSTRAP\").is_none());\npub fn value() {}\n",
+            true,
+            vec!["1", "unset"],
+        ),
+        (
+            "genuine-error",
+            "compile_error!(\"genuine-compile-error\");\n",
+            false,
+            vec!["1"],
+        ),
+        ("no-dep-info", "pub fn broken( {\n", false, vec!["1"]),
+    ] {
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_project(project.path());
+        std::fs::write(project.path().join("src/lib.rs"), source).unwrap();
+        let wrapper = project.path().join("counting-rustc");
+        let log = project.path().join("attempts.log");
+        std::fs::write(
+            &wrapper,
+            r#"#!/bin/sh
+case " $* " in
+  *" --crate-name fixture "*)
+    printf '%s\n' "${RUSTC_BOOTSTRAP-unset}" >> "$TEST_COMPILER_ATTEMPTS"
+    ;;
+esac
+exec "$TEST_REAL_RUSTC" "$@"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = mbx_command();
+        command.env_remove("RUSTC_BOOTSTRAP");
+        let output = isolated_cargo_command(
+            command,
+            project.path(),
+            store.path(),
+            &reports.path().join("build.json"),
+            &["build", "--locked"],
+            &[
+                ("MBX_EAGER_INCREMENTAL", "1"),
+                ("RUSTC", wrapper.to_str().unwrap()),
+                ("TEST_REAL_RUSTC", real_rustc.to_str().unwrap()),
+                ("TEST_COMPILER_ATTEMPTS", log.to_str().unwrap()),
+            ],
+        )
+        .output()
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), succeeds, "{name}: {stderr}");
+        let actual = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            actual.lines().collect::<Vec<_>>(),
+            attempts,
+            "{name}: {stderr}"
+        );
+        let markers = find_files(&store.path().join("incremental"), |path| {
+            file_name_is(path, |name| name == "bootstrap-env-dependency")
+        });
+        assert_eq!(
+            !markers.is_empty(),
+            succeeds,
+            "{name}: retry marker should match bootstrap dependency"
+        );
+        if succeeds {
+            assert!(
+                !stderr.contains("E0080"),
+                "discarded diagnostics reached Cargo: {stderr}"
+            );
+        } else if name == "genuine-error" {
+            assert!(stderr.contains("genuine-compile-error"), "{stderr}");
+        }
+    }
+}
