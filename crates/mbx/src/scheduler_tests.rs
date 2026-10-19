@@ -17,6 +17,21 @@ fn pool_at(dir: &Path, capacity: u64, bytes_per_permit: u64) -> Pool {
     pool
 }
 
+fn calibrate_kind(pool: &Pool, kind: &str) {
+    let mut ledger = read_ledger(&pool.ledger_path());
+    for index in 0..10 {
+        let key = match kind {
+            "link" => format!("calibration-{index} [link]"),
+            "test-binary" => format!("calibration-{index} [test]"),
+            _ => format!("calibration-{index} [compile mode]"),
+        };
+        ledger.memory_windows.insert(key, vec![100, 145, 213, 320]);
+    }
+    // These fixtures establish only the calibration threshold; keep recorded
+    // spread values stable for tests that check exact estimator vectors.
+    std::fs::write(pool.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
+}
+
 fn encode_history_map(binary: &str, records: &BTreeMap<u64, TestMeasurement>) -> Vec<u8> {
     let records: Vec<_> = records
         .iter()
@@ -439,7 +454,7 @@ fn plans_weigh_history_links_and_nothing() {
     let (weight, predicted) = pool.plan(&Demand::new("heavy", true));
     assert_eq!(
         (weight, predicted),
-        (8, Some(40637)),
+        (8, Some(9000)),
         "a link's own history above the floor wins"
     );
     // and below it, which is the floor being retired rather than raised.
@@ -448,7 +463,7 @@ fn plans_weigh_history_links_and_nothing() {
     let (weight, predicted) = pool.plan(&Demand::new("light-link", true));
     assert_eq!(
         (weight, predicted),
-        (4, Some(3161)),
+        (1, Some(700)),
         "a link's own history below the floor also wins"
     );
     // The two entries are genuinely separate, not one overwriting the other.
@@ -594,7 +609,7 @@ fn an_unmeasured_link_is_weighed_by_what_this_machine_s_links_have_cost() {
         .unwrap();
     assert_eq!(
         pool.plan(&Demand::new("known", true)),
-        (7, Some(6773)),
+        (2, Some(1500)),
         "a crate's own calibrated window outranks the machine's"
     );
 
@@ -1102,7 +1117,8 @@ fn link_profile_separates_release_from_dev_links() {
         "a release peak must not charge a dev link"
     );
     let (_, predicted) = pool.plan(&release_demand);
-    assert!(predicted.unwrap() > 10_000_000);
+    // Before link calibration, the window peak is the warmup cap.
+    assert_eq!(predicted, Some(10_000_000));
 
     // Spelled `-Clto=fat` or as separate arguments, the profile is the same;
     // non-links are untouched.
@@ -1910,7 +1926,9 @@ fn compile_modes_use_the_window_from_the_first_successful_sample() {
     assert_eq!(pool.plan(&demand), (10, Some(1000)));
     for count in 1..=4 {
         pool.record_compile(&demand, 81, false, true).unwrap();
-        let charge = [366_u64, 245, 203, 181][count as usize - 1];
+        // After three successes, the previous rule's mode headroom caps the
+        // uncalibrated estimate at 122 bytes.
+        let charge = [366_u64, 245, 122, 122][count as usize - 1];
         let expected = (charge.div_ceil(100), Some(charge));
         assert_eq!(pool.plan(&demand), expected);
         let ledger = read_ledger(&pool.ledger_path());
@@ -1930,12 +1948,14 @@ fn compile_window_ignores_legacy_caps_and_handles_a_missing_bare_peak() {
     for _ in 0..3 {
         pool.record_compile(&demand, 401, false, true).unwrap();
     }
-    assert_eq!(pool.plan(&demand), (11, Some(1003)));
+    // The bare crate entry keeps this window at its measured 401-byte peak.
+    assert_eq!(pool.plan(&demand), (5, Some(401)));
     let key = demand.compile_mode.as_ref().unwrap();
     let mut ledger = read_ledger(&pool.ledger_path());
     ledger.crates.remove("heavy");
     std::fs::write(pool.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
-    assert_eq!(pool.plan(&demand), (11, Some(1003)));
+    // Without the bare entry, the previous mode rule supplies 602 bytes.
+    assert_eq!(pool.plan(&demand), (7, Some(602)));
     ledger.crates.insert(key.clone(), u64::MAX);
     assert_eq!(
         legacy_compile_prediction(&ledger, "heavy", key),
@@ -1957,7 +1977,7 @@ fn recreating_a_missing_fallback_covers_all_retained_modes() {
     let new = compile_demand("heavy", &[]);
     pool.record_compile(&new, 200, false, true).unwrap();
     assert_eq!(read_ledger(&pool.ledger_path()).crates["heavy"], 1000);
-    assert_eq!(pool.plan(&old), (25, Some(2500)));
+    assert_eq!(pool.plan(&old), (10, Some(1000)));
 }
 
 #[test]
@@ -1978,7 +1998,7 @@ fn compile_failures_and_oom_raise_peaks_without_successful_samples() {
     assert!(!ledger.compile_samples.contains_key(key));
     pool.record_compile(&demand, 1, true, false).unwrap();
     assert_eq!(read_ledger(&pool.ledger_path()).crates[key], 602);
-    assert_eq!(pool.plan(&demand), (15, Some(1459)));
+    assert_eq!(pool.plan(&demand), (7, Some(602)));
 }
 
 #[test]
@@ -2105,7 +2125,7 @@ fn scheduler_stats_read_old_records_without_locking_or_reclaiming_them() {
     let snapshot = scheduler_snapshot(directory.path(), 100, 100, true);
     let text = snapshot.text();
     assert!(
-        text.contains("n=3, window max=81 B, bound=203 B, charge=1 cores + 203 B (window)"),
+        text.contains("n=3, window max=81 B, bound=203 B, charge=1 cores + 122 B (window)"),
         "{text}"
     );
     assert!(text.contains("lease unknown: mode=unknown, build=unknown, domain=unknown"));
@@ -2147,8 +2167,8 @@ fn scheduler_stats_report_links_and_defer_test_charges_to_admission() {
         let report = scheduler_snapshot(directory.path(), 10, unit, true);
         for entry in &report.entries {
             if unit > 0 && entry.key.ends_with(" [link]") {
-                assert_eq!(entry.charge_bytes, Some(904));
-                assert_eq!(entry.charge_permits, Some(10));
+                assert_eq!(entry.charge_bytes, Some(200));
+                assert_eq!(entry.charge_permits, Some(2));
             } else {
                 assert_eq!(entry.charge_bytes, None, "{}", entry.key);
                 assert_eq!(entry.charge_permits, None, "{}", entry.key);
@@ -2220,7 +2240,7 @@ fn unsampled_compile_modes_use_the_largest_sibling_charge() {
         pool.record_compile(&metadata, 100, false, true).unwrap();
         pool.record_compile(&mir, 100, false, true).unwrap();
     }
-    assert_eq!(pool.plan(&metadata), (3, Some(250)));
+    assert_eq!(pool.plan(&metadata), (2, Some(150)));
     for args in [
         vec!["--crate-type=rlib", "--emit=link", "--emit=metadata"],
         vec!["--crate-type=rlib", "--emit=link"],
@@ -2238,7 +2258,7 @@ fn unsampled_compile_modes_use_the_largest_sibling_charge() {
     ] {
         assert_eq!(
             pool.plan(&compile_demand("crate", &args)),
-            (3, Some(250)),
+            (2, Some(150)),
             "{args:?}"
         );
     }
@@ -3397,10 +3417,10 @@ fn demand_vectors_keep_mode_link_window_and_nextest_predictions_in_bytes() {
         plan.resources,
         Resources {
             cpu: 1,
-            memory_bytes: 500
+            memory_bytes: 300
         }
     );
-    assert_eq!(plan.weight, 5);
+    assert_eq!(plan.weight, 3);
     for _ in 0..MIN_LINK_SAMPLES {
         pool.record_link_peak("known [link]", 301, true, None)
             .unwrap();
@@ -4128,6 +4148,7 @@ fn calibrated_compile_oom_windows_roll_and_residual_features_are_frozen() {
     pool.record_compile(&demand, 900, true, false).unwrap();
     let ledger = read_ledger(&pool.ledger_path());
     assert_eq!(ledger.memory_windows[key], vec![200, 400, 1800]);
+    calibrate_kind(&pool, "compile");
     assert!(pool.demand_vector(&demand).resources.memory_bytes >= 1800);
     let mut wrapped = compile_demand("crate", &[]);
     wrapped.count_compile_samples = false;
@@ -4177,6 +4198,7 @@ fn calibrated_link_hierarchy_and_wrapped_failures_preserve_legacy_windows() {
         }),
     )
     .unwrap();
+    calibrate_kind(&pool, "link");
     let plan = pool.demand_vector(&demand);
     assert_eq!(plan.source, "window");
     assert_eq!(plan.resources.memory_bytes, 904);
@@ -4205,6 +4227,7 @@ fn calibrated_stats_show_window_math_and_kind_calibration() {
     let pool = pool_at(dir.path(), 100, 100);
     let demand = compile_demand("crate", &[]);
     pool.record_compile(&demand, 100, false, true).unwrap();
+    calibrate_kind(&pool, "compile");
     let report = scheduler_snapshot(dir.path(), 100, 100, true);
     let json = serde_json::to_value(&report).unwrap();
     let entry = json["entries"]
@@ -4218,7 +4241,10 @@ fn calibrated_stats_show_window_math_and_kind_calibration() {
     assert_eq!(entry["bound_bytes"], 452);
     assert_eq!(entry["charge_bytes"], 452);
     assert_eq!(entry["source"], "window");
-    assert_eq!(json["memory_calibration"][0]["sigma_pool"], 0.5);
+    assert_eq!(
+        json["memory_calibration"][0]["sigma_pool"],
+        0.5002389229311026
+    );
     assert_eq!(json["memory_calibration"][0]["target_p"], 0.95);
     assert_eq!(json["memory_calibration"][0]["residual_count"], 0);
     let text = report.text();

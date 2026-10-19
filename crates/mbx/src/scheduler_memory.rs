@@ -161,32 +161,79 @@ pub(super) fn estimate(ledger: &MemoryLedger, key: &str, kind: &str) -> Option<E
     })
 }
 
+/// Whether a kind's pooled spread comes from data rather than the default.
+fn calibrated(ledger: &MemoryLedger, kind_name: &str) -> bool {
+    ledger
+        .memory_windows
+        .iter()
+        .filter(|(key, values)| kind(key) == kind_name && values.len() >= 4)
+        .count()
+        >= MIN_POOL_KEYS
+}
+
+/// While a kind's spread is still the default, a window's bound is several
+/// times wider than this workload's measured variation, so a key's first
+/// samples would be charged far more than the previous rule ever charged.
+/// Until enough keys calibrate the spread, cap the charge at the previous
+/// rule's, and never below the window's largest peak.
+fn warm_up_charge(
+    ledger: &MemoryLedger,
+    kind_name: &str,
+    estimate: &Estimate,
+    previous: Option<u64>,
+) -> u64 {
+    match previous {
+        Some(previous) if !calibrated(ledger, kind_name) => {
+            estimate.charge.min(previous.max(estimate.window_max))
+        }
+        _ => estimate.charge,
+    }
+}
+
+/// The charge f47d416's rule gives a compile mode, when it has any history.
+fn previous_compile_charge(ledger: &MemoryLedger, name: &str, key: &str) -> Option<u64> {
+    let bare = ledger.crates.get(name).copied();
+    let Some(peak) = ledger.crates.get(key).copied() else {
+        return bare;
+    };
+    // An old writer can discard windows. Preserve its charge, including mode
+    // headroom or the crate-wide fallback before three successes.
+    let old_charge = if ledger.compile_samples.get(key).copied().unwrap_or(0) >= 3 {
+        let padded = peak.saturating_add(peak.div_ceil(2));
+        bare.map_or(padded, |bare| padded.min(bare))
+    } else {
+        bare.unwrap_or(peak)
+    };
+    Some(peak.max(old_charge))
+}
+
+fn compile_window_charge(ledger: &MemoryLedger, name: &str, key: &str) -> Option<u64> {
+    let estimate = estimate(ledger, key, "compile")?;
+    Some(warm_up_charge(
+        ledger,
+        "compile",
+        &estimate,
+        previous_compile_charge(ledger, name, key),
+    ))
+}
+
 pub(super) fn compile_prediction(
     ledger: &MemoryLedger,
     name: &str,
     key: &str,
 ) -> (Option<u64>, &'static str) {
-    if let Some(estimate) = estimate(ledger, key, "compile") {
-        return (Some(estimate.charge), "window");
+    if let Some(charge) = compile_window_charge(ledger, name, key) {
+        return (Some(charge), "window");
     }
-    if let Some(peak) = ledger.crates.get(key).copied() {
-        // An old writer can discard windows. Preserve its charge, including
-        // mode headroom or the crate-wide fallback before three successes.
-        let bare = ledger.crates.get(name).copied();
-        let old_charge = if ledger.compile_samples.get(key).copied().unwrap_or(0) >= 3 {
-            let padded = peak.saturating_add(peak.div_ceil(2));
-            bare.map_or(padded, |bare| padded.min(bare))
-        } else {
-            bare.unwrap_or(peak)
-        };
-        return (Some(peak.max(old_charge)), "legacy");
+    if ledger.crates.contains_key(key) {
+        return (previous_compile_charge(ledger, name, key), "legacy");
     }
     let prefix = format!("{name} [compile ");
     if let Some(charge) = ledger
         .memory_windows
         .keys()
         .filter(|key| key.starts_with(&prefix))
-        .filter_map(|key| estimate(ledger, key, "compile").map(|e| e.charge))
+        .filter_map(|key| compile_window_charge(ledger, name, key))
         .max()
     {
         return (Some(charge), "sibling");
@@ -204,12 +251,6 @@ pub(super) fn link_prediction(
     profile: Option<&str>,
     floor: u64,
 ) -> (Option<u64>, &'static str) {
-    if let Some(estimate) = estimate(ledger, key, "link") {
-        return (Some(estimate.charge), "window");
-    }
-    if let Some(peak) = ledger.crates.get(key).copied() {
-        return (Some(peak), "legacy");
-    }
     let window = match profile {
         Some(profile) => ledger
             .profile_link_peaks
@@ -217,10 +258,20 @@ pub(super) fn link_prediction(
             .map_or(&[][..], Vec::as_slice),
         None => ledger.link_peaks.as_slice(),
     };
-    match window.iter().copied().max() {
-        Some(peak) => (Some(peak), "link-window"),
-        None => (Some(floor), "link-floor"),
+    let fallback = match ledger.crates.get(key).copied() {
+        Some(peak) => (peak, "legacy"),
+        None => match window.iter().copied().max() {
+            Some(peak) => (peak, "link-window"),
+            None => (floor, "link-floor"),
+        },
+    };
+    if let Some(estimate) = estimate(ledger, key, "link") {
+        return (
+            Some(warm_up_charge(ledger, "link", &estimate, Some(fallback.0))),
+            "window",
+        );
     }
+    (Some(fallback.0), fallback.1)
 }
 
 fn trim(ledger: &mut MemoryLedger) {
@@ -316,6 +367,89 @@ pub(super) fn record(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn calibrate(ledger: &mut MemoryLedger, kind_name: &str) {
+        for index in 0..MIN_POOL_KEYS {
+            let key = match kind_name {
+                "link" => format!("calibration-{index} [link]"),
+                "test-binary" => format!("calibration-{index} [test]"),
+                _ => format!("calibration-{index} [compile mode]"),
+            };
+            ledger.memory_windows.insert(key, vec![100; 4]);
+        }
+    }
+
+    #[test]
+    fn warmup_compile_cap_uses_previous_charge_and_respects_window_max() {
+        let key = "crate [compile mode]";
+        let mut ledger = MemoryLedger::default();
+        ledger.crates.insert("crate".into(), 200);
+        ledger.memory_windows.insert(key.into(), vec![100]);
+        let raw = estimate(&ledger, key, "compile").unwrap().charge;
+        assert!(raw > 200);
+        assert_eq!(compile_window_charge(&ledger, "crate", key), Some(200));
+
+        ledger.crates.insert("crate".into(), 200);
+        ledger.memory_windows.insert(key.into(), vec![500]);
+        let raw = estimate(&ledger, key, "compile").unwrap().charge;
+        assert!(raw > 500);
+        assert_eq!(compile_window_charge(&ledger, "crate", key), Some(500));
+    }
+
+    #[test]
+    fn calibrated_compile_kind_uses_raw_estimate() {
+        let key = "crate [compile mode]";
+        let mut ledger = MemoryLedger::default();
+        ledger.crates.insert("crate".into(), 200);
+        ledger.memory_windows.insert(key.into(), vec![100; 4]);
+        calibrate(&mut ledger, "compile");
+        let raw = estimate(&ledger, key, "compile").unwrap().charge;
+        assert!(raw > 200);
+        assert_eq!(compile_window_charge(&ledger, "crate", key), Some(raw));
+    }
+
+    #[test]
+    fn link_warmup_uses_legacy_profile_and_floor_fallbacks() {
+        let key = "crate [link]";
+        let mut legacy = MemoryLedger::default();
+        legacy.crates.insert(key.into(), 200);
+        legacy.memory_windows.insert(key.into(), vec![100]);
+        let raw = estimate(&legacy, key, "link").unwrap().charge;
+        assert!(raw > 200);
+        assert_eq!(
+            link_prediction(&legacy, key, None, 50),
+            (Some(200), "window")
+        );
+
+        let mut profile = MemoryLedger::default();
+        profile
+            .profile_link_peaks
+            .insert("release".into(), vec![200]);
+        profile.memory_windows.insert(key.into(), vec![100]);
+        assert_eq!(
+            link_prediction(&profile, key, Some("release"), 50),
+            (Some(200), "window")
+        );
+
+        let mut floor = MemoryLedger::default();
+        floor.memory_windows.insert(key.into(), vec![5000]);
+        let raw = estimate(&floor, key, "link").unwrap().charge;
+        assert!(raw > 1000);
+        assert_eq!(
+            link_prediction(&floor, key, None, 1000),
+            (Some(5000), "window"),
+            "the charge cannot fall below the largest observed window peak"
+        );
+    }
+
+    #[test]
+    fn compile_window_without_any_previous_rule_value_is_not_capped() {
+        let key = "crate [compile mode]";
+        let mut ledger = MemoryLedger::default();
+        ledger.memory_windows.insert(key.into(), vec![100]);
+        let raw = estimate(&ledger, key, "compile").unwrap().charge;
+        assert_eq!(compile_window_charge(&ledger, "crate", key), Some(raw));
+    }
     #[test]
     fn fixed_vectors_and_shrinkage() {
         for (n, expected) in [(1, 452), (2, 484), (3, 583), (16, 2533)] {

@@ -748,7 +748,7 @@ mod tests {
         for _ in 0..3 {
             pool.record_compile(&demand, 200, false, true).unwrap();
         }
-        assert_eq!(pool.prediction(&demand), (5, Some(500), "window"));
+        assert_eq!(pool.prediction(&demand), (3, Some(300), "window"));
         let link = Demand::new("unseen", true);
         assert_eq!(pool.prediction(&link).2, "link-floor");
         for _ in 0..3 {
