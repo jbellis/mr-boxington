@@ -742,13 +742,13 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let pool = pool(dir.path(), 100);
         let demand = Demand::new("crate", false).with_link_profile(&[]);
-        assert_eq!(pool.prediction(&demand).2, "unmeasured");
+        assert_eq!(pool.prediction(&demand).2, "default");
         pool.record_link_peak("crate", 1000, false, None).unwrap();
+        assert_eq!(pool.prediction(&demand).2, "legacy");
         for _ in 0..3 {
-            assert_eq!(pool.prediction(&demand).2, "crate-wide");
             pool.record_compile(&demand, 200, false, true).unwrap();
         }
-        assert_eq!(pool.prediction(&demand), (3, Some(300), "mode"));
+        assert_eq!(pool.prediction(&demand), (5, Some(500), "window"));
         let link = Demand::new("unseen", true);
         assert_eq!(pool.prediction(&link).2, "link-floor");
         for _ in 0..3 {
@@ -756,10 +756,7 @@ mod tests {
                 .unwrap();
         }
         assert_eq!(pool.prediction(&link).2, "link-window");
-        assert_eq!(
-            pool.prediction(&Demand::new("known", true)).2,
-            "link-history"
-        );
+        assert_eq!(pool.prediction(&Demand::new("known", true)).2, "window");
         let test = Demand::test("suite", Some(1));
         pool.record_link_peak(&test.name, 300, false, None).unwrap();
         assert_eq!(pool.prediction(&test).2, "test-history");

@@ -405,7 +405,7 @@ pub(super) fn prediction(pool: &Pool, demand: &Demand) -> (u64, Option<u64>, &'s
     // the link beside it, which is over-admission with a plausible number
     // attached to it.
     let (estimate, source) = if let Some(key) = &demand.compile_mode {
-        let (value, trusted) = compile_prediction(&ledger, &demand.name, key);
+        let (value, trusted) = legacy_compile_prediction(&ledger, &demand.name, key);
         (
             value,
             if trusted {
@@ -443,3 +443,129 @@ pub(super) fn prediction(pool: &Pool, demand: &Demand) -> (u64, Option<u64>, &'s
         .clamp(1, pool.capacity);
     (weight, predicted, source)
 }
+
+// State writer copied from f47d416, before calibrated windows.
+pub(super) fn record_compile(
+        pool: &super::Pool,
+        demand: &Demand,
+        measured: u64,
+        oom: bool,
+        succeeded: bool,
+    ) -> Result<()> {
+        let Some(key) = demand.compile_mode.as_ref() else {
+            return Ok(());
+        };
+        if pool.bytes_per_permit == 0 {
+            return Ok(());
+        }
+        let succeeded = succeeded && demand.count_compile_samples;
+        let peak = ledger_peak(measured, oom, false, succeeded, pool.bytes_per_permit);
+        // Ordinary light crates need no ledger lock. A concurrent first heavy
+        // sample may be missed here; that only delays trusting the light mode.
+        if peak.is_none()
+            && !read_ledger(&pool.ledger_path())
+                .crates
+                .contains_key(&demand.name)
+        {
+            return Ok(());
+        }
+        std::fs::create_dir_all(&pool.dir)?;
+        let mut lock = fslock::LockFile::open(&pool.dir.join(LEDGER_LOCK))?;
+        lock.lock()?;
+        let mut ledger = read_ledger(&pool.ledger_path());
+        let mode_peak = peak.unwrap_or(measured);
+        let bare_known = ledger.crates.get(&demand.name).copied();
+        let mode_known = ledger.crates.get(key).copied();
+        let count = ledger.compile_samples.get(key).copied().unwrap_or(0);
+        if bare_known.is_some_and(|bare| peak.is_none_or(|peak| peak <= bare))
+            && mode_known.is_some_and(|known| known >= mode_peak)
+            && (!succeeded || oom || count >= 3)
+        {
+            return Ok(());
+        }
+        if let Some(peak) = peak {
+            // A mode may survive without its bare entry (e.g. an old writer's
+            // eviction). Recreating the fallback must cover every retained
+            // mode, rather than cap a known mode below its measured maximum.
+            let retained = if bare_known.is_none() {
+                let prefix = format!("{} [compile ", demand.name);
+                ledger
+                    .crates
+                    .iter()
+                    .filter(|(name, _)| name.starts_with(&prefix))
+                    .map(|(_, peak)| *peak)
+                    .max()
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            let bare = ledger.crates.entry(demand.name.clone()).or_default();
+            *bare = (*bare).max(peak).max(retained);
+        }
+        if !ledger.crates.contains_key(&demand.name) {
+            return Ok(());
+        }
+        // Even a light successful mode must learn when its crate is heavy.
+        let mode = ledger.crates.entry(key.clone()).or_default();
+        *mode = (*mode).max(mode_peak);
+        if succeeded && !oom {
+            let count = ledger.compile_samples.entry(key.clone()).or_default();
+            *count = count.saturating_add(1).min(3);
+        }
+        ledger.version = LEDGER_VERSION;
+        trim_compile_ledger(&mut ledger);
+        let mut contents = serde_json::to_vec(&ledger)?;
+        contents.push(b'\n');
+        crate::util::write_advisory(&pool.ledger_path(), &contents)
+    }
+
+
+// Link writer copied from f47d416.
+pub(super) fn record_link_peak(
+        pool: &super::Pool,
+        name: &str,
+        peak: u64,
+        links: bool,
+        profile: Option<&str>,
+    ) -> Result<()> {
+        std::fs::create_dir_all(&pool.dir)
+            .wrap_err_with(|| format!("failed to create {}", pool.dir.display()))?;
+        let mut lock = fslock::LockFile::open(&pool.dir.join(LEDGER_LOCK))?;
+        lock.lock()?;
+        let path = pool.ledger_path();
+        let mut ledger = read_ledger(&path);
+        ledger.version = LEDGER_VERSION;
+        // The window records every link, including one whose per-crate entry
+        // is already higher: it says what links cost around here lately, which
+        // a measurement no worse than the last one still answers.
+        if links {
+            let window = match profile {
+                Some(profile) => ledger
+                    .profile_link_peaks
+                    .entry(profile.to_string())
+                    .or_default(),
+                None => &mut ledger.link_peaks,
+            };
+            window.push(peak);
+            let surplus = window.len().saturating_sub(MAX_LINK_SAMPLES);
+            window.drain(..surplus);
+            while ledger.profile_link_peaks.len() > MAX_LEDGER_ENTRIES {
+                ledger.profile_link_peaks.pop_first();
+            }
+        }
+        let known = ledger.crates.get(name).is_some_and(|known| *known >= peak);
+        if known && !links {
+            // Nothing moved: the entry already stands higher and there is no
+            // window entry to add. Rewriting the file identically would cost
+            // every repeat compilation a write under this lock.
+            return Ok(());
+        }
+        if !known {
+            ledger.crates.insert(name.to_string(), peak);
+        }
+        trim_compile_ledger(&mut ledger);
+        let mut contents = serde_json::to_vec(&ledger)?;
+        contents.push(b'\n');
+        // A heuristic every link refreshes: a lost write costs one sample.
+        crate::util::write_advisory(&path, &contents)
+    }

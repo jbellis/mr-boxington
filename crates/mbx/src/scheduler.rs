@@ -45,6 +45,8 @@
 
 #[path = "scheduler_accuracy.rs"]
 mod accuracy;
+#[path = "scheduler_memory.rs"]
+mod memory;
 
 use crate::config::{Config, SchedulerPriority};
 use eyre::{Context, Result};
@@ -134,11 +136,8 @@ const MAX_LEDGER_ENTRIES: usize = 1024;
 /// and a window long enough to remember a toolchain ago would keep quoting a
 /// number nothing here produces any more.
 const MAX_LINK_SAMPLES: usize = 16;
-/// Measurements the window needs before it may speak for an unmeasured link.
-///
-/// One link is an anecdote -- the first one on a machine is as likely to be a
-/// trivial build script as the program itself -- so the static floor stands
-/// until a few have been seen.
+/// Trust threshold used only by the independent old-reader test reference.
+#[cfg(test)]
 const MIN_LINK_SAMPLES: usize = 3;
 /// Permits a native link costs before it has ever been measured.
 ///
@@ -246,6 +245,8 @@ pub(crate) struct Demand {
     /// Another wrapper may have returned a cache hit without running rustc.
     count_compile_samples: bool,
     observation: std::cell::Cell<Option<accuracy::Admission>>,
+    /// Frozen before waiting; completion residuals must use the prediction’s features.
+    memory_features: std::cell::Cell<Option<memory::Features>>,
 }
 
 #[derive(Debug, Clone)]
@@ -269,6 +270,7 @@ impl Demand {
             compile_mode: None,
             count_compile_samples: true,
             observation: std::cell::Cell::new(None),
+            memory_features: std::cell::Cell::new(None),
             per_test: None,
         }
     }
@@ -358,6 +360,7 @@ impl Demand {
             compile_mode: None,
             count_compile_samples: true,
             observation: std::cell::Cell::new(None),
+            memory_features: std::cell::Cell::new(None),
             per_test: None,
         }
     }
@@ -373,6 +376,7 @@ impl Demand {
             compile_mode: None,
             count_compile_samples: true,
             observation: std::cell::Cell::new(None),
+            memory_features: std::cell::Cell::new(None),
             per_test: Some(TestIdentity {
                 binary: binary.to_owned(),
                 test: test.to_owned(),
@@ -1129,6 +1133,15 @@ struct MemoryLedger {
     /// in `crates` so old shims preserve them, but dropping counts is safe.
     #[serde(default)]
     compile_samples: BTreeMap<String, u8>,
+    /// Recent successful unwrapped peaks (plus doubled OOM peaks), newest last.
+    #[serde(default)]
+    memory_windows: BTreeMap<String, Vec<u64>>,
+    /// Causal standardized residuals, newest last, independently per kind.
+    #[serde(default)]
+    memory_residuals: BTreeMap<String, Vec<f64>>,
+    /// Derived once per read, never persisted alongside the raw observations.
+    #[serde(skip)]
+    pooled_spreads: BTreeMap<String, f64>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1743,93 +1756,67 @@ impl Pool {
             };
         }
         let ledger = read_ledger(&self.ledger_path());
-        let recorded = ledger
-            .crates
-            .get(&ledger_key(&demand.name, demand.links))
-            .copied();
-        let mut link_source = "link-floor";
-        let link_bytes = link_floor.map(|weight| {
-            // What this machine's links have actually cost beats a constant
-            // chosen before anyone had seen one. Every test binary is its own
-            // crate name, so a cold `cargo test --no-run` never gets to reuse
-            // the measurement of the link it just made -- the per-crate entry
-            // is always missing for the one in front of it -- and this is the
-            // history it can use instead. The heaviest of the window rather
-            // than its average, because the cost of guessing low is an
-            // out-of-memory kill and the cost of guessing high is a wait.
-            //
-            // A link with a known profile consults only that profile's
-            // window, so a release LTO link never speaks for a dev link.
-            let window = match &demand.profile {
-                Some(profile) => ledger
-                    .profile_link_peaks
-                    .get(profile)
-                    .map_or(&[][..], Vec::as_slice),
-                None => ledger.link_peaks.as_slice(),
-            };
-            let measured = (window.len() >= MIN_LINK_SAMPLES)
-                .then(|| window.iter().copied().max())
-                .flatten();
-            if measured.is_some() {
-                link_source = "link-window";
-            }
-            measured.unwrap_or_else(|| weight.saturating_mul(self.bytes_per_permit))
-        });
-        // History replaces the floor rather than merely raising it. The floor
-        // is a guess for links the pool has never seen; once one has been
-        // measured, charging it the guess anyway would hold the tail of every
-        // build -- the link-heavy stretch -- to half the concurrency its real
-        // memory justifies. The ledger never lowers a recorded peak and an
-        // OOM kill escalates past it, so trusting the measurement stays safe
-        // in the direction that matters.
-        //
-        // Only a *link's* own history may retire the link floor, which is why
-        // the two are separate ledger entries. One crate is compiled both
-        // ways in a single build -- `cargo check` emits metadata where `cargo
-        // build` links -- and the metadata-only measurement is the smaller of
-        // the two by far. Keyed by name alone it would retire the floor for
-        // the link beside it, which is over-admission with a plausible number
-        // attached to it.
-        let (estimate, source) = if let Some(key) = &demand.compile_mode {
-            let (value, trusted) = compile_prediction(&ledger, &demand.name, key);
+        let key = ledger_key(&demand.name, demand.links);
+        let (predicted, source) = if let Some(mode) = &demand.compile_mode {
+            demand.memory_features.set(Some(
+                memory::estimate(&ledger, mode, "compile")
+                    .map_or(memory::Features::COLD, |e| e.features),
+            ));
+            memory::compile_prediction(&ledger, &demand.name, mode)
+        } else if demand.learns_cpu {
+            let peak = ledger.crates.get(&key).copied();
             (
-                value,
-                if trusted {
-                    "mode"
-                } else if value.is_some() {
-                    "crate-wide"
-                } else {
-                    "unmeasured"
-                },
-            )
-        } else {
-            (
-                recorded,
-                if recorded.is_none() {
-                    "unmeasured"
-                } else if demand.learns_cpu {
+                peak,
+                if peak.is_some() {
                     "test-history"
-                } else if demand.links {
-                    "link-history"
                 } else {
-                    "crate-wide"
+                    "unmeasured"
                 },
             )
+        } else if demand.links {
+            let estimate = memory::estimate(&ledger, &key, "link");
+            demand.memory_features.set(Some(
+                estimate.map_or(memory::Features::COLD, |e| e.features),
+            ));
+            if let Some(estimate) = estimate {
+                (Some(estimate.charge), "window")
+            } else {
+                let window = match &demand.profile {
+                    Some(profile) => ledger
+                        .profile_link_peaks
+                        .get(profile)
+                        .map_or(&[][..], Vec::as_slice),
+                    None => ledger.link_peaks.as_slice(),
+                };
+                match window.iter().copied().max() {
+                    Some(peak) => (Some(peak), "link-window"),
+                    None => (
+                        Some(LINK_WEIGHT.saturating_mul(self.bytes_per_permit)),
+                        "link-floor",
+                    ),
+                }
+            }
+        } else {
+            let estimate = memory::estimate(&ledger, &key, "compile");
+            demand.memory_features.set(Some(
+                estimate.map_or(memory::Features::COLD, |e| e.features),
+            ));
+            if let Some(estimate) = estimate {
+                (Some(estimate.charge), "window")
+            } else {
+                let peak = ledger.crates.get(&key).copied();
+                (peak, if peak.is_some() { "legacy" } else { "default" })
+            }
         };
-        let (predicted, source) = match estimate {
-            Some(value) => (Some(value), source),
-            None if link_bytes.is_some() => (link_bytes, link_source),
-            None => (None, source),
-        };
-        // Preserve the old scalar charge exactly for old readers. Admission
-        // uses the independent resources below, without this capacity clamp.
+        // Project the current prediction into the legacy scalar weight.
+        // Admission uses independent resources without this capacity clamp.
         // Old readers retain today's oversize under-charge across different
         // capacities; new readers use exact `cpu` and `memory_bytes` fields.
         let weight = predicted
             .map_or(1, |bytes| bytes.div_ceil(self.bytes_per_permit))
             .max(threads)
             .clamp(1, self.capacity);
-        let memory_bytes = if source == "unmeasured" || source == "link-floor" {
+        let memory_bytes = if matches!(source, "unmeasured" | "default" | "link-floor") {
             predicted
                 .unwrap_or(0)
                 .max(weight.saturating_mul(self.bytes_per_permit))
@@ -2103,20 +2090,34 @@ impl Pool {
             }
             return;
         }
-        let Some(peak) = ledger_peak(
+        let oom = oom_killed(status);
+        let peak = ledger_peak(
             measured,
-            oom_killed(status),
+            oom,
             demand.links,
             status.success(),
             self.bytes_per_permit,
-        ) else {
-            return;
+        );
+        let eligible = !demand.learns_cpu && status.success() && demand.count_compile_samples;
+        let sample_peak = if !demand.learns_cpu && oom {
+            peak
+        } else {
+            eligible.then_some(measured).filter(|p| *p > 0)
         };
-        if let Err(error) = self.record_link_peak(
+        if peak.is_none() && sample_peak.is_none() {
+            return;
+        }
+        let sample = sample_peak.map(|peak| memory::Sample {
+            peak,
+            features: demand.memory_features.take(),
+            calibrate: eligible && !oom,
+        });
+        if let Err(error) = self.record_link_measurement(
             &ledger_key(&demand.name, demand.links),
             peak,
             demand.links,
             demand.profile.as_deref(),
+            sample,
         ) {
             debug!("compiler memory was not recorded: {error:#}");
         }
@@ -2137,9 +2138,13 @@ impl Pool {
         }
         let succeeded = succeeded && demand.count_compile_samples;
         let peak = ledger_peak(measured, oom, false, succeeded, self.bytes_per_permit);
-        // Ordinary light crates need no ledger lock. A concurrent first heavy
-        // sample may be missed here; that only delays trusting the light mode.
-        if peak.is_none()
+        let sample = if oom {
+            peak
+        } else {
+            succeeded.then_some(measured).filter(|p| *p > 0)
+        };
+        if sample.is_none()
+            && peak.is_none()
             && !read_ledger(&self.ledger_path())
                 .crates
                 .contains_key(&demand.name)
@@ -2150,44 +2155,24 @@ impl Pool {
         let mut lock = fslock::LockFile::open(&self.dir.join(LEDGER_LOCK))?;
         lock.lock()?;
         let mut ledger = read_ledger(&self.ledger_path());
-        let mode_peak = peak.unwrap_or(measured);
-        let bare_known = ledger.crates.get(&demand.name).copied();
-        let mode_known = ledger.crates.get(key).copied();
-        let count = ledger.compile_samples.get(key).copied().unwrap_or(0);
-        if bare_known.is_some_and(|bare| peak.is_none_or(|peak| peak <= bare))
-            && mode_known.is_some_and(|known| known >= mode_peak)
-            && (!succeeded || oom || count >= 3)
-        {
+        if let Some(sample) = sample {
+            let features = demand
+                .memory_features
+                .take()
+                .or_else(|| memory::estimate(&ledger, key, "compile").map(|e| e.features));
+            memory::record(
+                &mut ledger,
+                key,
+                "compile",
+                sample,
+                features,
+                succeeded && !oom,
+            );
+        }
+        let legacy_changed =
+            update_legacy_compile(&mut ledger, demand, measured, peak, succeeded, oom);
+        if sample.is_none() && !legacy_changed {
             return Ok(());
-        }
-        if let Some(peak) = peak {
-            // A mode may survive without its bare entry (e.g. an old writer's
-            // eviction). Recreating the fallback must cover every retained
-            // mode, rather than cap a known mode below its measured maximum.
-            let retained = if bare_known.is_none() {
-                let prefix = format!("{} [compile ", demand.name);
-                ledger
-                    .crates
-                    .iter()
-                    .filter(|(name, _)| name.starts_with(&prefix))
-                    .map(|(_, peak)| *peak)
-                    .max()
-                    .unwrap_or(0)
-            } else {
-                0
-            };
-            let bare = ledger.crates.entry(demand.name.clone()).or_default();
-            *bare = (*bare).max(peak).max(retained);
-        }
-        if !ledger.crates.contains_key(&demand.name) {
-            return Ok(());
-        }
-        // Even a light successful mode must learn when its crate is heavy.
-        let mode = ledger.crates.entry(key.clone()).or_default();
-        *mode = (*mode).max(mode_peak);
-        if succeeded && !oom {
-            let count = ledger.compile_samples.entry(key.clone()).or_default();
-            *count = count.saturating_add(1).min(3);
         }
         ledger.version = LEDGER_VERSION;
         trim_compile_ledger(&mut ledger);
@@ -2284,6 +2269,7 @@ impl Pool {
         self.record_link_peak(name, peak, links, None)
     }
 
+    #[cfg(test)]
     fn record_link_peak(
         &self,
         name: &str,
@@ -2291,45 +2277,55 @@ impl Pool {
         links: bool,
         profile: Option<&str>,
     ) -> Result<()> {
-        std::fs::create_dir_all(&self.dir)
-            .wrap_err_with(|| format!("failed to create {}", self.dir.display()))?;
+        self.record_link_measurement(
+            name,
+            Some(peak),
+            links,
+            profile,
+            links.then_some(memory::Sample {
+                peak,
+                features: None,
+                calibrate: true,
+            }),
+        )
+    }
+
+    fn record_link_measurement(
+        &self,
+        name: &str,
+        peak: Option<u64>,
+        links: bool,
+        profile: Option<&str>,
+        sample: Option<memory::Sample>,
+    ) -> Result<()> {
+        std::fs::create_dir_all(&self.dir)?;
         let mut lock = fslock::LockFile::open(&self.dir.join(LEDGER_LOCK))?;
         lock.lock()?;
         let path = self.ledger_path();
         let mut ledger = read_ledger(&path);
-        ledger.version = LEDGER_VERSION;
-        // The window records every link, including one whose per-crate entry
-        // is already higher: it says what links cost around here lately, which
-        // a measurement no worse than the last one still answers.
-        if links {
-            let window = match profile {
-                Some(profile) => ledger
-                    .profile_link_peaks
-                    .entry(profile.to_string())
-                    .or_default(),
-                None => &mut ledger.link_peaks,
-            };
-            window.push(peak);
-            let surplus = window.len().saturating_sub(MAX_LINK_SAMPLES);
-            window.drain(..surplus);
-            while ledger.profile_link_peaks.len() > MAX_LEDGER_ENTRIES {
-                ledger.profile_link_peaks.pop_first();
-            }
+        if let Some(sample) = sample {
+            let kind = if links { "link" } else { "compile" };
+            let features = sample
+                .features
+                .or_else(|| memory::estimate(&ledger, name, kind).map(|e| e.features));
+            memory::record(
+                &mut ledger,
+                name,
+                kind,
+                sample.peak,
+                features,
+                sample.calibrate,
+            );
         }
-        let known = ledger.crates.get(name).is_some_and(|known| *known >= peak);
-        if known && !links {
-            // Nothing moved: the entry already stands higher and there is no
-            // window entry to add. Rewriting the file identically would cost
-            // every repeat compilation a write under this lock.
+        let legacy_changed =
+            peak.is_some_and(|peak| update_legacy_link(&mut ledger, name, peak, links, profile));
+        if sample.is_none() && !legacy_changed {
             return Ok(());
         }
-        if !known {
-            ledger.crates.insert(name.to_string(), peak);
-        }
+        ledger.version = LEDGER_VERSION;
         trim_compile_ledger(&mut ledger);
         let mut contents = serde_json::to_vec(&ledger)?;
         contents.push(b'\n');
-        // A heuristic every link refreshes: a lost write costs one sample.
         crate::util::write_advisory(&path, &contents)
     }
 }
@@ -2515,7 +2511,101 @@ fn compile_profile(arguments: &[std::ffi::OsString]) -> String {
     )
 }
 
-fn compile_prediction(ledger: &MemoryLedger, name: &str, key: &str) -> (Option<u64>, bool) {
+fn update_legacy_link(
+    ledger: &mut MemoryLedger,
+    name: &str,
+    peak: u64,
+    links: bool,
+    profile: Option<&str>,
+) -> bool {
+    // The window records every link, including one whose per-crate entry
+    // is already higher: it says what links cost around here lately, which
+    // a measurement no worse than the last one still answers.
+    if links {
+        let window = match profile {
+            Some(profile) => ledger
+                .profile_link_peaks
+                .entry(profile.to_string())
+                .or_default(),
+            None => &mut ledger.link_peaks,
+        };
+        window.push(peak);
+        let surplus = window.len().saturating_sub(MAX_LINK_SAMPLES);
+        window.drain(..surplus);
+        while ledger.profile_link_peaks.len() > MAX_LEDGER_ENTRIES {
+            ledger.profile_link_peaks.pop_first();
+        }
+    }
+    let known = ledger.crates.get(name).is_some_and(|known| *known >= peak);
+    if known && !links {
+        // Nothing moved: the entry already stands higher and there is no
+        // window entry to add. Rewriting the file identically would cost
+        // every repeat compilation a write under this lock.
+        return false;
+    }
+    if !known {
+        ledger.crates.insert(name.to_string(), peak);
+    }
+    true
+}
+
+fn update_legacy_compile(
+    ledger: &mut MemoryLedger,
+    demand: &Demand,
+    measured: u64,
+    peak: Option<u64>,
+    succeeded: bool,
+    oom: bool,
+) -> bool {
+    let key = demand.compile_mode.as_ref().expect("compile mode");
+    if peak.is_none() && !ledger.crates.contains_key(&demand.name) {
+        return false;
+    }
+    let mode_peak = peak.unwrap_or(measured);
+    let bare_known = ledger.crates.get(&demand.name).copied();
+    let mode_known = ledger.crates.get(key).copied();
+    let count = ledger.compile_samples.get(key).copied().unwrap_or(0);
+    if bare_known.is_some_and(|bare| peak.is_none_or(|peak| peak <= bare))
+        && mode_known.is_some_and(|known| known >= mode_peak)
+        && (!succeeded || oom || count >= 3)
+    {
+        return false;
+    }
+    if let Some(peak) = peak {
+        // A mode may survive without its bare entry (e.g. an old writer's
+        // eviction). Recreating the fallback must cover every retained
+        // mode, rather than cap a known mode below its measured maximum.
+        let retained = if bare_known.is_none() {
+            let prefix = format!("{} [compile ", demand.name);
+            ledger
+                .crates
+                .iter()
+                .filter(|(name, _)| name.starts_with(&prefix))
+                .map(|(_, peak)| *peak)
+                .max()
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let bare = ledger.crates.entry(demand.name.clone()).or_default();
+        *bare = (*bare).max(peak).max(retained);
+    }
+    if !ledger.crates.contains_key(&demand.name) {
+        return false;
+    }
+    // Even a light successful mode must learn when its crate is heavy.
+    let mode = ledger.crates.entry(key.clone()).or_default();
+    *mode = (*mode).max(mode_peak);
+    if succeeded && !oom {
+        let count = ledger.compile_samples.entry(key.clone()).or_default();
+        *count = count.saturating_add(1).min(3);
+    }
+    true
+}
+
+#[cfg(test)]
+// Independent old-reader prediction for compatibility assertions only.
+fn legacy_compile_prediction(ledger: &MemoryLedger, name: &str, key: &str) -> (Option<u64>, bool) {
     let bare = ledger.crates.get(name).copied();
     if ledger.compile_samples.get(key).copied().unwrap_or(0) >= 3
         && let Some(peak) = ledger.crates.get(key).copied()
@@ -2555,6 +2645,7 @@ pub(crate) struct SchedulerReport {
     memory_capacity: u64,
     bytes_per_permit: u64,
     entries: Vec<SchedulerEntry>,
+    memory_calibration: Vec<MemoryCalibration>,
     activity: Vec<SchedulerActivity>,
     accuracy: accuracy::Summary,
 }
@@ -2564,10 +2655,25 @@ struct SchedulerEntry {
     key: String,
     recorded_peak_bytes: u64,
     successful_samples: u8,
+    n: usize,
+    window_max_bytes: Option<u64>,
+    bound_bytes: Option<u64>,
+    q: Option<f64>,
     charge_bytes: Option<u64>,
     charge_permits: Option<u64>,
     charge_cpu: Option<u64>,
     source: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct MemoryCalibration {
+    kind: &'static str,
+    target_p: f64,
+    sigma_pool: f64,
+    residual_count: usize,
+    /// A cold-key t multiplier (df=4) until calibrated; each key shows its q.
+    q: f64,
+    calibrated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -2606,35 +2712,79 @@ fn scheduler_snapshot(
     enabled: bool,
 ) -> SchedulerReport {
     let ledger = read_ledger(&dir.join(LEDGER_FILE));
-    let entries = ledger
+    let keys: std::collections::BTreeSet<_> = ledger
         .crates
-        .iter()
-        .map(|(key, &peak)| {
+        .keys()
+        .chain(ledger.memory_windows.keys())
+        .collect();
+    let entries = keys
+        .into_iter()
+        .map(|key| {
             let mode = key.split_once(" [compile ");
-            let predictable = mode.is_some() || !key.contains(" [");
-            let (charge, trusted) = if predictable {
-                compile_prediction(&ledger, mode.map_or(key.as_str(), |(name, _)| name), key)
+            let kind = memory::kind(key);
+            let predictable = mode.is_some() || !key.contains(" [") || kind == "link";
+            let estimate = memory::estimate(&ledger, key, kind);
+            let (charge, source) = if kind == "link" {
+                if let Some(e) = estimate {
+                    (Some(e.charge), "window")
+                } else {
+                    // Profile suffixes precede [link]; bare links use the global window.
+                    let profile = key
+                        .strip_suffix(" [link]")
+                        .and_then(|name| name.split_once(" ["))
+                        .map(|(_, profile)| profile.trim_end_matches(']'));
+                    let window = profile.map_or(Some(&ledger.link_peaks), |profile| {
+                        ledger.profile_link_peaks.get(profile)
+                    });
+                    match window.and_then(|window| window.iter().copied().max()) {
+                        Some(peak) => (Some(peak), "link-window"),
+                        None => (
+                            Some(LINK_WEIGHT.saturating_mul(bytes_per_permit)),
+                            "link-floor",
+                        ),
+                    }
+                }
+            } else if predictable {
+                memory::compile_prediction(
+                    &ledger,
+                    mode.map_or(key.as_str(), |(name, _)| name),
+                    key,
+                )
             } else {
-                (None, false)
+                (None, "see admission")
             };
             let charge_bytes = (bytes_per_permit > 0).then_some(charge).flatten();
             SchedulerEntry {
                 key: key.clone(),
-                recorded_peak_bytes: peak,
+                recorded_peak_bytes: ledger.crates.get(key).copied().unwrap_or(0),
                 successful_samples: ledger.compile_samples.get(key).copied().unwrap_or(0),
+                n: estimate.map_or(0, |e| e.n),
+                window_max_bytes: estimate.map(|e| e.window_max),
+                bound_bytes: estimate.map(|e| e.bound),
+                q: estimate.map(|e| e.q),
                 charge_bytes,
                 charge_cpu: predictable.then_some(1),
                 charge_permits: charge_bytes
                     .map(|bytes| bytes.div_ceil(bytes_per_permit).clamp(1, capacity)),
-                source: if !predictable {
-                    "see admission"
-                } else if bytes_per_permit == 0 {
+                source: if bytes_per_permit == 0 && predictable {
                     "CPU-only"
-                } else if trusted {
-                    "mode"
                 } else {
-                    "crate-wide fallback"
+                    source
                 },
+            }
+        })
+        .collect();
+    let memory_calibration = memory::KINDS
+        .into_iter()
+        .map(|kind| {
+            let residual_count = ledger.memory_residuals.get(kind).map_or(0, Vec::len);
+            MemoryCalibration {
+                kind,
+                target_p: memory::TARGET_P,
+                sigma_pool: memory::sigma_pool(&ledger, kind),
+                residual_count,
+                q: memory::quantile(&ledger, kind, 1),
+                calibrated: residual_count >= 50,
             }
         })
         .collect();
@@ -2704,6 +2854,7 @@ fn scheduler_snapshot(
         memory_capacity: capacity.saturating_mul(bytes_per_permit),
         bytes_per_permit,
         entries,
+        memory_calibration,
         activity,
         accuracy: accuracy::Summary::read(dir),
     }
@@ -2732,16 +2883,36 @@ impl SchedulerReport {
                 format!(" ({})", e.source)
             };
             lines.push(format!(
-                "  {}: peak={}, samples={}, charge={}{}",
+                "  {}: peak={}, samples={}, n={}, window max={}, bound={}, charge={}{}",
                 e.key,
                 crate::stats::size(e.recorded_peak_bytes),
                 e.successful_samples,
+                e.n,
+                e.window_max_bytes
+                    .map_or_else(|| "unknown".into(), crate::stats::size),
+                e.bound_bytes
+                    .map_or_else(|| "unknown".into(), crate::stats::size),
                 charge,
                 source
             ));
         }
         if self.entries.is_empty() {
             lines.push("  No recorded memory peaks.".into());
+        }
+        for calibration in &self.memory_calibration {
+            lines.push(format!(
+                "  {}: sigma_pool={:.6}, residuals={}, p={}, q={:.6}{}",
+                calibration.kind,
+                calibration.sigma_pool,
+                calibration.residual_count,
+                calibration.target_p,
+                calibration.q,
+                if calibration.calibrated {
+                    " (empirical)"
+                } else {
+                    " (t fallback at n=1; per-key df=4+n-1)"
+                }
+            ));
         }
         lines.push(
             "  Activity snapshot (may include abandoned records; no lease locks taken):".into(),
@@ -2769,10 +2940,12 @@ impl SchedulerReport {
 }
 
 fn read_ledger(path: &Path) -> MemoryLedger {
-    std::fs::read(path)
+    let mut ledger: MemoryLedger = std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-        .unwrap_or_default()
+        .unwrap_or_default();
+    memory::prepare(&mut ledger);
+    ledger
 }
 
 fn test_history_path(dir: &Path, binary: &str) -> PathBuf {

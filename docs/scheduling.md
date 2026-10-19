@@ -73,29 +73,56 @@ Windows, compilations keep the starting guesses. Set
 Cargo's `-j` or `CARGO_BUILD_JOBS` adds a CPU ceiling for one build; it does
 not impose another memory ceiling.
 
-For non-link compiles of a crate already measured above one memory permit,
-mbx learns separate peaks for each set of emitted outputs, crate types, and
-explicit target. Repeated emit and crate-type flags are combined, sorted, and
-deduplicated; output paths and dep-info do not distinguish modes. With no
-emit flag, rustc emits a link output. The mode also includes test compilation,
-optimization, LTO, codegen units, debug info, incremental compilation
-(including flags added by mbx), and explicit compiler thread settings. Clippy
-compiles learn their own estimates, apart from `cargo check`. A compile with
-more than one `--target` matches no single-target mode.
-After three successful samples of a mode (the stored count is capped at
-three), its estimate is the mode's highest peak plus 50% headroom, capped at
-the crate-wide highest peak. Until then, mbx uses the crate-wide peak. Peaks
-never decrease; failed compiles and compiles run through another wrapper,
-such as a `RUSTC_WRAPPER` cache, do not count as successful samples, and OOM
-kills raise both peaks. An older shim
-that drops sample counts makes modes return to the crate-wide fallback.
+For compiles, mbx keeps separate histories for each set of emitted outputs,
+crate types, explicit targets, test compilation, optimization, LTO, codegen
+units, debug info, incremental compilation and compiler thread settings.
+Repeated emit and crate-type flags are combined, sorted and deduplicated;
+output paths and dep-info do not distinguish modes. With no emit flag, rustc
+emits a link output. Clippy has separate modes. Links retain their existing
+crate and code-generation-profile keys. Native C/C++ compiles use their existing
+per-file keys with the same window estimator.
 
-`mbx stats --scheduler` shows scheduler peaks, successful sample counts, and
-compile charges in cores and readable memory sizes, with their mode or crate-wide
-fallback source. Link and test-run entries show recorded peaks and defer
-charges to admission. Add `--json` for raw byte counts. Without `--scheduler`,
-the stats output omits this section. Its charges use the global scheduler
-settings; a workspace `.mbx.toml` can change them for that workspace's builds.
+Each key keeps the last **16 successful, unwrapped peak-RSS measurements**.
+Starting with the first sample, mbx estimates an upper bound in log space:
+`exp(mean(log peaks) + q * s * sqrt(1 + 1/n))`. The charge is the larger of
+that bound and the window maximum. The spread `s` shrinks the key's sample
+variance toward a pooled spread with four prior degrees of freedom. The
+pooled spread is the median log-space sample standard deviation over keys
+of the same kind with at least four samples; fewer than ten qualifying keys
+use a spread of 0.5. This is recomputed when the ledger is read.
+
+The target probability is **0.95**, selected by causal admission replay.
+For each kind, the latest 256 standardized prediction residuals calibrate
+`q` using the empirical 95th percentile (nearest rank). Before 50 residuals,
+mbx uses a one-sided Student-t multiplier with `4 + n - 1` degrees of freedom.
+Residuals use the prediction features frozen before admission waiting, and
+only successful, unwrapped runs calibrate them. Zero-spread predictions have
+no defined standardized residual and skip calibration for that sample.
+
+A compile mode without samples uses the largest current charge among sibling
+modes of the same crate. With no sampled siblings it uses the legacy crate-wide
+maximum, then the default one-share memory guess. An unmeasured link uses its
+profile's recent link maximum if available (the global link window for links
+without a profile), then the two-share link floor. Test-binary and nextest
+histories keep their existing behavior.
+
+Estimates can fall as old peaks roll out of the window. An OOM kill appends
+its doubled measured peak, even for wrapped work, so the charge rises to at
+least that value. Ordinary failures and wrapped successes do not teach the
+new windows. Each window map is capped at 1024 keys, evicting the smallest
+window maximum first. Legacy all-time peaks, compile sample counts and link
+windows are still written with their original rules for older mbx versions.
+Old ledgers read without migration; older writers can discard the new fields,
+which makes new readers return to the cold-start hierarchy until they relearn.
+
+`mbx stats --scheduler` shows each key's window size, window maximum, bound,
+charge and source, alongside its legacy peak and sample count. It also shows
+pooled spreads, residual counts and quantile multipliers for each kind.
+Before calibration the kind summary shows the cold-key multiplier (n=1);
+JSON includes each measured key's actual multiplier. Test-run charges still
+defer to admission. Add `--json` for raw bytes. Without `--scheduler`, the
+stats output omits this section. Charges use global scheduler settings;
+a workspace `.mbx.toml` can change them for that workspace's builds.
 The read-only activity snapshot shows each lease and waiter with its name, mode
 key, build ID, pressure domain, age, and the charge it was really admitted or
 queued with. Older records show unknown names; abandoned records can remain
