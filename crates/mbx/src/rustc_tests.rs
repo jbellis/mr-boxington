@@ -1912,3 +1912,144 @@ fn relocatable_incremental_state_needs_rustc_1_98() {
         "no version line"
     );
 }
+
+#[test]
+fn incremental_seed_injection_respects_compiler_and_user_policy() {
+    use IncrementalSeedMode::{Disabled, Inject, UserRemap};
+    let cases = [
+        (
+            "1.98.0",
+            true,
+            true,
+            false,
+            false,
+            Inject { bootstrap: true },
+        ),
+        (
+            "1.99.0-beta.1",
+            true,
+            true,
+            false,
+            false,
+            Inject { bootstrap: true },
+        ),
+        (
+            "1.99.0-nightly",
+            true,
+            true,
+            false,
+            false,
+            Inject { bootstrap: false },
+        ),
+        (
+            "1.99.0-dev",
+            true,
+            true,
+            false,
+            false,
+            Inject { bootstrap: false },
+        ),
+        ("1.97.0", true, true, false, false, Disabled),
+        ("1.99.0", false, true, false, false, Disabled),
+        ("1.99.0", true, true, true, false, UserRemap),
+        ("1.99.0", false, true, true, true, UserRemap),
+        ("1.99.0", true, true, false, true, Disabled),
+        ("1.99.0-nightly", true, true, false, true, Disabled),
+        ("1.99.0", true, false, false, false, Disabled),
+        ("1.99.0", true, false, true, false, Disabled),
+    ];
+    for (release, enabled, private, user_remap, bootstrap_set, expected) in cases {
+        let mode = seed_mode_for(
+            &format!("rustc {release} (hash date)"),
+            enabled,
+            private,
+            user_remap,
+            bootstrap_set,
+        );
+        assert_eq!(
+            mode, expected,
+            "{release}, enabled={enabled}, private={private}, remap={user_remap}, bootstrap={bootstrap_set}"
+        );
+        let mut command = Command::new("rustc");
+        command.args(["src/lib.rs", "-Zallow-features=some_feature"]);
+        if user_remap {
+            command.arg("-Zremap-cwd-prefix=/chosen");
+        }
+        let original = command.get_args().map(OsStr::to_owned).collect::<Vec<_>>();
+        mode.apply(&mut command);
+        let args = command.get_args().map(OsStr::to_owned).collect::<Vec<_>>();
+        let env = command.get_envs().collect::<Vec<_>>();
+        match mode {
+            Inject { bootstrap } => {
+                assert_eq!(args[original.len()], "-Zremap-cwd-prefix=.");
+                assert_eq!(args.len(), original.len() + if bootstrap { 2 } else { 1 });
+                if bootstrap {
+                    assert_eq!(args.last().unwrap(), "-Zallow-features=");
+                    assert_eq!(
+                        env,
+                        [(OsStr::new("RUSTC_BOOTSTRAP"), Some(OsStr::new("1")))]
+                    );
+                } else {
+                    assert!(env.is_empty());
+                }
+            }
+            _ => {
+                assert_eq!(args, original);
+                assert!(env.is_empty());
+            }
+        }
+        // Directory selection and command construction consume the same mode.
+        assert_eq!(
+            mode.shares_state(),
+            matches!(mode, Inject { .. } | UserRemap)
+        );
+    }
+}
+
+#[test]
+fn incremental_seed_identity_separates_automatic_remapping() {
+    let unit = CacheDigest::blake3(b"cargo invocation");
+    let injected =
+        incremental_state_identity(&unit, IncrementalSeedMode::Inject { bootstrap: true });
+    assert_ne!(injected, unit);
+    assert_eq!(
+        injected,
+        incremental_state_identity(&unit, IncrementalSeedMode::Inject { bootstrap: false })
+    );
+    assert_eq!(
+        unit,
+        incremental_state_identity(&unit, IncrementalSeedMode::Disabled)
+    );
+    assert_eq!(
+        unit,
+        incremental_state_identity(&unit, IncrementalSeedMode::UserRemap)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn incremental_seed_probe_checks_flags_and_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+    let directory = tempfile::tempdir().unwrap();
+    let compiler = directory.path().join("rustc");
+    let write = |body: &str| {
+        std::fs::write(&compiler, format!("#!/bin/sh\n{body}\n")).unwrap();
+        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    write(
+        "test \"$*\" = '--print=cfg -Zremap-cwd-prefix=. -Zallow-features=' && test \"$RUSTC_BOOTSTRAP\" = 1",
+    );
+    assert!(probe_remap_cwd(&compiler, "1.98.0"));
+    assert!(probe_remap_cwd(&compiler, "1.99.0-beta.1"));
+    write("test \"$*\" = '--print=cfg -Zremap-cwd-prefix=.' && test -z \"${RUSTC_BOOTSTRAP+x}\"");
+    assert!(probe_remap_cwd(&compiler, "1.99.0-nightly"));
+    assert!(probe_remap_cwd(&compiler, "1.99.0-dev"));
+    write("exit 0");
+    assert!(!probe_remap_cwd(&compiler, "1.97.0"));
+    write("exit 1");
+    assert!(!probe_remap_cwd(&compiler, "1.100.0"));
+    assert!(!probe_remap_cwd(
+        &directory.path().join("missing"),
+        "1.100.0"
+    ));
+}

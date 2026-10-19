@@ -569,6 +569,16 @@ nextest admits each test separately; `cargo test` admits each binary.
 
 This may also be set in workspace `.mbx.toml`; the environment variable wins.
 
+### `seed_incremental`
+
+- **Type:** `bool`
+- **Default:** `true`
+- **Set with:** `MBX_SEED_INCREMENTAL`
+
+Seed private incremental state from another checkout on rustc 1.98 or later.
+
+Uses `.` as the working directory in debug info and backtrace frames. On stable and beta, enables compiler bootstrap only for private-state compilations, while still rejecting `#![feature]`. An existing `RUSTC_BOOTSTRAP` disables automatic flag injection. A user-supplied `-Zremap-cwd-prefix` still enables seeding when this setting is off.
+
 ### `share_out_dir`
 
 - **Type:** `bool`

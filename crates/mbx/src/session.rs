@@ -106,6 +106,7 @@ pub(crate) const GC_MIN_FREE_ENV: &str = "MBX_SESSION_GC_MIN_FREE";
 pub(crate) const GC_CACHE_DIR_ENV: &str = "MBX_SESSION_GC_CACHE_DIR";
 pub(crate) const GC_TARGET_ROOT_ENV: &str = "MBX_SESSION_GC_TARGET_ROOT";
 pub(crate) const GC_EXECUTABLE_ENV: &str = "MBX_SESSION_GC_EXECUTABLE";
+pub(crate) const SEED_INCREMENTAL_ENV: &str = "MBX_SEED_INCREMENTAL";
 pub(crate) const LEARNED_INCREMENTAL_ENV: &str = "MBX_LEARNED_INCREMENTAL";
 pub(crate) const LEARNED_INCREMENTAL_MAX_SIZE_ENV: &str = "MBX_LEARNED_INCREMENTAL_MAX_SIZE";
 pub(crate) const INCREMENTAL_ROOT_ENV: &str = "MBX_INCREMENTAL_ROOT";
@@ -2308,6 +2309,11 @@ pub(crate) fn forward_compiler_notifications_requested() -> bool {
 /// state instead of publishing it. Read the same way as verify mode.
 pub(crate) fn learned_incremental_requested() -> bool {
     std::env::var_os(LEARNED_INCREMENTAL_ENV).is_some_and(|value| !value.is_empty() && value != "0")
+}
+
+/// Whether private state may be made portable automatically.
+pub(crate) fn seed_incremental_requested() -> bool {
+    std::env::var_os(SEED_INCREMENTAL_ENV).is_none_or(|value| value != "0" && value != "false")
 }
 
 /// Whether the session opted into private workspace state from the first compilation.

@@ -225,6 +225,7 @@ checked-in `.mbx.toml`, which rejects them; see
 cache_dir = "/var/cache/mbx"
 incremental = false
 eager_incremental = false  # opt-in state from the first compilation
+seed_incremental = true              # reuse private state across checkouts
 learned_incremental_max_size = "8GiB"  # or "none"
 share_out_dir = true
 share_workspace_root = false

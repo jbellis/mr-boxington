@@ -1463,16 +1463,24 @@ fn rustc_relocates_incremental_state() -> bool {
 
 #[test]
 fn learned_state_seeds_another_checkout_when_rustc_remaps_the_working_directory() {
+    check_incremental_seeding(&[
+        ("RUSTC_BOOTSTRAP", "1"),
+        ("RUSTFLAGS", "-Zremap-cwd-prefix=/src"),
+    ]);
+}
+
+#[test]
+fn learned_incremental_state_seeds_another_checkout_by_default() {
+    check_incremental_seeding(&[]);
+}
+
+fn check_incremental_seeding(remapped: &[(&str, &str)]) {
     const MARKER: &str = "seeded-from-first";
     let store = tempfile::tempdir().unwrap();
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
     let unremapped = tempfile::tempdir().unwrap();
     let reports = tempfile::tempdir().unwrap();
-    let remapped = [
-        ("RUSTC_BOOTSTRAP", "1"),
-        ("RUSTFLAGS", "-Zremap-cwd-prefix=/src"),
-    ];
     // A module the edit never touches compiles to its own codegen units, which
     // rustc reuses rather than recompiles when it accepts the state.
     let stable = (0..64)
@@ -1496,14 +1504,14 @@ fn learned_state_seeds_another_checkout_when_rustc_remaps_the_working_directory(
         first.path(),
         store.path(),
         &reports.path().join("first.json"),
-        &remapped,
+        remapped,
     );
     edit(first.path());
     let edited = build_with(
         first.path(),
         store.path(),
         &reports.path().join("first-edit.json"),
-        &remapped,
+        remapped,
     )
     .0;
     assert!(compiled_incrementally(&edited) >= 1, "{edited}");
@@ -1525,14 +1533,14 @@ fn learned_state_seeds_another_checkout_when_rustc_remaps_the_working_directory(
         second.path(),
         store.path(),
         &reports.path().join("second.json"),
-        &remapped,
+        remapped,
     );
     edit(second.path());
     let seeded = build_with(
         second.path(),
         store.path(),
         &reports.path().join("second-edit.json"),
-        &remapped,
+        remapped,
     )
     .0;
     assert!(compiled_incrementally(&seeded) >= 1, "{seeded}");
@@ -1598,20 +1606,19 @@ fn learned_state_seeds_another_checkout_when_rustc_remaps_the_working_directory(
         );
     }
 
-    // Without the flag rustc would ignore another checkout's state, so none
-    // is copied.
+    // Turning automatic seeding off keeps unremapped state separate from donors.
     build_with(
         unremapped.path(),
         store.path(),
         &reports.path().join("unremapped.json"),
-        &[],
+        &[("MBX_SEED_INCREMENTAL", "0")],
     );
     edit(unremapped.path());
     build_with(
         unremapped.path(),
         store.path(),
         &reports.path().join("unremapped-edit.json"),
-        &[],
+        &[("MBX_SEED_INCREMENTAL", "0")],
     );
     let unremapped_state = incremental_checkout(store.path(), unremapped.path());
     assert!(

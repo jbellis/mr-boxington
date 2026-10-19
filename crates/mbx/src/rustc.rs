@@ -71,10 +71,12 @@ impl LearnedPlan {
     /// checkout's; see [`incremental::seed`].
     fn resolved(mut self, compilation: &Compilation<'_>, unit: &CacheDigest) -> Self {
         if self.hot {
+            let mode = incremental_seed_mode(compilation.rustc, compilation.invocation, true);
+            let unit = incremental_state_identity(unit, mode);
             self.directory = incremental_directory(
-                unit,
+                &unit,
                 compilation.invocation.crate_name(),
-                shares_incremental_state(compilation.rustc, compilation.invocation),
+                mode.shares_state(),
             );
         }
         self
@@ -526,7 +528,8 @@ pub(crate) fn compile(
     let compilation_started = SystemTime::now();
     let compiler_timer = Instant::now();
     let mut command = compiler_command(rustc, wrapper_argument);
-    if incremental_flag.is_some() && shares_incremental_state(rustc, &invocation) {
+    let seed_mode = incremental_seed_mode(rustc, &invocation, incremental_flag.is_some());
+    if seed_mode.shares_state() {
         command.args(paths_relative_to(&arguments, &working_dir));
     } else {
         command.args(&arguments);
@@ -538,6 +541,7 @@ pub(crate) fn compile(
         // admission above still sees the command that actually runs.
         command.arg(flag);
     }
+    seed_mode.apply(&mut command);
     if private_outputs {
         // Before the compiler starts, so that a dependent Cargo pipelines
         // behind this unit's metadata already finds the marker in place.
@@ -1439,10 +1443,113 @@ fn learned_plan(
 /// the working directory as the flag presents it, which it first does in 1.98.
 /// Earlier releases compare the real directory and ignore state recorded in
 /// any other checkout, so copying it would only cost time and disk.
-fn shares_incremental_state(rustc: &OsStr, invocation: &RustcInvocation) -> bool {
-    invocation.remaps_working_directory()
-        && compiler_identity(rustc)
-            .is_ok_and(|identity| release_at_least(&identity.rustc_version, (1, 98)))
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IncrementalSeedMode {
+    Disabled,
+    UserRemap,
+    Inject { bootstrap: bool },
+}
+
+impl IncrementalSeedMode {
+    fn shares_state(self) -> bool {
+        self != Self::Disabled
+    }
+
+    fn apply(self, command: &mut Command) {
+        if let Self::Inject { bootstrap } = self {
+            command.arg("-Zremap-cwd-prefix=.");
+            if bootstrap {
+                command.env("RUSTC_BOOTSTRAP", "1");
+                // Last, so a preceding allow-features cannot enable language features.
+                command.arg("-Zallow-features=");
+            }
+        }
+    }
+}
+
+fn seed_mode_for(
+    version: &str,
+    enabled: bool,
+    private: bool,
+    user_remap: bool,
+    bootstrap_set: bool,
+) -> IncrementalSeedMode {
+    if !private || !release_at_least(version, (1, 98)) {
+        return IncrementalSeedMode::Disabled;
+    }
+    if user_remap {
+        return IncrementalSeedMode::UserRemap;
+    }
+    if !enabled || bootstrap_set {
+        return IncrementalSeedMode::Disabled;
+    }
+    let release = version.split_whitespace().nth(1).unwrap_or_default();
+    IncrementalSeedMode::Inject {
+        bootstrap: !release.contains("nightly") && !release.contains("dev"),
+    }
+}
+
+/// Both directory selection and command construction use this decision.
+fn incremental_seed_mode(
+    rustc: &OsStr,
+    invocation: &RustcInvocation,
+    private: bool,
+) -> IncrementalSeedMode {
+    let enabled = session::seed_incremental_requested();
+    let user_remap = invocation.remaps_working_directory();
+    let bootstrap_set = std::env::var_os("RUSTC_BOOTSTRAP").is_some();
+    if !private || (!user_remap && (!enabled || bootstrap_set)) {
+        return IncrementalSeedMode::Disabled;
+    }
+    let Ok(identity) = compiler_identity(rustc) else {
+        return IncrementalSeedMode::Disabled;
+    };
+    let mode = seed_mode_for(
+        &identity.rustc_version,
+        enabled,
+        private,
+        user_remap,
+        bootstrap_set,
+    );
+    if matches!(mode, IncrementalSeedMode::Inject { .. }) && !remap_cwd_supported(rustc) {
+        return IncrementalSeedMode::Disabled;
+    }
+    mode
+}
+
+/// Separate automatically remapped state from state compiled with Cargo's flags.
+fn incremental_state_identity(unit: &CacheDigest, mode: IncrementalSeedMode) -> CacheDigest {
+    if matches!(mode, IncrementalSeedMode::Inject { .. }) {
+        CacheDigest::blake3(format!("{}\0mbx-remap-cwd-prefix-dot-v1", unit.key()).as_bytes())
+    } else {
+        unit.clone()
+    }
+}
+
+// Populated from the executable identity cache without entering the action key.
+static REMAP_CWD_SUPPORTED: OnceLock<(OsString, bool)> = OnceLock::new();
+
+fn remap_cwd_supported(rustc: &OsStr) -> bool {
+    REMAP_CWD_SUPPORTED
+        .get()
+        .is_some_and(|(known, supported)| known == rustc && *supported)
+}
+
+/// Probe the exact flags used for private state. Output is kept in the existing
+/// pinned compiler identity record, separately from its cache-key fields.
+fn probe_remap_cwd(executable: &Path, release: &str) -> bool {
+    if !release_at_least(&format!("rustc {release}"), (1, 98)) {
+        return false;
+    }
+    let mut command = Command::new(executable);
+    command.args(["--print=cfg", "-Zremap-cwd-prefix=."]);
+    if release.contains("nightly") || release.contains("dev") {
+        command.env_remove("RUSTC_BOOTSTRAP");
+    } else {
+        command.env("RUSTC_BOOTSTRAP", "1");
+        command.arg("-Zallow-features=");
+    }
+    command.output().is_ok_and(|output| output.status.success())
 }
 
 /// Whether a [`CompilerIdentity::rustc_version`] names `minimum` or later, by
@@ -3260,7 +3367,11 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
     let Some(AgentResponse::ExecutableIdentity { stdout }) = responses.into_iter().next() else {
         bail!("cache agent did not return the rustc identity");
     };
-    let stdout = if let Some(stdout) = stdout {
+    let stdout = if let Some(stdout) = stdout.filter(|bytes| {
+        String::from_utf8_lossy(bytes)
+            .lines()
+            .any(|line| line.starts_with("mbx-remap-cwd-dot-v1: "))
+    }) {
         stdout
     } else {
         // Described before the compiler runs, so a binary replaced while it
@@ -3284,6 +3395,9 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
             );
         }
         let mut stdout = output.stdout;
+        let release = identity_field(&String::from_utf8_lossy(&stdout), "release")?.to_string();
+        let remap = probe_remap_cwd(&executable, &release);
+        stdout.extend_from_slice(format!("\nmbx-remap-cwd-dot-v1: {remap}\n").as_bytes());
         let host = identity_field(&String::from_utf8_lossy(&stdout), "host")?.to_string();
         if clippy {
             let mut command = Command::new(&executable);
@@ -3328,6 +3442,10 @@ fn query_compiler_identity(rustc: &OsStr) -> Result<CompilerIdentity> {
         stdout
     };
     let verbose = std::str::from_utf8(&stdout).wrap_err("rustc identity is not UTF-8")?;
+    let supported = verbose
+        .lines()
+        .any(|line| line == "mbx-remap-cwd-dot-v1: true");
+    let _ = REMAP_CWD_SUPPORTED.set((rustc.to_os_string(), supported));
     let release = identity_field(verbose, "release")?;
     let host = identity_field(verbose, "host")?;
     let rustc_version = verbose

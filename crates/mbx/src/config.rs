@@ -210,6 +210,15 @@ pub(crate) struct RawConfig {
         default = true
     )]
     _learned_incremental: bool,
+    /// Seed private incremental state from another checkout on rustc 1.98 or later.
+    ///
+    /// Uses `.` as the working directory in debug info and backtrace frames.
+    /// On stable and beta, enables compiler bootstrap only for private-state
+    /// compilations, while still rejecting `#![feature]`. An existing
+    /// `RUSTC_BOOTSTRAP` disables automatic flag injection. A user-supplied
+    /// `-Zremap-cwd-prefix` still enables seeding when this setting is off.
+    #[usage(env = "MBX_SEED_INCREMENTAL", default = true)]
+    seed_incremental: bool,
     /// How much learned incremental state one crate may keep, or `"none"`.
     ///
     /// State past this is discarded before the crate compiles again.
@@ -1045,6 +1054,7 @@ pub(crate) struct CliSettings {
     pub plain_output: bool,
     /// Whether a churning crate may compile with its own incremental state.
     pub learned_incremental: bool,
+    pub seed_incremental: bool,
     /// How much of that state one crate may keep, in bytes; `None` is no limit.
     pub learned_incremental_max_size: Option<u64>,
     /// Whether natively linked programs may be cached.
@@ -1065,6 +1075,7 @@ impl Default for CliSettings {
             pretty_inspect: false,
             plain_output: false,
             learned_incremental: true,
+            seed_incremental: true,
             learned_incremental_max_size: Some(DEFAULT_LEARNED_INCREMENTAL_MAX_SIZE),
             cache_links: true,
             events_max_size: Some(DEFAULT_EVENTS_MAX_SIZE),
@@ -1472,6 +1483,7 @@ impl Config {
                 pretty_inspect: raw.pretty_inspect,
                 plain_output: raw.display == "plain",
                 learned_incremental: raw._learned_incremental,
+                seed_incremental: raw.seed_incremental,
                 learned_incremental_max_size: raw
                     .learned_incremental_max_size
                     .as_deref()
@@ -2679,6 +2691,32 @@ incremental_max_size = "none"
 
     /// On by default: a crate nobody is editing never reaches the threshold, so
     /// the setting only matters to the one the developer is working in.
+    #[test]
+    fn seed_incremental_defaults_on_and_respects_config_and_environment() {
+        assert!(configured_for_cli(None, &[]).unwrap().1.seed_incremental);
+        assert!(
+            !configured_for_cli(Some("seed_incremental = false"), &[])
+                .unwrap()
+                .1
+                .seed_incremental
+        );
+        assert!(
+            !configured_for_cli(None, &[("MBX_SEED_INCREMENTAL", "0")])
+                .unwrap()
+                .1
+                .seed_incremental
+        );
+        assert!(
+            configured_for_cli(
+                Some("seed_incremental = false"),
+                &[("MBX_SEED_INCREMENTAL", "1")]
+            )
+            .unwrap()
+            .1
+            .seed_incremental
+        );
+    }
+
     #[test]
     fn learned_incremental_is_on_until_it_is_turned_off() {
         let (_, settings) = configured_for_cli(None, &[]).unwrap();
