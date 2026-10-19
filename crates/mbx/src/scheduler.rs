@@ -436,9 +436,9 @@ struct Lease {
 
 #[derive(Clone, Serialize, Deserialize)]
 struct Waiting {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pid: Option<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     first_arrival_ms: Option<u64>,
     #[serde(default)]
     name: Option<String>,
@@ -468,9 +468,48 @@ struct Waiting {
 }
 
 struct QueueEntry {
-    record: Waiting,
+    record: Option<Waiting>,
     ticket: u64,
     _guard: Permit,
+}
+
+impl QueueEntry {
+    fn mark_released(&self) {
+        // fslock unlocks before truncating. Empty the record while we still
+        // hold its lock so a graceful release cannot look like a dead holder.
+        // Windows locks a one-byte range with LockFileEx; if truncation fails
+        // there (or on another I/O error), the old classification race remains.
+        if let Ok(file) = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&self._guard.path)
+        {
+            let _ = file.set_len(0);
+        }
+    }
+}
+
+impl Drop for QueueEntry {
+    fn drop(&mut self) {
+        self.mark_released();
+        #[cfg(test)]
+        decisions::after_queue_release(self);
+    }
+}
+
+struct AdmissionState {
+    queued: Option<QueueEntry>,
+    first_arrival_ms: u64,
+    last_gate: Option<&'static str>,
+}
+
+impl AdmissionState {
+    fn new(first_arrival_ms: u64) -> Self {
+        Self {
+            queued: None,
+            first_arrival_ms,
+            last_gate: None,
+        }
+    }
 }
 
 fn fits(used: u64, weight: u64, capacity: u64) -> bool {
@@ -771,18 +810,21 @@ fn admission_decision_traced<'a>(
     {
         return AdmissionDecision::Waiting;
     }
-    let all_older: Vec<_> = waiting
-        .filter(|older| older.ticket < request.ticket)
-        .collect();
-    let mut older: Vec<_> = all_older
-        .iter()
-        .copied()
-        .filter(|older| !priority_exception(older, request))
-        .collect();
-    older.sort_unstable_by_key(|older| older.ticket);
-    if let Some(trace) = trace {
+    let mut older: Vec<_> = if let Some(trace) = trace {
+        let all_older: Vec<_> = waiting
+            .filter(|older| older.ticket < request.ticket)
+            .collect();
         trace.borrow_mut().initialize(&all_older, live, request);
-    }
+        all_older
+            .into_iter()
+            .filter(|older| !priority_exception(older, request))
+            .collect()
+    } else {
+        waiting
+            .filter(|older| older.ticket < request.ticket && !priority_exception(older, request))
+            .collect()
+    };
+    older.sort_unstable_by_key(|older| older.ticket);
     let ordered_blocked = older
         .iter()
         .any(|older| older_exception(live, older, request).is_none());
@@ -809,10 +851,19 @@ fn admission_decision_traced<'a>(
                 build.is_none_or(|id| waiter.build.as_ref().map(|(id, _)| id.as_str()) == Some(id))
                     && domain.is_none_or(|id| waiter.domain == id)
             })
-            .copied()
+            .map(|waiter| waiter.resources())
             .collect();
-        let tickets: Vec<_> = heads.iter().map(|w| w.ticket).collect();
-        let heads: Vec<_> = heads.iter().map(|w| w.resources()).collect();
+        let tickets = trace.map(|_| {
+            older
+                .iter()
+                .filter(|waiter| {
+                    build.is_none_or(|id| {
+                        waiter.build.as_ref().map(|(id, _)| id.as_str()) == Some(id)
+                    }) && domain.is_none_or(|id| waiter.domain == id)
+                })
+                .map(|w| w.ticket)
+                .collect::<Vec<_>>()
+        });
         let scope = if build.is_some() {
             "build"
         } else if domain.is_some() {
@@ -828,7 +879,7 @@ fn admission_decision_traced<'a>(
         // on either one. Independent minima are therefore no larger than
         // the joint minimum; requiring both independent slack bounds is safe.
         pass_quantized(budget.cpu, &cpus, &head_cpus, charge.cpu, 1, |i, slack| {
-            if let Some(trace) = trace {
+            if let (Some(trace), Some(tickets)) = (trace, tickets.as_ref()) {
                 trace
                     .borrow_mut()
                     .slack(tickets[i], scope, budget, "cpu", slack);
@@ -841,7 +892,7 @@ fn admission_decision_traced<'a>(
                 charge.memory_bytes,
                 MEMORY_QUANTUM,
                 |i, slack| {
-                    if let Some(trace) = trace {
+                    if let (Some(trace), Some(tickets)) = (trace, tickets.as_ref()) {
                         trace
                             .borrow_mut()
                             .slack(tickets[i], scope, budget, "memory_bytes", slack);
@@ -906,14 +957,17 @@ fn admission_decision_traced<'a>(
             })
             .map(|waiter| weight_in_units(waiter.weight, waiter.bytes_per_permit, unit))
             .collect();
-        let tickets: Vec<_> = older
-            .iter()
-            .filter(|waiter| {
-                build.is_none_or(|id| waiter.build.as_ref().map(|(id, _)| id.as_str()) == Some(id))
-                    && domain.is_none_or(|id| waiter.domain == id)
-            })
-            .map(|w| w.ticket)
-            .collect();
+        let tickets = trace.map(|_| {
+            older
+                .iter()
+                .filter(|waiter| {
+                    build.is_none_or(|id| {
+                        waiter.build.as_ref().map(|(id, _)| id.as_str()) == Some(id)
+                    }) && domain.is_none_or(|id| waiter.domain == id)
+                })
+                .map(|w| w.ticket)
+                .collect::<Vec<_>>()
+        });
         let scope = if build.is_some() {
             "legacy:build"
         } else if domain.is_some() {
@@ -928,7 +982,7 @@ fn admission_decision_traced<'a>(
             weight_in_units(request.weight, request.bytes_per_permit, unit),
             1,
             |i, slack| {
-                if let Some(trace) = trace {
+                if let (Some(trace), Some(tickets)) = (trace, tickets.as_ref()) {
                     trace.borrow_mut().slack(
                         tickets[i],
                         scope,
@@ -1676,23 +1730,15 @@ impl Pool {
             source,
         } = self.demand_vector(demand);
         let started = Instant::now();
-        let first_arrival_ms = (self.clock)();
+        let mut state = AdmissionState::new(if self.events { (self.clock)() } else { 0 });
         let mut delay = POLL_INITIAL;
-        let mut queued = None;
         let mut stamped: Option<Instant> = None;
         let mut complained = false;
         loop {
             // The gate stops applying at its deadline so a machine that stays
             // short of memory delays this compilation rather than starving it.
             let gate = predicted.filter(|_| started.elapsed() < GATE_DEADLINE);
-            match self.try_admit_named_at(
-                resources,
-                weight,
-                gate,
-                &mut queued,
-                Some(demand),
-                first_arrival_ms,
-            ) {
+            match self.try_admit_state(resources, weight, gate, &mut state, Some(demand)) {
                 Ok(Some(permit)) => {
                     demand.observation.set(Some(accuracy::Admission {
                         weight,
@@ -1771,24 +1817,22 @@ impl Pool {
         let weight = self.reservation_weight(cpus, memory_bytes)?;
 
         let started = Instant::now();
-        let first_arrival_ms = (self.clock)();
+        let mut state = AdmissionState::new(if self.events { (self.clock)() } else { 0 });
         let mut delay = POLL_INITIAL;
-        let mut queued = None;
         let mut stamped: Option<Instant> = None;
         loop {
             // Like compiler admission, a persistently low available-memory
             // reading must not turn an advisory gate into permanent starvation.
             let gate = memory_bytes.filter(|_| started.elapsed() < GATE_DEADLINE);
-            if let Some(permit) = self.try_admit_named_at(
+            if let Some(permit) = self.try_admit_state(
                 Resources {
                     cpu: cpus.unwrap_or(0),
                     memory_bytes: memory_bytes.unwrap_or(0),
                 },
                 weight,
                 gate,
-                &mut queued,
+                &mut state,
                 None,
-                first_arrival_ms,
             )? {
                 return Ok(permit);
             }
@@ -1998,39 +2042,34 @@ impl Pool {
     ) -> Result<Option<Permit>> {
         let first_arrival_ms = queued
             .as_ref()
-            .and_then(|entry| entry.record.first_arrival_ms)
+            .and_then(|entry| entry.record.as_ref()?.first_arrival_ms)
             .unwrap_or_else(|| (self.clock)());
-        self.try_admit_named_at(
-            resources,
-            weight,
-            predicted,
-            queued,
-            demand,
+        let mut state = AdmissionState {
+            queued: queued.take(),
             first_arrival_ms,
-        )
+            last_gate: None,
+        };
+        let result = self.try_admit_state(resources, weight, predicted, &mut state, demand);
+        *queued = state.queued;
+        result
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn try_admit_named_at(
+    fn try_admit_state(
         &self,
         resources: Resources,
         weight: u64,
         predicted: Option<u64>,
-        queued: &mut Option<QueueEntry>,
+        state: &mut AdmissionState,
         demand: Option<&Demand>,
-        first_arrival_ms: u64,
     ) -> Result<Option<Permit>> {
-        let result = self.try_admit_inner(
-            resources,
-            weight,
-            predicted,
-            queued,
-            demand,
-            first_arrival_ms,
-        );
+        let mut events = Vec::new();
+        let result = self.try_admit_inner(resources, weight, predicted, state, demand, &mut events);
+        // The registrar guard belongs to try_admit_inner and has been dropped,
+        // including on errors. No log encoding, append or rotation holds it.
         if result.is_err() {
-            self.dequeue(queued, "error");
+            self.dequeue(&mut state.queued, "error", &mut events);
         }
+        self.write_decisions(events);
         result
     }
 
@@ -2040,9 +2079,9 @@ impl Pool {
         resources: Resources,
         weight: u64,
         predicted: Option<u64>,
-        queued: &mut Option<QueueEntry>,
+        state: &mut AdmissionState,
         demand: Option<&Demand>,
-        first_arrival_ms: u64,
+        events: &mut Vec<decisions::Event>,
     ) -> Result<Option<Permit>> {
         let leases = self.dir.join(LEASES_DIR);
         std::fs::create_dir_all(&leases)
@@ -2052,6 +2091,7 @@ impl Pool {
         registrar.lock()?;
         let live = scan_leases(&leases)?;
         let now = (self.clock)();
+        let first_arrival_ms = state.first_arrival_ms;
         // Broken sensing disables only this advisory gate, never CPU scheduling.
         let pressure_state = (self.pressure && self.bytes_per_permit > 0)
             .then(|| crate::pressure::domain_state(&self.dir, self.pressure_domain));
@@ -2063,19 +2103,23 @@ impl Pool {
             && !live.is_empty()
             && crate::supervision::resumes_pending(&self.dir, now)
         {
-            self.dequeue(queued, "resumes-pending");
+            self.gated(state, "resumes-pending", events, || {
+                self.waiting_record(resources, weight, demand, first_arrival_ms, u64::MAX)
+            });
             return Ok(None);
         }
         if !live.is_empty()
-            && let Some(state) = &pressure
-            && state.valid
-            && (state.pressured
-                || (state.recovered_ms.is_some()
-                    && state.last_admission_ms.is_some_and(|last| {
+            && let Some(pressure) = &pressure
+            && pressure.valid
+            && (pressure.pressured
+                || (pressure.recovered_ms.is_some()
+                    && pressure.last_admission_ms.is_some_and(|last| {
                         now.saturating_sub(last) < crate::pressure::INTERVAL_MS
                     })))
         {
-            self.dequeue(queued, "pressure");
+            self.gated(state, "pressure", events, || {
+                self.waiting_record(resources, weight, demand, first_arrival_ms, u64::MAX)
+            });
             return Ok(None);
         }
         let budget = self.effective_budget();
@@ -2094,16 +2138,68 @@ impl Pool {
             && let Some(available) = (self.available_memory)()
             && available < needed
         {
-            self.dequeue(queued, "available-memory");
+            self.gated(state, "available-memory", events, || {
+                self.waiting_record(resources, weight, demand, first_arrival_ms, u64::MAX)
+            });
             return Ok(None);
         }
         let waiters = self.dir.join(WAITERS_DIR);
         std::fs::create_dir_all(&waiters)?;
-        let waiting = scan_waiters_logged(&waiters, Some(self))?;
-        let ticket = queued.as_ref().map_or(u64::MAX, |entry| entry.ticket);
-        let request = Waiting {
-            first_arrival_ms: Some(first_arrival_ms),
-            pid: Some(std::process::id()),
+        let waiting = scan_waiters_logged(&waiters, Some(self), events)?;
+        let ticket = state.queued.as_ref().map_or(u64::MAX, |entry| entry.ticket);
+        let mut request = self.waiting_record(resources, weight, demand, first_arrival_ms, ticket);
+        request.global_capacity = Some(capacity);
+        request.cpu_cap = Some(budget.cpu);
+        request.mem_cap = Some(budget.memory_bytes);
+        let trace = self
+            .events
+            .then(|| std::cell::RefCell::new(decisions::Trace::default()));
+        let decision =
+            admission_decision_traced(capacity, &live, waiting.iter(), &request, trace.as_ref());
+        if decision == AdmissionDecision::Waiting {
+            if state.queued.is_none() {
+                let ticket = waiting
+                    .iter()
+                    .map(|entry| entry.ticket)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| eyre::eyre!("scheduler queue exhausted"))?;
+                let record = Waiting { ticket, ..request };
+                state.queued = Some(QueueEntry {
+                    ticket,
+                    _guard: self.lock_record(&waiters, &serde_json::to_vec(&record)?)?,
+                    record: self.events.then(|| record.clone()),
+                });
+                self.decision_event("enqueued", &record, None, events);
+                state.last_gate = None;
+            }
+            return Ok(None);
+        }
+        let permit = self.grant(&leases, resources, weight, demand)?;
+        if let Some(trace) = trace {
+            self.admitted_event(&request, &live, decision, trace.into_inner(), events);
+        }
+        state.queued = None;
+        state.last_gate = None;
+        if let Some((path, state)) = pressure_state.as_ref().zip(pressure.as_mut()) {
+            state.last_admission_ms = Some(now);
+            let _ = crate::pressure::save(path, state);
+        }
+        Ok(Some(permit))
+    }
+
+    fn waiting_record(
+        &self,
+        resources: Resources,
+        weight: u64,
+        demand: Option<&Demand>,
+        first_arrival_ms: u64,
+        ticket: u64,
+    ) -> Waiting {
+        Waiting {
+            first_arrival_ms: self.events.then_some(first_arrival_ms),
+            pid: self.events.then(std::process::id),
             name: demand.map(|d| d.name.clone()),
             mode_key: demand.map(|d| {
                 d.compile_mode
@@ -2116,49 +2212,15 @@ impl Pool {
             domain: self.pressure_domain.into(),
             domain_capacity: self.legacy_domain_capacity,
             domain_cpu_cap: Some(self.domain_capacity),
-            global_capacity: Some(capacity),
-            cpu_cap: Some(budget.cpu),
-            mem_cap: Some(budget.memory_bytes),
+            global_capacity: Some(self.capacity),
+            cpu_cap: Some(self.capacity),
+            mem_cap: Some(self.memory_capacity),
             domain_memory_cap: Some(self.domain_memory_capacity),
             cpu: Some(resources.cpu),
             memory_bytes: Some(resources.memory_bytes),
             bytes_per_permit: self.bytes_per_permit,
             build: self.build.clone(),
-        };
-        let trace = self
-            .events
-            .then(|| std::cell::RefCell::new(decisions::Trace::default()));
-        let decision =
-            admission_decision_traced(capacity, &live, waiting.iter(), &request, trace.as_ref());
-        if decision == AdmissionDecision::Waiting {
-            if queued.is_none() {
-                let ticket = waiting
-                    .iter()
-                    .map(|entry| entry.ticket)
-                    .max()
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or_else(|| eyre::eyre!("scheduler queue exhausted"))?;
-                let record = Waiting { ticket, ..request };
-                *queued = Some(QueueEntry {
-                    ticket,
-                    _guard: self.lock_record(&waiters, &serde_json::to_vec(&record)?)?,
-                    record: record.clone(),
-                });
-                self.decision_event("enqueued", &record, None);
-            }
-            return Ok(None);
         }
-        let permit = self.grant(&leases, resources, weight, demand)?;
-        if let Some(trace) = trace {
-            self.admitted_event(&request, &live, decision, trace.into_inner());
-        }
-        *queued = None;
-        if let Some((path, state)) = pressure_state.as_ref().zip(pressure.as_mut()) {
-            state.last_admission_ms = Some(now);
-            let _ = crate::pressure::save(path, state);
-        }
-        Ok(Some(permit))
     }
 
     /// Create and lock this process's lease. Runs under the registrar lock,
@@ -3424,10 +3486,14 @@ fn raise_measurement(current: TestMeasurement, incoming: TestMeasurement) -> Tes
 /// cancelled waiter cannot leave a permanent head-of-line blocker.
 #[cfg(test)]
 fn scan_waiters(directory: &Path) -> Result<Vec<Waiting>> {
-    scan_waiters_logged(directory, None)
+    scan_waiters_logged(directory, None, &mut Vec::new())
 }
 
-fn scan_waiters_logged(directory: &Path, pool: Option<&Pool>) -> Result<Vec<Waiting>> {
+fn scan_waiters_logged(
+    directory: &Path,
+    pool: Option<&Pool>,
+    events: &mut Vec<decisions::Event>,
+) -> Result<Vec<Waiting>> {
     let mut waiting = Vec::new();
     for entry in std::fs::read_dir(directory)? {
         let path = entry?.path();
@@ -3438,12 +3504,12 @@ fn scan_waiters_logged(directory: &Path, pool: Option<&Pool>) -> Result<Vec<Wait
                 && let Ok(Some(record)) = read_waiter(&path)
             {
                 let age = waiter_mtime_ms(&path).map(|time| (pool.clock)().saturating_sub(time));
-                pool.decision_event("abandoned", &record, age);
+                pool.decision_event("abandoned", &record, age, events);
             }
             drop(lock);
             let _ = std::fs::remove_file(&path);
         } else if let Some(mut record) = read_waiter(&path)? {
-            if record.first_arrival_ms.is_none() {
+            if pool.is_some_and(|pool| pool.events) && record.first_arrival_ms.is_none() {
                 record.first_arrival_ms = waiter_mtime_ms(&path);
             }
             waiting.push(record);
@@ -3464,13 +3530,13 @@ fn waiter_mtime_ms(path: &Path) -> Option<u64> {
         .ok()
 }
 
-/// A live waiter's record, or `None` when it vanished after its lock check.
+/// A live waiter's record, or `None` when it is empty or has vanished.
 ///
-/// Release unlocks the file, fslock truncates it, and then the file is removed.
-/// A scan can see the lock held and then an empty file or no file; both mean
-/// that waiter left the queue. A live waiter's record is written before its
-/// lock is taken, so it is never empty. Propagate non-empty unreadable records
-/// through the scheduler's usual fail-open path.
+/// Records are completely written before their holder locks them. QueueEntry
+/// empties its file while still locked; fslock then unlocks and truncates it,
+/// and Permit removes it. A scan can see the lock held and then an empty file
+/// or no file; both mean that waiter left the queue. Propagate non-empty
+/// unreadable records through the scheduler's usual fail-open path.
 fn read_waiter(path: &Path) -> Result<Option<Waiting>> {
     match std::fs::read(path) {
         Ok(bytes) if bytes.is_empty() => Ok(None),

@@ -250,11 +250,15 @@ pub(super) fn append_line(
         .create(true)
         .append(true)
         .open(path)?;
-    // Do not retry a short write: readers ignore the partial line.
-    eyre::ensure!(
-        file.write(line)? == line.len(),
-        "short scheduler event write"
-    );
+    write_line(&mut file, line)
+}
+
+fn write_line(file: &mut impl Write, line: &[u8]) -> Result<()> {
+    if file.write(line)? != line.len() {
+        // Do not retry the record; salvage framing for the next append.
+        let _ = file.write(b"\n");
+        eyre::bail!("short scheduler event write");
+    }
     Ok(())
 }
 
@@ -548,6 +552,55 @@ mod tests {
             use std::os::windows::process::ExitStatusExt;
             ExitStatus::from_raw(code)
         }
+    }
+
+    #[test]
+    fn short_append_salvages_framing_without_retrying_the_record() {
+        #[derive(Default)]
+        struct Writer {
+            bytes: Vec<u8>,
+            calls: usize,
+            short: Option<usize>,
+            fail_newline: bool,
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                if bytes == b"\n" && self.fail_newline {
+                    return Err(std::io::Error::other("newline failed"));
+                }
+                let count = self.short.take().unwrap_or(bytes.len());
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = Writer {
+            short: Some(3),
+            ..Default::default()
+        };
+        assert!(write_line(&mut writer, b"{\"event\":1}\n").is_err());
+        assert_eq!(writer.bytes, b"{\"e\n");
+        assert_eq!(writer.calls, 2);
+        write_line(&mut writer, b"{\"event\":2}\n").unwrap();
+        assert_eq!(writer.calls, 3);
+        let last = writer.bytes.split(|b| *b == b'\n').nth(1).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(last).unwrap()["event"],
+            2
+        );
+        let mut failed = Writer {
+            short: Some(3),
+            fail_newline: true,
+            ..Default::default()
+        };
+        assert!(write_line(&mut failed, b"{\"event\":1}\n").is_err());
+        assert_eq!(failed.calls, 2);
+        let mut normal = Writer::default();
+        write_line(&mut normal, b"{}\n").unwrap();
+        assert_eq!(normal.calls, 1);
     }
 
     #[test]

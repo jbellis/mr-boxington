@@ -6,8 +6,8 @@ const FILE: &str = "decisions.jsonl";
 const PREVIOUS: &str = "decisions.jsonl.1";
 const LOCK: &str = "decisions.lock";
 // Small transitions retain the observation log's sub-1 KiB bound. Admission
-// includes bounded overtake evidence and may use conventional PIPE_BUF (4 KiB),
-// including its newline, while still being issued as one O_APPEND write.
+// includes bounded overtake evidence and has a separate 4 KiB limit, including
+// its newline. This bounds record size, not regular-file write atomicity.
 const TRANSITION_LINE_BYTES: usize = 1024;
 const ADMITTED_LINE_BYTES: usize = 4096;
 const MAX_OVERTAKES: usize = 16;
@@ -166,7 +166,7 @@ struct QueueLimits {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-struct Event {
+pub(super) struct Event {
     v: u8,
     ts_ms: u64,
     mbx_version: String,
@@ -248,15 +248,46 @@ impl Event {
 }
 
 impl Pool {
-    pub(super) fn dequeue(&self, queued: &mut Option<QueueEntry>, reason: &str) {
-        if let Some(entry) = queued.take() {
-            let mut event = Event::new(self, "dequeued", &entry.record);
+    pub(super) fn dequeue(
+        &self,
+        queued: &mut Option<QueueEntry>,
+        reason: &str,
+        events: &mut Vec<Event>,
+    ) {
+        if let Some(entry) = queued.take()
+            && self.events
+            && let Some(record) = &entry.record
+        {
+            let mut event = Event::new(self, "dequeued", record);
             event.reason = Some(reason.into());
-            self.write_decision(event);
+            events.push(event);
         }
     }
 
-    pub(super) fn decision_event(&self, kind: &str, record: &Waiting, age_ms: Option<u64>) {
+    pub(super) fn gated(
+        &self,
+        state: &mut AdmissionState,
+        reason: &'static str,
+        events: &mut Vec<Event>,
+        request: impl FnOnce() -> Waiting,
+    ) {
+        if state.queued.is_some() {
+            self.dequeue(&mut state.queued, reason, events);
+        } else if self.events && state.last_gate != Some(reason) {
+            let mut event = Event::new(self, "gated", &request());
+            event.reason = Some(reason.into());
+            events.push(event);
+        }
+        state.last_gate = Some(reason);
+    }
+
+    pub(super) fn decision_event(
+        &self,
+        kind: &str,
+        record: &Waiting,
+        age_ms: Option<u64>,
+        events: &mut Vec<Event>,
+    ) {
         if !self.events {
             return;
         }
@@ -265,7 +296,7 @@ impl Pool {
             // Age of the reclaimed record, rather than total request age.
             event.waited_ms = age_ms.unwrap_or(0);
         }
-        self.write_decision(event);
+        events.push(event);
     }
 
     pub(super) fn admitted_event(
@@ -274,7 +305,11 @@ impl Pool {
         live: &[Lease],
         decision: AdmissionDecision,
         mut trace: Trace,
+        events: &mut Vec<Event>,
     ) {
+        if !self.events {
+            return;
+        }
         let mut event = Event::new(self, "admitted", request);
         event.rule = Some(
             match decision {
@@ -314,16 +349,42 @@ impl Pool {
         }
         event.overtook_total = Some(trace.overtook_total);
         event.overtook = Some(trace.overtook);
-        self.write_decision(event);
+        events.push(event);
     }
 
-    fn write_decision(&self, event: Event) {
-        if self.events
-            && let Err(error) = append(&self.dir, event)
-        {
-            debug!("scheduler admission decision was not recorded: {error:#}");
+    pub(super) fn write_decisions(&self, events: Vec<Event>) {
+        for event in events {
+            #[cfg(test)]
+            BEFORE_APPEND.with(|probe| {
+                if let Some(probe) = probe.get() {
+                    probe(&self.dir, &event);
+                }
+            });
+            if let Err(error) = append(&self.dir, event) {
+                debug!("scheduler admission decision was not recorded: {error:#}");
+            }
         }
     }
+}
+
+#[cfg(test)]
+type AppendProbe = fn(&Path, &Event);
+#[cfg(test)]
+type ReleaseProbe = fn(&QueueEntry);
+
+#[cfg(test)]
+thread_local! {
+    static BEFORE_APPEND: std::cell::Cell<Option<AppendProbe>> = const { std::cell::Cell::new(None) };
+    static AFTER_RELEASE: std::cell::Cell<Option<ReleaseProbe>> = const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn after_queue_release(entry: &QueueEntry) {
+    AFTER_RELEASE.with(|probe| {
+        if let Some(probe) = probe.get() {
+            probe(entry);
+        }
+    });
 }
 
 fn compact_optional(value: &mut Option<String>) -> Result<()> {
@@ -406,6 +467,7 @@ pub(super) struct Summary {
     admissions_overtaking: u64,
     overtook_entries_omitted: usize,
     dequeued_by_reason: BTreeMap<String, u64>,
+    gated_by_reason: BTreeMap<String, u64>,
     largest_overtakes: Vec<LargestOvertake>,
     abandoned_long_waits: Vec<Abandoned>,
 }
@@ -446,7 +508,10 @@ impl Summary {
             let Ok(file) = File::open(dir.join(filename)) else {
                 continue;
             };
-            for line in BufReader::new(file).split(b'\n').flatten() {
+            for line in BufReader::new(file)
+                .split(b'\n')
+                .map_while(std::result::Result::ok)
+            {
                 let Ok(event) = serde_json::from_slice::<Event>(&line) else {
                     continue;
                 };
@@ -500,6 +565,12 @@ impl Summary {
                             .entry(event.reason.unwrap_or_else(|| "unknown".into()))
                             .or_default() += 1
                     }
+                    "gated" => {
+                        *summary
+                            .gated_by_reason
+                            .entry(event.reason.unwrap_or_else(|| "unknown".into()))
+                            .or_default() += 1;
+                    }
                     "abandoned" if event.waited_ms > 15 * 60 * 1000 => {
                         summary.abandoned_long_waits.push(Abandoned {
                             ts_ms: event.ts_ms,
@@ -537,6 +608,7 @@ impl Summary {
                 "  Dequeued by reason: {}",
                 counts_text(&self.dequeued_by_reason)
             ),
+            format!("  Gated by reason: {}", counts_text(&self.gated_by_reason)),
         ];
         if self.overtook_entries_omitted > 0 {
             lines.push(format!("  {} overtake entries omitted by log limits; reason counts and rankings may be incomplete.", self.overtook_entries_omitted));
@@ -566,6 +638,25 @@ impl Summary {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn admit_event(
+        pool: &Pool,
+        request: &Waiting,
+        live: &[Lease],
+        decision: AdmissionDecision,
+        trace: Trace,
+    ) {
+        let mut pending = Vec::new();
+        pool.admitted_event(request, live, decision, trace, &mut pending);
+        pool.write_decisions(pending);
+    }
+
+    fn scan_logged(pool: &Pool, directory: &Path) -> Result<Vec<Waiting>> {
+        let mut pending = Vec::new();
+        let result = scan_waiters_logged(directory, Some(pool), &mut pending);
+        pool.write_decisions(pending);
+        result
+    }
 
     fn pool(dir: &Path, capacity: u64) -> Pool {
         let mut pool = Pool::new(
@@ -639,9 +730,9 @@ mod tests {
         waiter.domain_cpu_cap = Some(u64::MAX);
         waiter.domain_memory_cap = Some(u64::MAX);
 
-        for kind in ["enqueued", "dequeued", "abandoned", "admitted"] {
+        for kind in ["enqueued", "dequeued", "gated", "abandoned", "admitted"] {
             let mut event = Event::new(&pool, kind, &waiter);
-            if kind == "dequeued" {
+            if kind == "dequeued" || kind == "gated" {
                 event.reason = Some("available-memory".into());
             }
             if kind == "admitted" {
@@ -757,7 +848,7 @@ mod tests {
                 .dimensions["cpu"],
             12
         );
-        pool.admitted_event(&request, &live, decision, trace);
+        admit_event(&pool, &request, &live, decision, trace);
         let logged = events(dir.path()).pop().unwrap();
         assert_eq!(logged.free[0].cpu, 12);
         assert_eq!(logged.free[0].memory_bytes, Some(12 * MEMORY_QUANTUM));
@@ -802,7 +893,7 @@ mod tests {
             waiter.build = Some(Some("other-build".repeat(100)));
             waiter.priority = Some("other-priority".repeat(100));
         }
-        pool.admitted_event(&request, &[], AdmissionDecision::Passing, trace);
+        admit_event(&pool, &request, &[], AdmissionDecision::Passing, trace);
         let bytes = std::fs::read(dir.path().join(FILE)).unwrap();
         assert!(bytes.len() <= ADMITTED_LINE_BYTES);
         let logged: Event = serde_json::from_slice(&bytes).unwrap();
@@ -821,7 +912,7 @@ mod tests {
         assert!(Summary::read(dir.path()).text().contains("omitted"));
         let mut trace = Trace::default();
         trace.initialize(&refs, &[], &request);
-        pool.admitted_event(&request, &[], AdmissionDecision::Passing, trace);
+        admit_event(&pool, &request, &[], AdmissionDecision::Passing, trace);
         let event = events(dir.path()).pop().unwrap();
         assert_eq!(event.overtook_logged, Some(16));
         assert_eq!(event.overtook_total, Some(40));
@@ -847,7 +938,7 @@ mod tests {
                 1,
             );
         }
-        pool.admitted_event(&request, &[], AdmissionDecision::Passing, trace);
+        admit_event(&pool, &request, &[], AdmissionDecision::Passing, trace);
         let event = events(dir.path()).pop().unwrap();
         assert_eq!(event.overtook_total, Some(1));
         assert_eq!(event.overtook_logged, Some(0));
@@ -860,14 +951,14 @@ mod tests {
             let dir = tempfile::tempdir().unwrap();
             let mut pool = pool(dir.path(), 4);
             let held = pool.try_admit(3, None).unwrap().unwrap();
-            let mut queued = None;
+            let mut state = AdmissionState::new(100);
             let resources = Resources {
                 cpu: 2,
                 memory_bytes: 2 * MEMORY_QUANTUM,
             };
             for _ in 0..3 {
                 assert!(
-                    pool.try_admit_named_at(resources, 2, None, &mut queued, None, 100)
+                    pool.try_admit_state(resources, 2, None, &mut state, None)
                         .unwrap()
                         .is_none()
                 );
@@ -917,29 +1008,17 @@ mod tests {
             } else {
                 None
             };
-            let outcome = pool.try_admit_named_at(
-                resources,
-                2,
-                Some(2 * MEMORY_QUANTUM),
-                &mut queued,
-                None,
-                100,
-            );
+            let outcome =
+                pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None);
             assert_eq!(outcome.is_err(), reason == "error");
-            assert!(queued.is_none(), "{reason} must dequeue");
+            assert!(state.queued.is_none(), "{reason} must dequeue");
             let logged = events(dir.path());
             let dequeued = logged.last().unwrap();
             assert_eq!(dequeued.event, "dequeued");
             assert_eq!(dequeued.reason.as_deref(), Some(reason));
             assert_eq!(dequeued.waited_ms, 900);
-            let retry = pool.try_admit_named_at(
-                resources,
-                2,
-                Some(2 * MEMORY_QUANTUM),
-                &mut queued,
-                None,
-                100,
-            );
+            let retry =
+                pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None);
             assert_eq!(retry.is_err(), reason == "error");
             assert_eq!(
                 events(dir.path()).len(),
@@ -957,14 +1036,24 @@ mod tests {
             pool.pressure = false;
             pool.available_memory = || None;
             assert!(
-                pool.try_admit_named_at(resources, 2, None, &mut queued, None, 100)
+                pool.try_admit_state(resources, 2, None, &mut state, None)
                     .unwrap()
                     .is_none()
             );
-            assert_eq!(queued.as_ref().unwrap().record.first_arrival_ms, Some(100));
+            assert_eq!(
+                state
+                    .queued
+                    .as_ref()
+                    .unwrap()
+                    .record
+                    .as_ref()
+                    .unwrap()
+                    .first_arrival_ms,
+                Some(100)
+            );
             drop(held);
             assert!(
-                pool.try_admit_named_at(resources, 2, None, &mut queued, None, 100)
+                pool.try_admit_state(resources, 2, None, &mut state, None)
                     .unwrap()
                     .is_some()
             );
@@ -994,7 +1083,7 @@ mod tests {
             .unwrap();
         let mut lock = fslock::LockFile::open(&path).unwrap();
         lock.lock().unwrap();
-        let live = scan_waiters_logged(&waiters, Some(&pool)).unwrap();
+        let live = scan_logged(&pool, &waiters).unwrap();
         assert_eq!(live[0].first_arrival_ms, Some(1000));
         assert!(events(dir.path()).is_empty());
         drop(lock);
@@ -1007,11 +1096,7 @@ mod tests {
             .unwrap()
             .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(1000))
             .unwrap();
-        assert!(
-            scan_waiters_logged(&waiters, Some(&pool))
-                .unwrap()
-                .is_empty()
-        );
+        assert!(scan_logged(&pool, &waiters).unwrap().is_empty());
         let events = events(dir.path());
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, "abandoned");
@@ -1041,9 +1126,290 @@ mod tests {
                 .is_none()
         );
         let waiter = record(1, 1);
-        pool.decision_event("abandoned", &waiter, Some(100));
+        let mut pending = Vec::new();
+        pool.decision_event("abandoned", &waiter, Some(100), &mut pending);
+        pool.write_decisions(pending);
         assert!(!dir.path().join(FILE).exists());
         drop(held);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn queue_drop_truncates_while_its_guard_is_still_locked() {
+        thread_local! { static CHECKED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) }; }
+        fn check(entry: &QueueEntry) {
+            AFTER_RELEASE.with(|probe| probe.set(None));
+            assert!(entry._guard.lock.as_ref().unwrap().owns_lock());
+            assert_eq!(std::fs::metadata(&entry._guard.path).unwrap().len(), 0);
+            let mut other = fslock::LockFile::open(&entry._guard.path).unwrap();
+            assert!(
+                !other.try_lock().unwrap(),
+                "Drop must truncate before releasing the lock"
+            );
+            assert!(read_waiter(&entry._guard.path).unwrap().is_none());
+            CHECKED.with(|checked| checked.set(true));
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool(dir.path(), 4);
+        let held = pool.try_admit(3, None).unwrap().unwrap();
+        let mut queued = None;
+        assert!(
+            pool.try_admit_queued(2, None, &mut queued)
+                .unwrap()
+                .is_none()
+        );
+        let path = queued.as_ref().unwrap()._guard.path.clone();
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        AFTER_RELEASE.with(|probe| probe.set(Some(check)));
+        drop(queued.take());
+        assert!(CHECKED.with(|checked| checked.get()));
+        assert!(!path.exists());
+        assert!(
+            scan_logged(&pool, &dir.path().join(WAITERS_DIR))
+                .unwrap()
+                .is_empty()
+        );
+        assert!(!events(dir.path()).iter().any(|e| e.event == "abandoned"));
+        drop(held);
+    }
+
+    #[test]
+    fn empty_waiters_locked_or_unlocked_are_releases_not_abandonments() {
+        let dir = tempfile::tempdir().unwrap();
+        let pool = pool(dir.path(), 4);
+        let waiters = dir.path().join(WAITERS_DIR);
+        std::fs::create_dir_all(&waiters).unwrap();
+        for locked in [true, false] {
+            let path = waiters.join("empty");
+            std::fs::write(&path, b"").unwrap();
+            let guard = locked.then(|| {
+                let mut lock = fslock::LockFile::open(&path).unwrap();
+                lock.lock().unwrap();
+                lock
+            });
+            assert!(read_waiter(&path).unwrap().is_none());
+            assert!(scan_logged(&pool, &waiters).unwrap().is_empty());
+            assert_eq!(path.exists(), locked);
+            drop(guard);
+            assert!(scan_logged(&pool, &waiters).unwrap().is_empty());
+        }
+        assert!(events(dir.path()).is_empty());
+        assert!(read_waiter(&waiters.join("vanished")).unwrap().is_none());
+    }
+
+    #[test]
+    fn prequeue_gates_log_only_reason_changes_and_all_appends_release_registrar() {
+        thread_local! { static SEEN: std::cell::Cell<u8> = const { std::cell::Cell::new(0) }; }
+        fn check(dir: &Path, event: &Event) {
+            let mut registrar = fslock::LockFile::open(&dir.join(POOL_LOCK)).unwrap();
+            assert!(
+                registrar.try_lock().unwrap(),
+                "{} append holds registrar",
+                event.event
+            );
+            let bit = match event.event.as_str() {
+                "gated" => 1,
+                "enqueued" => 2,
+                "dequeued" => 4,
+                "admitted" => 8,
+                "abandoned" => 16,
+                _ => panic!("unexpected event"),
+            };
+            SEEN.with(|seen| seen.set(seen.get() | bit));
+        }
+        struct Reset;
+        impl Drop for Reset {
+            fn drop(&mut self) {
+                BEFORE_APPEND.with(|probe| probe.set(None));
+            }
+        }
+        let _reset = Reset;
+        BEFORE_APPEND.with(|probe| probe.set(Some(check)));
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool(dir.path(), 4);
+        let held = pool.try_admit(3, None).unwrap().unwrap();
+        let mut state = AdmissionState::new(100);
+        let resources = Resources {
+            cpu: 1,
+            memory_bytes: 2 * MEMORY_QUANTUM,
+        };
+        pool.available_memory = || Some(0);
+        for _ in 0..3 {
+            assert!(
+                pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        assert_eq!(
+            events(dir.path())
+                .iter()
+                .filter(|e| e.event == "gated")
+                .count(),
+            1
+        );
+        assert!(state.queued.is_none());
+        pool.pressure = true;
+        pool.pressure_probe = || crate::pressure::Reading {
+            total: Some(100),
+            available: Some(0),
+            ..Default::default()
+        };
+        crate::pressure::sample(
+            &crate::pressure::domain_state(&pool.dir, pool.pressure_domain),
+            500,
+            pool.pressure_probe,
+        )
+        .unwrap();
+        let suspended = dir.path().join("suspended");
+        std::fs::create_dir_all(&suspended).unwrap();
+        std::fs::write(suspended.join("fixture"), "1000").unwrap();
+        for _ in 0..2 {
+            assert!(
+                pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        std::fs::remove_file(suspended.join("fixture")).unwrap();
+        for _ in 0..2 {
+            assert!(
+                pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        pool.pressure = false;
+        assert!(
+            pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None)
+                .unwrap()
+                .is_none()
+        );
+        pool.available_memory = || None;
+        assert!(
+            pool.try_admit_state(resources, 2, None, &mut state, None)
+                .unwrap()
+                .is_none()
+        );
+        assert!(state.last_gate.is_none());
+        pool.available_memory = || Some(0);
+        for _ in 0..3 {
+            assert!(
+                pool.try_admit_state(resources, 2, Some(2 * MEMORY_QUANTUM), &mut state, None)
+                    .unwrap()
+                    .is_none()
+            );
+        }
+        pool.available_memory = || None;
+        assert!(
+            pool.try_admit_state(resources, 2, None, &mut state, None)
+                .unwrap()
+                .is_none()
+        );
+        let waiters = dir.path().join(WAITERS_DIR);
+        std::fs::write(
+            waiters.join("dead"),
+            serde_json::to_vec(&record(99, 2)).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            pool.try_admit_state(resources, 2, None, &mut state, None)
+                .unwrap()
+                .is_none()
+        );
+        let bad = waiters.join("malformed");
+        std::fs::write(&bad, b"bad json").unwrap();
+        let mut bad_lock = fslock::LockFile::open(&bad).unwrap();
+        bad_lock.lock().unwrap();
+        assert!(
+            pool.try_admit_state(resources, 2, None, &mut state, None)
+                .is_err()
+        );
+        assert!(state.queued.is_none());
+        drop(bad_lock);
+        std::fs::remove_file(bad).unwrap();
+        drop(held);
+        assert!(
+            pool.try_admit_state(resources, 2, None, &mut state, None)
+                .unwrap()
+                .is_some()
+        );
+        assert!(state.last_gate.is_none());
+        let summary = Summary::read(dir.path());
+        assert_eq!(
+            summary.gated_by_reason,
+            BTreeMap::from([
+                ("available-memory".into(), 2),
+                ("resumes-pending".into(), 1),
+                ("pressure".into(), 1)
+            ])
+        );
+        assert_eq!(summary.dequeued_by_reason["available-memory"], 1);
+        assert_eq!(summary.dequeued_by_reason["error"], 1);
+        assert!(
+            summary
+                .text()
+                .contains("Gated by reason: available-memory=2")
+        );
+        assert_eq!(
+            serde_json::to_value(&summary).unwrap()["gated_by_reason"]["pressure"],
+            1
+        );
+        assert_eq!(SEEN.with(|seen| seen.get()), 31);
+    }
+
+    #[test]
+    fn disabled_events_keeps_no_record_clone_or_event_buffer_allocations() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool(dir.path(), 4);
+        pool.events = false;
+        let held = pool.try_admit(3, None).unwrap().unwrap();
+        let mut state = AdmissionState::new(0);
+        let mut pending = Vec::new();
+        let resources = Resources {
+            cpu: 2,
+            memory_bytes: 2 * MEMORY_QUANTUM,
+        };
+        assert!(
+            pool.try_admit_inner(resources, 2, None, &mut state, None, &mut pending)
+                .unwrap()
+                .is_none()
+        );
+        let entry = state.queued.as_ref().unwrap();
+        assert!(entry.record.is_none());
+        let value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&entry._guard.path).unwrap()).unwrap();
+        assert!(value.get("pid").is_none());
+        assert!(value.get("first_arrival_ms").is_none());
+        pool.available_memory = || Some(0);
+        assert!(
+            pool.try_admit_inner(
+                resources,
+                2,
+                Some(2 * MEMORY_QUANTUM),
+                &mut state,
+                None,
+                &mut pending
+            )
+            .unwrap()
+            .is_none()
+        );
+        assert!(state.queued.is_none());
+        assert_eq!(pending.capacity(), 0);
+        pool.dequeue(&mut state.queued, "error", &mut pending);
+        assert_eq!(pending.capacity(), 0);
+        assert!(!dir.path().join(FILE).exists());
+        drop(held);
+    }
+
+    #[test]
+    fn stats_stops_on_persistent_read_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join(FILE)).unwrap();
+        std::fs::create_dir(dir.path().join(PREVIOUS)).unwrap();
+        let summary = Summary::read(dir.path());
+        assert!(summary.admitted_by_rule.is_empty());
+        assert!(summary.gated_by_reason.is_empty());
     }
 
     #[test]
@@ -1086,7 +1452,7 @@ mod tests {
             } else {
                 AdmissionDecision::Passing
             };
-            pool.admitted_event(&request, &[], decision, trace);
+            admit_event(&pool, &request, &[], decision, trace);
             if rule == "ordered" {
                 std::fs::rename(dir.path().join(FILE), dir.path().join(PREVIOUS)).unwrap();
             }

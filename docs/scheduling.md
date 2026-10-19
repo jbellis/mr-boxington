@@ -161,16 +161,32 @@ Observation failures are debug-logged and do not prevent the workload from runni
 Admission transitions are recorded in `<cache_dir>/scheduler/decisions.jsonl`,
 also gated by `events`, with the same best-effort 8 MiB rotation to `.1`.
 Enqueue, dequeue (including gate or error reason), admission, and reclamation of
-dead waiters record identity, resources, and wait age. Admissions include the
+dead waiters record identity, resources, and wait age. A request gated before it
+joins the queue records a `gated` event when its gate reason changes, rather than
+on every retry. A dequeue records that reason too, so continued gating does not
+repeat it. Request arrival time survives requeues. Admissions include the
 ordered/passing rule, free resources in each scope, and the oldest overtaken
 waiters with exception reasons or the actual CPU/memory slack bounds (legacy
-scalar checks include their permit size). Request arrival time survives requeues.
+scalar checks include their permit size). Events are collected while admission
+is locked, then encoded and appended after the registrar is released. Concurrent
+writers can therefore append events in a different order from their decisions;
+use their timestamps and tickets to follow a request.
+
+A graceful release empties its waiter file before unlocking it, so it is skipped
+rather than reported as abandoned. This truncation is best effort: Windows uses
+a one-byte file lock, and if truncation fails there or an I/O error prevents it,
+a graceful release can still be mislabelled. Abandoned events are incomplete:
+an older mbx, or a process with `events = false`, can reclaim a dead waiter without
+logging it. Logging errors and rotation can also lose events.
+
 Transitions are under 1 KiB; admission records fit within 4 KiB including the
 newline and retain at most 16 overtaken waiters, oldest first. The total and
-logged counts expose truncation. Both use one append write. `mbx stats --scheduler`
-summarizes admissions, overtakes, dequeues, and abandoned waits over 15 minutes;
-its JSON retains all recorded ranked overtakes. Missing entries make overtake
-reason counts and rankings incomplete. Logging never changes admission policy.
+logged counts expose truncation. A normal append uses one write; after a short
+write, the writer makes a best-effort newline write to separate the next record.
+`mbx stats --scheduler` summarizes admissions, overtakes, dequeues, gate reasons,
+and abandoned waits over 15 minutes; its JSON retains all recorded ranked
+overtakes. Missing entries make overtake reason counts and rankings incomplete.
+Logging never changes admission policy.
 
 The estimate-accuracy section of `mbx stats --scheduler` reads both generations,
 ignoring malformed lines, and shows the retained time span as UTC dates and
