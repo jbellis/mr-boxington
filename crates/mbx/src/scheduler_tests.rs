@@ -4203,7 +4203,8 @@ fn calibrated_link_hierarchy_and_wrapped_failures_preserve_legacy_windows() {
     calibrate_kind(&pool, "link");
     let plan = pool.demand_vector(&demand);
     assert_eq!(plan.source, "window");
-    assert_eq!(plan.resources.memory_bytes, 904);
+    // One sample of its own: held to its legacy 300 bytes, not the 904-byte bound.
+    assert_eq!(plan.resources.memory_bytes, 300);
     pool.record_link_measurement(
         "crate [link]",
         Some(1000),
@@ -4241,7 +4242,8 @@ fn calibrated_stats_show_window_math_and_kind_calibration() {
     assert_eq!(entry["n"], 1);
     assert_eq!(entry["window_max_bytes"], 100);
     assert_eq!(entry["bound_bytes"], 452);
-    assert_eq!(entry["charge_bytes"], 452);
+    // One sample of its own: a light crate is held to the one-permit default.
+    assert_eq!(entry["charge_bytes"], 100);
     assert_eq!(entry["source"], "window");
     assert_eq!(
         json["memory_calibration"][0]["sigma_pool"],

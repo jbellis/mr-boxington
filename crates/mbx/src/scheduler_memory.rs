@@ -6,6 +6,9 @@ pub(super) const WINDOW: usize = 16;
 const MAX_RESIDUALS: usize = 256;
 const MIN_RESIDUALS: usize = 50;
 const MIN_POOL_KEYS: usize = 10;
+/// Samples a key needs, like a key qualifying for the pooled spread, before
+/// its own estimate may exceed the previous rule's charge.
+const MIN_KEY_SAMPLES: usize = 4;
 const DEFAULT_SIGMA_POOL: f64 = 0.5;
 const NU0: usize = 4;
 pub(super) const KINDS: [&str; 4] = ["compile", "link", "test-binary", "nextest-test"];
@@ -182,10 +185,12 @@ fn warm_up_charge(
     estimate: &Estimate,
     previous: Option<u64>,
 ) -> u64 {
+    // Per key as well as per kind: a calibrated kind can still have a wide
+    // spread, and a key with one or two samples would then be charged far
+    // above anything it was charged before, without receiving a new sample.
+    let warming = !calibrated(ledger, kind_name) || estimate.n < MIN_KEY_SAMPLES;
     match previous {
-        Some(previous) if !calibrated(ledger, kind_name) => {
-            estimate.charge.min(previous.max(estimate.window_max))
-        }
+        Some(previous) if warming => estimate.charge.min(previous.max(estimate.window_max)),
         _ => estimate.charge,
     }
 }
@@ -574,6 +579,43 @@ mod tests {
         );
         assert_eq!(ledger.memory_residuals["compile"], vec![0.0; 256]);
     }
+    #[test]
+    fn a_calibrated_wide_spread_does_not_uncap_a_key_with_few_samples() {
+        // Ten link keys with four samples each and a wide spread, as in review.
+        let mut ledger = MemoryLedger::default();
+        for i in 0..MIN_POOL_KEYS {
+            ledger
+                .memory_windows
+                .insert(format!("calibrating{i} [link]"), vec![100, 145, 213, 320]);
+        }
+        let key = "heavy [link]";
+        ledger.memory_windows.insert(key.into(), vec![21_000]);
+        ledger.crates.insert(key.into(), 21_000);
+        prepare(&mut ledger);
+        assert!(calibrated(&ledger, "link"));
+        assert!(sigma_pool(&ledger, "link") > 0.45);
+        let raw = estimate(&ledger, key, "link").unwrap().charge;
+        assert!(
+            raw > 90_000,
+            "the wide spread makes the raw bound large: {raw}"
+        );
+        // One sample: still held to the previous rule's charge.
+        assert_eq!(
+            link_prediction(&ledger, key, None, 1000),
+            (Some(21_000), "window")
+        );
+        // With four samples of its own, the key's estimate applies uncapped.
+        ledger
+            .memory_windows
+            .insert(key.into(), vec![21_000, 21_000, 21_000, 21_000]);
+        prepare(&mut ledger);
+        let own = estimate(&ledger, key, "link").unwrap().charge;
+        assert_eq!(
+            link_prediction(&ledger, key, None, 1000),
+            (Some(own), "window")
+        );
+    }
+
     #[test]
     fn warm_up_caps_a_key_without_history_at_the_default_charge() {
         // A light crate never gets a legacy entry, but it does get a window.
