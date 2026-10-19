@@ -72,7 +72,10 @@ feature set, or dependency identity can have its own unit. Units age by the
 newest rustc session directory's modification time, falling back to the unit
 directory's modification time when there are no sessions. Building another
 unit in the same checkout does not refresh old units. Active checkout leases
-and held rustc session locks protect state currently in use.
+and held rustc session locks protect state currently in use, including donor
+leases during seeding. New sessions, lock files, and seeding staging
+directories receive a 60-second grace period; stale staging directories can
+be collected like other units.
 
 ### Storage and collection
 
@@ -80,7 +83,12 @@ and held rustc session locks protect state currently in use.
 defaults to 5% of the cache disk, between 10 GiB and 100 GiB.
 `gc.incremental_max_age` defaults to 30 days. Collection removes expired units
 first, then remaining units least recently used first until the budget is met.
-Live checkouts retain their bookkeeping even when all their units are removed.
+Shared hard-linked files count once across the whole sweep and in
+`mbx cache stats`. Removing one unit frees those bytes only after the last
+unit or bookkeeping reference in the incremental cache is removed. Live
+checkouts retain their bookkeeping even when all their units are removed;
+a deleted checkout loses its directory and bookkeeping after its last unit
+is collected.
 To change either limit:
 
 ```sh
@@ -97,7 +105,9 @@ still apply. See [Single cache budget](/configuration#single-cache-budget).
 The former `learned_incremental_max_size` setting is removed; existing config
 files containing it warn and continue. As an internal backstop, a learned unit
 whose existing state exceeds half the resolved aggregate incremental budget
-takes the shared compilation path for that compile. Its state remains for GC;
+takes the shared compilation path for that compile without seeding from a
+donor. Otherwise, eligible units can seed before compiling with private
+state. Existing oversized state remains for GC;
 with no aggregate budget, this backstop is disabled.
 
 ## Eager incremental reuse

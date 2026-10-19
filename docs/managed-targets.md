@@ -544,7 +544,10 @@ To remove existing managed targets now, use the commands in
 
 ## Collection byte counts
 
-Collection reports **logical bytes**: the sum of removed file lengths. The
+Collection reports **logical bytes**, based on file lengths. Learned
+incremental state counts each distinct file inode once across all checkouts,
+including hard-linked seeded sessions. Removing a unit only counts shared
+bytes as removed when their last reference in the incremental cache is gone. The
 `removed_bytes` and `remaining_bytes` fields in `mbx gc --json` use this measure;
 `byte_accounting: "logical"` identifies it explicitly. The lifetime `savings`
 object in `mbx stats --json` also carries that marker. Lifetime savings totals
