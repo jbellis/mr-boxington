@@ -1218,14 +1218,7 @@ impl Config {
             .warnings
             .iter()
             .filter(|warning| {
-                let removed = warning.kind == usage_config::WarningKind::UnknownSetting
-                    && warning.origin.as_ref().is_some_and(|origin| {
-                        origin.kind == usage_config::SourceKind::FILE
-                            && origin
-                                .identifier
-                                .rsplit_once('#')
-                                .is_some_and(|(_, key)| key == "learned_incremental_max_size")
-                    });
+                let removed = is_retired_setting(warning);
                 if removed {
                     removed_incremental_cap = true;
                 }
@@ -1827,6 +1820,17 @@ impl std::fmt::Display for Invalid {
     }
 }
 
+fn is_retired_setting(warning: &usage_config::Warning) -> bool {
+    warning.kind == usage_config::WarningKind::UnknownSetting
+        && warning.origin.as_ref().is_some_and(|origin| {
+            origin.kind == usage_config::SourceKind::FILE
+                && origin
+                    .identifier
+                    .rsplit_once('#')
+                    .is_some_and(|(_, key)| key == "learned_incremental_max_size")
+        })
+}
+
 /// `error` followed by how to fix each setting it names.
 ///
 /// Resolved a second time rather than threaded through, because only a
@@ -1843,7 +1847,12 @@ fn with_repair_hints(
     let Ok(resolved) = usage_config::resolve(RawConfig::SETTINGS_REGISTRY, layers) else {
         return error;
     };
-    let hints = if resolved.warnings.is_empty() {
+    let warnings = resolved
+        .warnings
+        .iter()
+        .filter(|warning| !is_retired_setting(warning))
+        .collect::<Vec<_>>();
+    let hints = if warnings.is_empty() {
         error
             .downcast_ref::<Invalid>()
             .and_then(|invalid| {
@@ -1854,8 +1863,7 @@ fn with_repair_hints(
             .into_iter()
             .collect::<Vec<_>>()
     } else {
-        resolved
-            .warnings
+        warnings
             .iter()
             .filter_map(|warning| {
                 let origin = warning.origin.as_ref()?;
@@ -3046,6 +3054,30 @@ default = "rust-lld"
             format!("{:#}", with_repair_hints(error, &env, None)),
             "invalid scheduler.cpus: must be a positive count\n\
              MBX_SCHEDULER_CPUS sets it; change or unset that variable"
+        );
+    }
+
+    #[test]
+    fn retired_setting_does_not_hide_an_invalid_values_repair_hint() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "learned_incremental_max_size = \"2GiB\"\n[gc]\ninterval = \"soon\"\n",
+        )
+        .unwrap();
+        let env = EnvLayer::new(Vec::<(String, String)>::new());
+        let file = FileLayer::at(&path, FileScope::Global);
+        let error = Config::from_layers_for_cli(&env, Some(&file)).unwrap_err();
+        let message = format!("{:#}", with_repair_hints(error, &env, Some(&file)));
+        assert!(message.contains("invalid gc.interval"), "{message}");
+        assert!(
+            message.contains("`mbx settings set gc.interval <value>`"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("learned_incremental_max_size"),
+            "{message}"
         );
     }
 
