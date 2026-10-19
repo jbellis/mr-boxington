@@ -72,17 +72,24 @@ impl LearnedPlan {
     /// checkout's; see [`incremental::seed`].
     fn resolved(mut self, compilation: &Compilation<'_>, unit: &CacheDigest) -> Self {
         if self.hot {
-            self.directory = incremental_directory(
-                unit,
-                compilation.invocation.crate_name(),
-                shares_incremental_state(compilation.rustc, compilation.invocation),
-            );
-            if self.directory.as_ref().is_some_and(|directory| {
+            // Check this checkout's existing state before seeding. A rejected
+            // unit takes the shared path without copying a donor's sessions.
+            let directory = incremental_root().and_then(|root| {
+                let key = unit.key();
+                key.get(..16).map(|shard| root.join(shard))
+            });
+            if directory.as_ref().is_some_and(|directory| {
                 incremental_state_exceeds_backstop(directory, session::incremental_budget())
             }) {
                 self.backstop_rejected = true;
                 self.hot = false;
                 self.directory = None;
+            } else {
+                self.directory = incremental_directory(
+                    unit,
+                    compilation.invocation.crate_name(),
+                    shares_incremental_state(compilation.rustc, compilation.invocation),
+                );
             }
         }
         self

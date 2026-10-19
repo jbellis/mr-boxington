@@ -1472,6 +1472,10 @@ fn learned_state_seeds_another_checkout_when_rustc_remaps_the_working_directory(
     let remapped = [
         ("RUSTC_BOOTSTRAP", "1"),
         ("RUSTFLAGS", "-Zremap-cwd-prefix=/src"),
+        // The backstop applies to existing state before seeding. A checkout
+        // with no state can still seed even when its donor exceeds the cap.
+        ("MBX_GC_INCREMENTAL_MAX_SIZE", "0B"),
+        ("MBX_GC_AUTO", "0"),
     ];
     // A module the edit never touches compiles to its own codegen units, which
     // rustc reuses rather than recompiles when it accepts the state.
@@ -1541,6 +1545,28 @@ fn learned_state_seeds_another_checkout_when_rustc_remaps_the_working_directory(
         file_name_is(path, |name| name == MARKER)
     })
     .is_empty();
+    let saved_sessions = find_files(&second_state, |path| {
+        file_name_is(path, |name| name == "query-cache.bin")
+    });
+    assert!(!saved_sessions.is_empty());
+    std::fs::write(second.path().join("base/src/lib.rs"), lib(22)).unwrap();
+    let oversized = build_with(
+        second.path(),
+        store.path(),
+        &reports.path().join("oversized-edit.json"),
+        &remapped,
+    )
+    .0;
+    assert_eq!(
+        compiled_incrementally(&oversized),
+        0,
+        "existing oversized state takes the shared path: {oversized}"
+    );
+    assert!(
+        saved_sessions.iter().all(|session| session.exists()),
+        "the backstop leaves existing sessions for collection"
+    );
+
     // Before 1.98, rustc checks incremental state against the real working
     // directory and ignores another checkout's whatever the flag says, so mbx
     // copies nothing.
