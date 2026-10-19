@@ -45,8 +45,10 @@ pub(super) struct GcArgs {
     ///
     /// Defaults to `gc.max_size`. Managed targets, learned incremental state,
     /// and generated source trees are still collected to their own budgets.
-    /// With `gc.max_total_size` set, they share what is left of that total
-    /// after the action store, whose share this flag caps.
+    /// With `gc.max_total_size` set, incremental state and generated source
+    /// trees default to a cap of 10% of the total, at least 10 GiB but never
+    /// above the total; managed targets use what remains after them and the
+    /// action store, whose share this flag caps.
     #[usage(long, value_name = "SIZE")]
     pub(super) max_size: Option<ByteSize>,
     /// Print a stable machine-readable report.

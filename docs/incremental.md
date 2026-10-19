@@ -69,9 +69,10 @@ mbx settings set gc.incremental_max_age 14d      # or none
 
 When set, `gc.max_total_size` is one combined budget for the action store,
 [managed target directories](/managed-targets), learned incremental state, and
-generated source trees. It replaces the default aggregate incremental cap, and
-the per-crate limit defaults to the combined budget. Explicit incremental
-limits still apply. See [Single cache budget](/configuration#single-cache-budget).
+generated source trees. The aggregate incremental cap defaults to 10% of that
+total, at least 10 GiB but never above the total; the per-crate limit stays at
+8 GiB. Explicit incremental limits still apply. See
+[Single cache budget](/configuration#single-cache-budget).
 
 ## Eager incremental reuse
 

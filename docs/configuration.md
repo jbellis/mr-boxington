@@ -173,17 +173,19 @@ Or run `mbx settings set gc.max_total_size 50GiB`. The environment equivalent is
 
 The budget covers action-store objects and results, managed targets, learned
 incremental state, and [generated source trees](/limits#out-dir-sharing).
-These components share the budget without the usual disk-scaled size caps.
-The per-crate learned incremental limit defaults to this same budget.
+These components share the budget without the usual disk-scaled size caps;
+learned incremental state and generated source trees default to a cap of 10%
+of the total, at least 10 GiB but never above the total.
+The per-crate learned incremental limit still defaults to 8 GiB.
 Explicit component limits still apply; remove those settings if you want mbx
 to manage the allocation. Age limits and the automatic disk-free-space
 safeguard remain enabled.
 
 Collection reserves only the space the action store occupies, up to its limit,
 so an empty store does not force useful targets out. Learned incremental state
-and generated source trees use the remaining allowance; managed targets use what
-remains after them. If protected state leaves less room, mbx collects the
-action store to fit the remaining budget. This order favors shared cached
+and generated source trees use the remaining allowance up to their cap; managed
+targets use what remains after them. If protected state leaves less room, mbx
+collects the action store to fit the remaining budget. This order favors shared cached
 results and incremental state over older target directories; allocation is not
 based on measured rebuild cost.
 

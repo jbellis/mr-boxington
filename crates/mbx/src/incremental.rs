@@ -272,7 +272,7 @@ fn entries(root: &Path) -> Result<Vec<Entry>> {
             bytes: tree_bytes(&directory),
             live: record
                 .as_ref()
-                .map(|record| crate::store::checkout_is_live(&record.workspace_root)),
+                .map(|record| crate::store::checkout_is_live_on(root, &record.workspace_root)),
             updated_secs: record.as_ref().map(|record| record.updated_secs),
             directory,
         });
@@ -494,7 +494,9 @@ mod tests {
     fn abandoned_checkout_state_is_pruned() {
         let cache = tempfile::tempdir().unwrap();
         let parent = tempfile::tempdir().unwrap();
-        let checkout = parent.path().join("checkout");
+        let checkout_parent = parent.path().join("manager");
+        std::fs::create_dir(&checkout_parent).unwrap();
+        let checkout = checkout_parent.join("checkout");
         let key = checkout_key(&checkout);
         std::fs::create_dir(&checkout).unwrap();
         let state = touch(cache.path(), &checkout).unwrap();
@@ -504,13 +506,51 @@ mod tests {
         drop(state);
 
         std::fs::remove_dir(&checkout).unwrap();
-        assert!(!crate::store::checkout_is_live(&checkout));
+        std::fs::remove_dir(&checkout_parent).unwrap();
+        assert!(!crate::store::checkout_is_live_on(cache.path(), &checkout));
         let outcome = collect(cache.path(), None, None, false).unwrap();
 
         assert_eq!(outcome.removed_directories, 1);
         assert!(outcome.removed_bytes > 0);
         assert!(!directory.exists());
         assert!(!lock_dir(cache.path(), &key).exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn checkout_on_another_filesystem_is_kept() {
+        let Some(other_fs) = Path::new("/dev/shm")
+            .exists()
+            .then_some(Path::new("/dev/shm"))
+        else {
+            return;
+        };
+        let cache = tempfile::tempdir().unwrap();
+        if crate::store::same_filesystem_paths(cache.path(), other_fs) {
+            return;
+        }
+        // An unwritable mount is not a test failure, as in
+        // real_cross_device_probe_warns.
+        let Ok(parent) = tempfile::Builder::new()
+            .prefix("mbx-incremental-")
+            .tempdir_in(other_fs)
+        else {
+            return;
+        };
+        let checkout_parent = parent.path().join("manager");
+        std::fs::create_dir(&checkout_parent).unwrap();
+        let checkout = checkout_parent.join("checkout");
+        std::fs::create_dir(&checkout).unwrap();
+        let state = touch(cache.path(), &checkout).unwrap();
+        let directory = state.directory.clone();
+        drop(state);
+
+        std::fs::remove_dir(&checkout).unwrap();
+        std::fs::remove_dir(&checkout_parent).unwrap();
+        let outcome = collect(cache.path(), None, None, false).unwrap();
+
+        assert_eq!(outcome.removed_directories, 0);
+        assert!(directory.exists());
     }
 
     #[test]
