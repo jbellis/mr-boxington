@@ -85,8 +85,9 @@ defaults to 5% of the cache disk, between 10 GiB and 100 GiB.
 first, then remaining units least recently used first until the budget is met.
 Shared hard-linked files count once across the whole sweep and in
 `mbx cache stats`. Removing one unit frees those bytes only after the last
-unit or bookkeeping reference in the incremental cache is removed. Live
-checkouts retain their bookkeeping even when all their units are removed;
+unit or bookkeeping reference in the incremental cache is removed. Counts
+reflect each sweep's snapshot, so references created by a seed that finishes
+during a sweep are counted at the next one. Live checkouts retain their bookkeeping even when all their units are removed;
 a deleted checkout loses its directory and bookkeeping after its last unit
 is collected.
 To change either limit:
