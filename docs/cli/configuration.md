@@ -162,12 +162,12 @@ Collect learned incremental state unused this long, or `"none"`.
 
 - **Type:** `option<string>`
 - **Optional:** true
-- **Default:** 5% of the cache disk, from 10 GiB to 100 GiB; shared budget when `gc.max_total_size` is set
+- **Default:** 5% of the cache disk, from 10 GiB to 100 GiB; with `gc.max_total_size`, 10% of the total, at least 10 GiB but never above the total
 - **Set with:** `MBX_GC_INCREMENTAL_MAX_SIZE`
 
 Shared budget for learned incremental state and generated source trees, or `"none"`.
 
-Over budget, mbx collects the incremental state of inactive checkouts least recently used first and keeps the most recently used checkout's. Generated source trees get whatever budget incremental state leaves.
+Over budget, mbx collects the incremental state of inactive checkouts least recently used first and keeps the most recently used checkout's. Generated source trees get whatever budget incremental state leaves. With `gc.max_total_size`, defaults to 10% of that total, at least 10 GiB but never above the total.
 
 ### `gc.interval`
 
@@ -198,7 +198,7 @@ It also caps how much one build downloads from the remote cache. Unlike the othe
 
 Combined size target for the action store, managed targets, and incremental state, or `"none"`.
 
-A size such as `50GiB` counts logical bytes across the action store, managed targets, learned incremental state, and generated source trees. When set, it replaces the disk-scaled defaults of the component budgets; explicit component limits still apply. Active and protected state may exceed this target.
+A size such as `50GiB` counts logical bytes across the action store, managed targets, learned incremental state, and generated source trees. When set, it replaces disk-scaled defaults and caps incremental state and generated source trees at 10% of the total, at least 10 GiB but never above the total, unless `gc.incremental_max_size` is explicit. Explicit component limits still apply. Active and protected state may exceed this target.
 
 ### `gc.min_free_size`
 
@@ -273,12 +273,12 @@ A workspace crate qualifies on its first source edit; any other crate after thre
 
 - **Type:** `option<string>`
 - **Optional:** true
-- **Default:** 8 GiB, or `gc.max_total_size` when set
+- **Default:** 8 GiB
 - **Set with:** `MBX_LEARNED_INCREMENTAL_MAX_SIZE`
 
 How much learned incremental state one crate may keep, or `"none"`.
 
-State past this is discarded before the crate compiles again.
+State past this is discarded before the crate compiles again. Defaults to 8 GiB even when `gc.max_total_size` is set.
 
 ### `linker.default`
 
