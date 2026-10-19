@@ -179,7 +179,10 @@ exited without unwinding, or panicked (release builds abort on panic). Emptying
 the file is best effort and has not been tested on Windows; if it fails, a normal
 release can still be reported as abandoned. Abandoned events are incomplete: an
 older mbx, or a process with `events = false`, can reclaim a dead waiter without
-logging it. Logging errors and rotation can also lose events. With `events =
+logging it. Logging errors and rotation can also lose events. In an abandoned
+event, `waited_ms` is the age of the last queue stint, which a gate requeue
+resets; `first_arrival_ms` gives the request's total age, and `mbx stats` uses it
+to list abandoned waits over 15 minutes. With `events =
 false`, admission does no decision-log work; the only remaining cost is emptying
 the waiter file on release.
 

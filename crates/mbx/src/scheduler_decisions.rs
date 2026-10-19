@@ -571,13 +571,21 @@ impl Summary {
                             .entry(event.reason.unwrap_or_else(|| "unknown".into()))
                             .or_default() += 1;
                     }
-                    "abandoned" if event.waited_ms > 15 * 60 * 1000 => {
-                        summary.abandoned_long_waits.push(Abandoned {
-                            ts_ms: event.ts_ms,
-                            name: event.name,
-                            memory_bytes: event.memory_bytes,
-                            age_ms: event.waited_ms,
-                        })
+                    "abandoned" => {
+                        // An abandoned event's waited_ms is the age of the last
+                        // queue stint; gate requeues reset it. Rank by total
+                        // request age when arrival survived requeues.
+                        let age_ms = event.first_arrival_ms.map_or(event.waited_ms, |first| {
+                            event.ts_ms.saturating_sub(first).max(event.waited_ms)
+                        });
+                        if age_ms > 15 * 60 * 1000 {
+                            summary.abandoned_long_waits.push(Abandoned {
+                                ts_ms: event.ts_ms,
+                                name: event.name,
+                                memory_bytes: event.memory_bytes,
+                                age_ms,
+                            })
+                        }
                     }
                     _ => {}
                 }
@@ -1105,6 +1113,33 @@ mod tests {
         assert!(!path.exists());
         let summary = Summary::read(dir.path());
         assert_eq!(summary.abandoned_long_waits[0].age_ms, 1_999_000);
+    }
+
+    #[test]
+    fn abandoned_long_waits_count_time_since_first_arrival() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut pool = pool(dir.path(), 4);
+        pool.clock = || 2_000_000;
+        let waiters = dir.path().join(WAITERS_DIR);
+        std::fs::create_dir_all(&waiters).unwrap();
+        // Requeued by a gate: first arrival long ago, current stint 9 s old.
+        let mut record = record(1, 2);
+        record.first_arrival_ms = Some(100_000);
+        let path = waiters.join("dead");
+        std::fs::write(&path, serde_json::to_vec(&record).unwrap()).unwrap();
+        File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(std::time::UNIX_EPOCH + Duration::from_millis(1_991_000))
+            .unwrap();
+        assert!(scan_logged(&pool, &waiters).unwrap().is_empty());
+        let events = events(dir.path());
+        assert_eq!(events[0].event, "abandoned");
+        assert_eq!(events[0].waited_ms, 9_000);
+        let summary = Summary::read(dir.path());
+        assert_eq!(summary.abandoned_long_waits.len(), 1);
+        assert_eq!(summary.abandoned_long_waits[0].age_ms, 1_900_000);
     }
 
     #[test]
