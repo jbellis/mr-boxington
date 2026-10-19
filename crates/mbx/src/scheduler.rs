@@ -1762,7 +1762,8 @@ impl Pool {
                 memory::estimate(&ledger, mode, "compile")
                     .map_or(memory::Features::COLD, |e| e.features),
             ));
-            memory::compile_prediction(&ledger, &demand.name, mode)
+            // One permit is what an unmeasured compile is charged.
+            memory::compile_prediction(&ledger, &demand.name, mode, self.bytes_per_permit)
         } else if demand.learns_cpu {
             let peak = ledger.crates.get(&key).copied();
             (
@@ -2723,7 +2724,7 @@ fn scheduler_snapshot(
                     LINK_WEIGHT.saturating_mul(bytes_per_permit),
                 )
             } else if let Some((name, _)) = mode {
-                memory::compile_prediction(&ledger, name, key)
+                memory::compile_prediction(&ledger, name, key, bytes_per_permit)
             } else if predictable {
                 (ledger.crates.get(key).copied(), "legacy")
             } else {

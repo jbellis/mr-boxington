@@ -207,22 +207,27 @@ fn previous_compile_charge(ledger: &MemoryLedger, name: &str, key: &str) -> Opti
     Some(peak.max(old_charge))
 }
 
-fn compile_window_charge(ledger: &MemoryLedger, name: &str, key: &str) -> Option<u64> {
+/// `default` is what the previous rule charged a compile with no recorded
+/// history: light crates never get a legacy entry, yet they do get windows.
+fn compile_window_charge(
+    ledger: &MemoryLedger,
+    name: &str,
+    key: &str,
+    default: u64,
+) -> Option<u64> {
     let estimate = estimate(ledger, key, "compile")?;
-    Some(warm_up_charge(
-        ledger,
-        "compile",
-        &estimate,
-        previous_compile_charge(ledger, name, key),
-    ))
+    let previous =
+        previous_compile_charge(ledger, name, key).or_else(|| (default > 0).then_some(default));
+    Some(warm_up_charge(ledger, "compile", &estimate, previous))
 }
 
 pub(super) fn compile_prediction(
     ledger: &MemoryLedger,
     name: &str,
     key: &str,
+    default: u64,
 ) -> (Option<u64>, &'static str) {
-    if let Some(charge) = compile_window_charge(ledger, name, key) {
+    if let Some(charge) = compile_window_charge(ledger, name, key, default) {
         return (Some(charge), "window");
     }
     if ledger.crates.contains_key(key) {
@@ -233,7 +238,7 @@ pub(super) fn compile_prediction(
         .memory_windows
         .keys()
         .filter(|key| key.starts_with(&prefix))
-        .filter_map(|key| compile_window_charge(ledger, name, key))
+        .filter_map(|key| compile_window_charge(ledger, name, key, default))
         .max()
     {
         return (Some(charge), "sibling");
@@ -387,13 +392,13 @@ mod tests {
         ledger.memory_windows.insert(key.into(), vec![100]);
         let raw = estimate(&ledger, key, "compile").unwrap().charge;
         assert!(raw > 200);
-        assert_eq!(compile_window_charge(&ledger, "crate", key), Some(200));
+        assert_eq!(compile_window_charge(&ledger, "crate", key, 0), Some(200));
 
         ledger.crates.insert("crate".into(), 200);
         ledger.memory_windows.insert(key.into(), vec![500]);
         let raw = estimate(&ledger, key, "compile").unwrap().charge;
         assert!(raw > 500);
-        assert_eq!(compile_window_charge(&ledger, "crate", key), Some(500));
+        assert_eq!(compile_window_charge(&ledger, "crate", key, 0), Some(500));
     }
 
     #[test]
@@ -405,7 +410,7 @@ mod tests {
         calibrate(&mut ledger, "compile");
         let raw = estimate(&ledger, key, "compile").unwrap().charge;
         assert!(raw > 200);
-        assert_eq!(compile_window_charge(&ledger, "crate", key), Some(raw));
+        assert_eq!(compile_window_charge(&ledger, "crate", key, 0), Some(raw));
     }
 
     #[test]
@@ -443,12 +448,14 @@ mod tests {
     }
 
     #[test]
-    fn compile_window_without_any_previous_rule_value_is_not_capped() {
+    fn compile_window_without_any_previous_rule_value_or_default_is_not_capped() {
+        // With no default (CPU-only scheduling) there is nothing to cap at; with
+        // a default, see warm_up_caps_a_key_without_history_at_the_default_charge.
         let key = "crate [compile mode]";
         let mut ledger = MemoryLedger::default();
         ledger.memory_windows.insert(key.into(), vec![100]);
         let raw = estimate(&ledger, key, "compile").unwrap().charge;
-        assert_eq!(compile_window_charge(&ledger, "crate", key), Some(raw));
+        assert_eq!(compile_window_charge(&ledger, "crate", key, 0), Some(raw));
     }
     #[test]
     fn fixed_vectors_and_shrinkage() {
@@ -568,15 +575,43 @@ mod tests {
         assert_eq!(ledger.memory_residuals["compile"], vec![0.0; 256]);
     }
     #[test]
+    fn warm_up_caps_a_key_without_history_at_the_default_charge() {
+        // A light crate never gets a legacy entry, but it does get a window.
+        // The previous rule charged it the default; warm-up must not exceed that.
+        let mut ledger = MemoryLedger::default();
+        let key = "light [compile mode]";
+        record(&mut ledger, key, "compile", 100, None, true);
+        let raw = estimate(&ledger, key, "compile").unwrap().charge;
+        assert!(
+            raw > 200,
+            "the default spread makes the raw bound wide: {raw}"
+        );
+        assert_eq!(
+            compile_prediction(&ledger, "light", key, 200),
+            (Some(200), "window")
+        );
+        // Never below the window's largest peak.
+        assert_eq!(
+            compile_prediction(&ledger, "light", key, 50),
+            (Some(100), "window")
+        );
+        // No default (CPU-only scheduling): nothing to cap at.
+        assert_eq!(
+            compile_prediction(&ledger, "light", key, 0),
+            (Some(raw), "window")
+        );
+    }
+
+    #[test]
     fn new_maps_are_bounded_and_cold_hierarchy_uses_sibling_charges() {
         let mut ledger = MemoryLedger::default();
         assert_eq!(
-            compile_prediction(&ledger, "crate", "crate [compile new]"),
+            compile_prediction(&ledger, "crate", "crate [compile new]", 0),
             (None, "default")
         );
         ledger.crates.insert("crate".into(), 99999);
         assert_eq!(
-            compile_prediction(&ledger, "crate", "crate [compile new]"),
+            compile_prediction(&ledger, "crate", "crate [compile new]", 0),
             (Some(99999), "legacy")
         );
         record(
@@ -588,7 +623,7 @@ mod tests {
             true,
         );
         assert_eq!(
-            compile_prediction(&ledger, "crate", "crate [compile new]"),
+            compile_prediction(&ledger, "crate", "crate [compile new]", 0),
             (Some(452), "sibling")
         );
         record(
@@ -600,7 +635,7 @@ mod tests {
             true,
         );
         assert_eq!(
-            compile_prediction(&ledger, "crate", "crate [compile new]"),
+            compile_prediction(&ledger, "crate", "crate [compile new]", 0),
             (Some(904), "sibling")
         );
         for i in 0..MAX_LEDGER_ENTRIES {

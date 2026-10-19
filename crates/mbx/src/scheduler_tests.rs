@@ -2011,7 +2011,9 @@ fn light_crates_learn_windows_without_legacy_peaks_and_cpu_only_does_not_learn()
     }
     assert!(read_ledger(&pool.ledger_path()).crates.is_empty());
     assert!(directory.path().join(LEDGER_LOCK).exists());
-    assert_eq!(pool.plan(&demand), (3, Some(248)));
+    // Warm-up caps the light crate at the one-permit default the previous rule
+    // charged; its uncapped bound would be 248 bytes.
+    assert_eq!(pool.plan(&demand), (1, Some(100)));
     let cpu = pool_at(directory.path(), 100, 0);
     cpu.record_compile(&demand, 999, false, true).unwrap();
     assert!(read_ledger(&pool.ledger_path()).crates.is_empty());
