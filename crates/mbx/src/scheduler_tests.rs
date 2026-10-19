@@ -1753,6 +1753,20 @@ fn a_waiter_removed_after_its_lock_check_has_left_the_queue() {
     );
 }
 
+#[test]
+fn a_locked_empty_waiter_has_left_the_queue() {
+    let directory = tempfile::tempdir().unwrap();
+    let waiters = directory.path().join(WAITERS_DIR);
+    std::fs::create_dir_all(&waiters).unwrap();
+    let path = waiters.join("released");
+    std::fs::write(&path, b"").unwrap();
+    let mut lock = fslock::LockFile::open(&path).unwrap();
+    assert!(lock.try_lock().unwrap());
+
+    assert!(scan_waiters(&waiters).unwrap().is_empty());
+    assert!(path.exists(), "a locked waiter must not be reclaimed");
+}
+
 const GIB: u64 = 1 << 30;
 
 #[test]

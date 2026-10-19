@@ -402,9 +402,9 @@ pub(crate) struct Permit {
 
 impl Drop for Permit {
     fn drop(&mut self) {
-        // Between the close and the removal this lease reads as stale to
-        // anyone scanning, which is exactly what it is: its holder has
-        // finished. The worst a concurrent scan does is remove it first.
+        // Unlocking and closing makes the lease stale to anyone scanning,
+        // which is exactly what it is: its holder has finished. The worst a
+        // concurrent scan does is remove it first.
         drop(self.lock.take());
         let _ = std::fs::remove_file(&self.path);
     }
@@ -3266,13 +3266,14 @@ fn scan_waiters(directory: &Path) -> Result<Vec<Waiting>> {
 
 /// A live waiter's record, or `None` when it vanished after its lock check.
 ///
-/// `Permit::drop` takes no registrar lock: it unlocks and then removes the
-/// file. A scan can see the lock still held and then find no file, which
-/// means that waiter has left the queue. Do not guess a queue position for a
-/// record that is present but unreadable; propagate that error through the
-/// scheduler's usual fail-open path.
+/// Release unlocks the file, fslock truncates it, and then the file is removed.
+/// A scan can see the lock held and then an empty file or no file; both mean
+/// that waiter left the queue. A live waiter's record is written before its
+/// lock is taken, so it is never empty. Propagate non-empty unreadable records
+/// through the scheduler's usual fail-open path.
 fn read_waiter(path: &Path) -> Result<Option<Waiting>> {
     match std::fs::read(path) {
+        Ok(bytes) if bytes.is_empty() => Ok(None),
         Ok(bytes) => Ok(Some(serde_json::from_slice(&bytes)?)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error.into()),
