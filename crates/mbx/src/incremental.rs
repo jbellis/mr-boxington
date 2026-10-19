@@ -3,7 +3,7 @@
 use eyre::{Context, Result};
 use mbx_cache_core::CacheDigest;
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -94,11 +94,16 @@ pub(crate) fn touch(root: &Path, workspace_root: &Path) -> Result<Checkout> {
 /// Inspect all traceable learned incremental checkout state.
 pub(crate) fn stats(root: &Path) -> Result<Stats> {
     let mut stats = Stats::default();
-    for entry in entries(root)? {
+    let snapshot = entries(root)?;
+    stats.bytes = snapshot.inodes.bytes;
+    for entry in snapshot.entries {
         stats.directories += 1;
         stats.units += entry.units.len() as u64;
-        stats.bytes = stats.bytes.saturating_add(entry.bytes);
-        match entry.live {
+        match entry
+            .workspace_root
+            .as_ref()
+            .map(|workspace| crate::store::checkout_is_live_on(root, workspace))
+        {
             Some(true) => stats.live_checkouts += 1,
             Some(false) => stats.stale_checkouts += 1,
             None => stats.untracked_directories += 1,
@@ -127,7 +132,8 @@ pub(crate) fn workspaces(root: &Path) -> Result<Vec<PathBuf>> {
     Ok(workspaces)
 }
 
-/// Collect gone checkouts, then expired and least-recently-used units.
+/// Collect expired units, then units in least-recently-used order.
+/// Deleted checkouts remain donors until their last unit is collected.
 pub(crate) fn collect(
     root: &Path,
     max_bytes: Option<u64>,
@@ -135,76 +141,42 @@ pub(crate) fn collect(
     dry_run: bool,
 ) -> Result<PruneOutcome> {
     let now = now_secs();
-    let entries = entries(root)?;
+    let Snapshot {
+        entries,
+        mut inodes,
+    } = entries(root)?;
+    let mut remaining = entries
+        .iter()
+        .map(|entry| entry.units.len())
+        .collect::<Vec<_>>();
     let mut outcome = PruneOutcome {
         remaining_directories: entries.len() as u64,
-        remaining_units: entries.iter().map(|entry| entry.units.len() as u64).sum(),
-        remaining_bytes: entries
+        remaining_units: remaining.iter().sum::<usize>() as u64,
+        remaining_bytes: inodes.bytes,
+        untracked_directories: entries
             .iter()
-            .map(|entry| entry.bytes)
-            .fold(0, u64::saturating_add),
-        untracked_directories: entries.iter().filter(|entry| entry.live.is_none()).count() as u64,
+            .filter(|entry| entry.workspace_root.is_none())
+            .count() as u64,
         ..PruneOutcome::default()
     };
-    let mut removed = HashSet::new();
     let mut active = HashSet::new();
-    // Gone checkouts include bookkeeping, private artifacts, and churn records.
-    for (index, entry) in entries
-        .iter()
-        .enumerate()
-        .filter(|(_, entry)| entry.live == Some(false))
-    {
-        let guard = match deletion_guard(root, &entry.key, !dry_run) {
-            Ok(guard) => guard,
-            Err(error) => {
-                log::debug!("incremental checkout disappeared or could not be reserved: {error}");
-                continue;
-            }
-        };
-        if guard.active {
-            active.insert(index);
-            outcome.skipped_active_units += entry.units.len() as u64;
-            continue;
-        }
-        let locks = entry
-            .units
-            .iter()
-            .map(|unit| unit_locks(&unit.directory, dry_run))
-            .collect::<Result<Vec<_>>>()?;
-        if locks.iter().any(Option::is_none) {
-            continue;
-        }
-        if remove_tree(&entry.directory, dry_run) {
-            removed.insert(index);
-            outcome.removed_directories += 1;
-            outcome.removed_units += entry.units.len() as u64;
-            outcome.removed_bytes = outcome.removed_bytes.saturating_add(entry.bytes);
-            outcome.remaining_bytes = outcome.remaining_bytes.saturating_sub(entry.bytes);
-            if !dry_run {
-                guard.cleanup();
-            }
-        }
-    }
+    let mut removed = HashSet::new();
+    let mut kept_records = HashSet::new();
+    let expired =
+        |unit: &Unit| max_age.is_some_and(|age| now.saturating_sub(unit.last_used) > age.as_secs());
     let mut units = entries
         .iter()
         .enumerate()
-        .filter(|(index, entry)| {
-            entry.live.is_some() && !removed.contains(index) && !active.contains(index)
-        })
+        .filter(|(_, entry)| entry.workspace_root.is_some())
         .flat_map(|(index, entry)| entry.units.iter().map(move |unit| (index, unit)))
         .collect::<Vec<_>>();
-    units.sort_by_key(|(index, unit)| {
-        let required = entries[*index].live == Some(false)
-            || max_age.is_some_and(|age| now.saturating_sub(unit.last_used) > age.as_secs());
-        (!required, unit.last_used, &unit.directory)
-    });
+    units.sort_by_key(|(_, unit)| (!expired(unit), unit.last_used, &unit.directory));
     for (index, unit) in units {
-        let entry = &entries[index];
-        let required = entry.live == Some(false)
-            || max_age.is_some_and(|age| now.saturating_sub(unit.last_used) > age.as_secs());
-        if !required && max_bytes.is_none_or(|budget| outcome.remaining_bytes <= budget) {
+        if !expired(unit) && max_bytes.is_none_or(|budget| inodes.bytes <= budget) {
             break;
         }
+        let entry = &entries[index];
+        // seed() holds the donor's checkout lease while linking its sessions.
         let guard = match deletion_guard(root, &entry.key, !dry_run) {
             Ok(guard) => guard,
             Err(error) => {
@@ -223,34 +195,77 @@ pub(crate) fn collect(
             continue;
         };
         if remove_tree(&unit.directory, dry_run) {
-            if !dry_run {
-                match std::fs::remove_file(&unit.churn_record) {
-                    Ok(()) => {}
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            inodes.release(&unit.files);
+            let record_removed = unit.churn_record.as_ref().is_none_or(|record| {
+                if dry_run {
+                    return true;
+                }
+                match std::fs::remove_file(record) {
+                    Ok(()) => true,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => true,
                     Err(error) => {
                         log::warn!(
                             "could not remove incremental churn record {}: {error}",
-                            unit.churn_record.display()
+                            record.display()
                         );
-                        // Count the unit tree as removed even if its record
-                        // could not be removed.
-                        let record_bytes = std::fs::metadata(&unit.churn_record)
-                            .ok()
-                            .filter(|metadata| metadata.is_file())
-                            .map_or(0, |metadata| metadata.len());
-                        outcome.removed_units += 1;
-                        let bytes = unit.bytes.saturating_sub(record_bytes);
-                        outcome.removed_bytes = outcome.removed_bytes.saturating_add(bytes);
-                        outcome.remaining_bytes = outcome.remaining_bytes.saturating_sub(bytes);
-                        continue;
+                        false
                     }
                 }
+            });
+            if record_removed {
+                inodes.release(&unit.churn_files);
+            } else {
+                kept_records.insert(index);
             }
+            remaining[index] -= 1;
+            removed.insert(unit.directory.clone());
             outcome.removed_units += 1;
-            outcome.removed_bytes = outcome.removed_bytes.saturating_add(unit.bytes);
-            outcome.remaining_bytes = outcome.remaining_bytes.saturating_sub(unit.bytes);
         }
     }
+    // Only empty, deleted checkouts lose their bookkeeping. An abandoned
+    // checkout with usable units is still a donor, regardless of its path.
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(workspace) = &entry.workspace_root else {
+            continue;
+        };
+        if remaining[index] != 0
+            || kept_records.contains(&index)
+            || crate::store::checkout_is_live_on(root, workspace)
+        {
+            continue;
+        }
+        let guard = match deletion_guard(root, &entry.key, !dry_run) {
+            Ok(guard) => guard,
+            Err(error) => {
+                log::debug!("incremental checkout could not be reserved: {error}");
+                continue;
+            }
+        };
+        if guard.active {
+            active.insert(index);
+            continue;
+        }
+        // A compiler may have added a unit since enumeration. The registrar
+        // now prevents a new lease; do not remove newly discovered state.
+        if nested_entries(&entry.directory.join("blake3"))
+            .iter()
+            .any(|unit| {
+                unit.file_type().is_ok_and(|kind| kind.is_dir())
+                    && (!dry_run || !removed.contains(&unit.path()))
+            })
+        {
+            continue;
+        }
+        if remove_tree(&entry.directory, dry_run) {
+            inodes.release(&entry.files);
+            outcome.removed_directories += 1;
+            if !dry_run {
+                guard.cleanup();
+            }
+        }
+    }
+    outcome.removed_bytes = outcome.remaining_bytes.saturating_sub(inodes.bytes);
+    outcome.remaining_bytes = inodes.bytes;
     outcome.skipped_active_directories = active.len() as u64;
     outcome.remaining_directories -= outcome.removed_directories;
     outcome.remaining_units -= outcome.removed_units;
@@ -287,9 +302,10 @@ fn remove_tree(directory: &Path, dry_run: bool) -> bool {
 
 struct Unit {
     directory: PathBuf,
-    bytes: u64,
+    files: Vec<FileKey>,
     last_used: u64,
-    churn_record: PathBuf,
+    churn_record: Option<PathBuf>,
+    churn_files: Vec<FileKey>,
 }
 
 fn nested_entries(directory: &Path) -> Vec<std::fs::DirEntry> {
@@ -319,19 +335,19 @@ fn warn_walk_error(path: &Path, error: &std::io::Error) {
     }
 }
 
-fn units(directory: &Path, measure_bytes: bool) -> Vec<Unit> {
+fn units(directory: &Path, inodes: &mut Inodes) -> Vec<Unit> {
     nested_entries(&directory.join("blake3"))
         .into_iter()
         .filter_map(|entry| {
             if !entry.file_type().ok()?.is_dir() {
                 return None;
             }
-            measure_unit(entry.path(), measure_bytes)
+            measure_unit(entry.path(), inodes)
         })
         .collect()
 }
 
-fn measure_unit(directory: PathBuf, measure_bytes: bool) -> Option<Unit> {
+fn measure_unit(directory: PathBuf, inodes: &mut Inodes) -> Option<Unit> {
     let metadata = std::fs::metadata(&directory).ok()?;
     if !metadata.is_dir() {
         return None;
@@ -356,22 +372,19 @@ fn measure_unit(directory: PathBuf, measure_bytes: bool) -> Option<Unit> {
         .or_else(|| metadata.modified().ok())
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map_or(0, |age| age.as_secs());
-    let churn_record = directory.with_extension("json");
-    let bytes = if measure_bytes {
-        tree_bytes(&directory).saturating_add(
-            std::fs::metadata(&churn_record)
-                .ok()
-                .filter(|metadata| metadata.is_file())
-                .map_or(0, |metadata| metadata.len()),
-        )
-    } else {
-        0
-    };
+    // A staging name has a dot before seeding; with_extension would otherwise
+    // point at the destination unit's churn record.
+    let churn_record = (!is_seeding(&directory)).then(|| directory.with_extension("json"));
+    let files = inodes.measure(&directory, &HashSet::new());
+    let churn_files = churn_record
+        .as_ref()
+        .map_or_else(Vec::new, |record| inodes.measure(record, &HashSet::new()));
     Some(Unit {
-        bytes,
+        files,
         directory,
         last_used,
         churn_record,
+        churn_files,
     })
 }
 
@@ -379,6 +392,21 @@ fn measure_unit(directory: PathBuf, measure_bytes: bool) -> Option<Unit> {
 /// the unit is in use. Never wait for a compiler while collecting.
 fn unit_locks(directory: &Path, dry_run: bool) -> Result<Option<Vec<fslock::LockFile>>> {
     let now = now_secs();
+    // seed() builds <unit>.seeding-<pid> before its atomic rename. Protect a
+    // newly started copy even before it has created its first session.
+    if is_seeding(directory)
+        && std::fs::metadata(directory)
+            .and_then(|metadata| metadata.modified())
+            .is_ok_and(|mtime| {
+                now.saturating_sub(
+                    mtime
+                        .duration_since(UNIX_EPOCH)
+                        .map_or(now, |time| time.as_secs()),
+                ) <= SESSION_START_GRACE_SECS
+            })
+    {
+        return Ok(None);
+    }
     let mut paths = Vec::new();
     let mut pending = vec![directory.to_path_buf()];
     while let Some(directory) = pending.pop() {
@@ -504,17 +532,25 @@ struct Entry {
     key: String,
     directory: PathBuf,
     units: Vec<Unit>,
-    bytes: u64,
-    live: Option<bool>,
+    files: Vec<FileKey>,
+    workspace_root: Option<PathBuf>,
 }
 
-fn entries(root: &Path) -> Result<Vec<Entry>> {
+struct Snapshot {
+    entries: Vec<Entry>,
+    inodes: Inodes,
+}
+
+fn entries(root: &Path) -> Result<Snapshot> {
+    let mut snapshot = Snapshot {
+        entries: Vec::new(),
+        inodes: Inodes::default(),
+    };
     let listing = match std::fs::read_dir(root) {
         Ok(listing) => listing,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(snapshot),
         Err(error) => return Err(error.into()),
     };
-    let mut entries = Vec::new();
     for entry in listing {
         let entry = match entry {
             Ok(entry) => entry,
@@ -528,40 +564,28 @@ fn entries(root: &Path) -> Result<Vec<Entry>> {
         }
         let directory = entry.path();
         let record = read_record(&directory.join(RECORD_FILE));
-        let units = if record.is_some() {
-            units(&directory, true)
-        } else {
-            units(&directory, false)
-        };
-        let bytes = if record.is_some() {
-            let mut excluded = units
-                .iter()
-                .map(|unit| unit.directory.clone())
-                .collect::<HashSet<_>>();
-            excluded.extend(
-                units
-                    .iter()
-                    .filter(|unit| unit.churn_record.is_file())
-                    .map(|unit| unit.churn_record.clone()),
-            );
-            units.iter().map(|unit| unit.bytes).fold(
-                tree_bytes_except(&directory, &excluded),
-                u64::saturating_add,
-            )
-        } else {
-            tree_bytes(&directory)
-        };
-        entries.push(Entry {
+        let units = units(&directory, &mut snapshot.inodes);
+        let mut excluded = units
+            .iter()
+            .map(|unit| unit.directory.clone())
+            .collect::<HashSet<_>>();
+        excluded.extend(units.iter().filter_map(|unit| unit.churn_record.clone()));
+        let files = snapshot.inodes.measure(&directory, &excluded);
+        snapshot.entries.push(Entry {
             key: entry.file_name().to_string_lossy().into_owned(),
-            bytes,
-            live: record
-                .as_ref()
-                .map(|record| crate::store::checkout_is_live_on(root, &record.workspace_root)),
+            workspace_root: record.map(|record| record.workspace_root),
+            files,
             units,
             directory,
         });
     }
-    Ok(entries)
+    Ok(snapshot)
+}
+
+fn is_seeding(directory: &Path) -> bool {
+    directory
+        .file_name()
+        .is_some_and(|name| name.to_string_lossy().contains(".seeding-"))
 }
 
 fn checkout_key(workspace_root: &Path) -> String {
@@ -925,32 +949,98 @@ fn now_secs() -> u64 {
         .unwrap_or_default()
 }
 
-fn tree_bytes(root: &Path) -> u64 {
-    tree_bytes_except(root, &HashSet::new())
+// A sweep owns one reference per unit (and per bookkeeping tree), even if
+// multiple session paths in that owner hard-link the same immutable file.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum FileKey {
+    Object(u64, u64),
+    #[cfg(not(unix))]
+    Path(PathBuf),
 }
 
-fn tree_bytes_except(root: &Path, excluded: &HashSet<PathBuf>) -> u64 {
-    let mut total = 0_u64;
-    let mut pending = vec![root.to_path_buf()];
-    while let Some(directory) = pending.pop() {
-        let Ok(listing) = std::fs::read_dir(directory) else {
-            continue;
-        };
-        for entry in listing.flatten() {
-            if excluded.contains(&entry.path()) {
+#[cfg(unix)]
+fn file_key(_path: &Path, metadata: &std::fs::Metadata) -> FileKey {
+    use std::os::unix::fs::MetadataExt as _;
+    FileKey::Object(metadata.dev(), metadata.ino())
+}
+
+#[cfg(windows)]
+fn file_key(path: &Path, _metadata: &std::fs::Metadata) -> FileKey {
+    use std::os::windows::io::AsRawHandle as _;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+    if let Ok(file) = std::fs::File::open(path) {
+        let mut info = std::mem::MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::uninit();
+        // The handle stays open and the output points to a correctly sized buffer.
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle(), info.as_mut_ptr()) } != 0 {
+            let info = unsafe { info.assume_init() };
+            return FileKey::Object(
+                u64::from(info.dwVolumeSerialNumber),
+                (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+            );
+        }
+    }
+    FileKey::Path(path.to_path_buf())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_key(path: &Path, _metadata: &std::fs::Metadata) -> FileKey {
+    FileKey::Path(path.to_path_buf())
+}
+
+#[derive(Default)]
+struct Inodes {
+    files: HashMap<FileKey, (u64, usize)>,
+    bytes: u64,
+}
+
+impl Inodes {
+    /// Walk each subtree once, deduplicating both inside an owner and across
+    /// owners. Bookkeeping participates in the same whole-sweep accounting.
+    fn measure(&mut self, root: &Path, excluded: &HashSet<PathBuf>) -> Vec<FileKey> {
+        let mut files = HashSet::new();
+        let mut pending = vec![root.to_path_buf()];
+        while let Some(path) = pending.pop() {
+            if excluded.contains(&path) {
                 continue;
             }
-            let Ok(metadata) = entry.metadata() else {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
                 continue;
             };
             if metadata.is_dir() {
-                pending.push(entry.path());
+                pending.extend(nested_entries(&path).into_iter().map(|entry| entry.path()));
             } else if metadata.is_file() {
-                total = total.saturating_add(metadata.len());
+                let key = file_key(&path, &metadata);
+                self.files.entry(key.clone()).or_insert((metadata.len(), 0));
+                files.insert(key);
+            }
+        }
+        for key in &files {
+            let (bytes, references) = self.files.get_mut(key).expect("measured inode");
+            if *references == 0 {
+                self.bytes = self.bytes.saturating_add(*bytes);
+            }
+            *references += 1;
+        }
+        files.into_iter().collect()
+    }
+
+    fn release(&mut self, files: &[FileKey]) {
+        for key in files {
+            let (bytes, references) = self.files.get_mut(key).expect("measured inode");
+            *references -= 1;
+            if *references == 0 {
+                self.bytes = self.bytes.saturating_sub(*bytes);
             }
         }
     }
-    total
+}
+
+fn tree_bytes(root: &Path) -> u64 {
+    let mut inodes = Inodes::default();
+    inodes.measure(root, &HashSet::new());
+    inodes.bytes
 }
 
 #[cfg(test)]
@@ -1035,7 +1125,7 @@ mod tests {
         std::fs::create_dir(&checkout).unwrap();
         let state = touch(cache.path(), &checkout).unwrap();
         let directory = state.directory.clone();
-        std::fs::write(directory.join("state"), b"incremental").unwrap();
+        unit(&directory, "unit", 0);
         assert!(read_record(&directory.join(RECORD_FILE)).is_some());
         drop(state);
 
@@ -1213,7 +1303,7 @@ mod tests {
             .unwrap()
             .unwrap();
         std::fs::remove_dir_all(&vanished).unwrap();
-        assert!(measure_unit(listed.path(), true).is_none());
+        assert!(measure_unit(listed.path(), &mut Inodes::default()).is_none());
         assert!(unit_locks(&vanished, false).unwrap().is_some());
         let surviving = unit(&state.directory, "surviving", 0);
         std::fs::remove_dir_all(surviving.join("crate-id/s-session")).unwrap();
@@ -1330,7 +1420,7 @@ mod tests {
     }
 
     #[test]
-    fn gone_checkout_removes_units_and_bookkeeping() {
+    fn gone_checkout_keeps_units_until_eviction_then_removes_bookkeeping() {
         let cache = tempfile::tempdir().unwrap();
         let workspace = tempfile::tempdir().unwrap();
         let state = touch(cache.path(), workspace.path()).unwrap();
@@ -1339,12 +1429,169 @@ mod tests {
         drop(state.lease);
         workspace.close().unwrap();
         let before = stats(cache.path()).unwrap();
-        let outcome = collect(cache.path(), None, None, false).unwrap();
+        let kept = collect(cache.path(), None, None, false).unwrap();
+        assert_eq!(kept.removed_units, 0);
+        assert_eq!(kept.removed_directories, 0);
+        assert!(state.directory.exists());
+        let outcome = collect(cache.path(), Some(0), None, false).unwrap();
         assert_eq!(outcome.removed_units, 1);
         assert_eq!(outcome.removed_directories, 1);
         assert_eq!(outcome.removed_bytes, before.bytes);
         assert_eq!(outcome.remaining_bytes, 0);
         assert!(!state.directory.exists());
+    }
+
+    #[test]
+    fn hard_linked_sessions_share_the_budget_and_only_free_the_last_reference() {
+        let cache = tempfile::tempdir().unwrap();
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_state = touch(cache.path(), first.path()).unwrap();
+        let old = unit(&first_state.directory, "unit", 0);
+        let second_state = touch(cache.path(), second.path()).unwrap();
+        let recent = unit(&second_state.directory, "unit", now_secs());
+        let shared = old.join("crate-id/s-session/dep-graph.bin");
+        let linked = recent.join("crate-id/s-session/dep-graph.bin");
+        std::fs::remove_file(&linked).unwrap();
+        std::fs::hard_link(&shared, &linked).unwrap();
+        // Repeated links inside a unit also count only once.
+        std::fs::hard_link(&shared, old.join("crate-id/s-session/alias.bin")).unwrap();
+        // Creating the alias refreshed the session directory; keep this
+        // donor old so the test exercises eviction rather than startup grace.
+        std::fs::File::open(old.join("crate-id/s-session"))
+            .unwrap()
+            .set_modified(UNIX_EPOCH)
+            .unwrap();
+        drop(first_state.lease);
+        drop(second_state.lease);
+        let before = stats(cache.path()).unwrap();
+        assert_eq!(
+            before.bytes,
+            tree_bytes(&first_state.directory) + tree_bytes(&second_state.directory) - 32
+        );
+        let within_budget = collect(cache.path(), Some(before.bytes + 16), None, false).unwrap();
+        assert_eq!(within_budget.removed_units, 0);
+        assert_eq!(within_budget.remaining_bytes, before.bytes);
+
+        let one_removed =
+            collect(cache.path(), None, Some(Duration::from_secs(60)), false).unwrap();
+        assert_eq!(one_removed.removed_units, 1);
+        assert_eq!(
+            one_removed.removed_bytes, 0,
+            "the other unit still owns the inode"
+        );
+        assert_eq!(one_removed.remaining_bytes, before.bytes);
+        assert_eq!(stats(cache.path()).unwrap().bytes, before.bytes);
+        assert!(!old.exists());
+        assert!(linked.exists());
+
+        std::fs::File::open(recent.join("crate-id/s-session"))
+            .unwrap()
+            .set_modified(UNIX_EPOCH)
+            .unwrap();
+        let last_removed = collect(cache.path(), Some(0), None, false).unwrap();
+        assert_eq!(last_removed.removed_units, 1);
+        assert_eq!(last_removed.removed_bytes, 32);
+    }
+
+    #[test]
+    fn bookkeeping_links_share_accounting_with_unit_files() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = touch(cache.path(), workspace.path()).unwrap();
+        let directory = unit(&state.directory, "unit", 0);
+        let private = state.directory.join("private");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::hard_link(
+            directory.join("crate-id/s-session/dep-graph.bin"),
+            private.join("linked"),
+        )
+        .unwrap();
+        drop(state.lease);
+        let before = stats(cache.path()).unwrap();
+        assert_eq!(before.bytes, tree_bytes(&state.directory));
+        let removed = collect(cache.path(), Some(0), None, false).unwrap();
+        assert_eq!(removed.removed_units, 1);
+        assert_eq!(removed.removed_bytes, 0);
+        assert_eq!(removed.remaining_bytes, before.bytes);
+        assert!(private.join("linked").exists());
+    }
+
+    #[test]
+    fn deleted_checkout_units_follow_the_same_lru_order_as_live_units() {
+        let cache = tempfile::tempdir().unwrap();
+        let live = tempfile::tempdir().unwrap();
+        let gone = tempfile::tempdir().unwrap();
+        let live_state = touch(cache.path(), live.path()).unwrap();
+        let oldest = unit(&live_state.directory, "unit", 0);
+        let gone_state = touch(cache.path(), gone.path()).unwrap();
+        let donor = unit(&gone_state.directory, "unit", 100);
+        drop(live_state.lease);
+        drop(gone_state.lease);
+        gone.close().unwrap();
+        let before = stats(cache.path()).unwrap();
+        let outcome = collect(cache.path(), Some(before.bytes - 32), None, false).unwrap();
+        assert_eq!(outcome.removed_units, 1);
+        assert_eq!(outcome.removed_directories, 0);
+        assert!(!oldest.exists());
+        assert!(donor.exists());
+    }
+
+    #[test]
+    fn a_seed_donors_lease_protects_its_units_after_the_workspace_is_deleted() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let key = checkout_key(workspace.path());
+        let state = touch(cache.path(), workspace.path()).unwrap();
+        let donor = unit(&state.directory, "unit", 0);
+        drop(state.lease);
+        workspace.close().unwrap();
+        let seeding = acquire_lease(cache.path(), &key).unwrap();
+        for dry_run in [true, false] {
+            let outcome = collect(cache.path(), Some(0), None, dry_run).unwrap();
+            assert_eq!(outcome.removed_units, 0);
+            assert_eq!(outcome.skipped_active_units, 1);
+            assert_eq!(outcome.skipped_active_directories, 1);
+            assert!(donor.exists());
+        }
+        drop(seeding);
+        assert_eq!(
+            collect(cache.path(), Some(0), None, false)
+                .unwrap()
+                .removed_directories,
+            1
+        );
+    }
+
+    #[test]
+    fn fresh_seeding_staging_is_protected_and_stale_staging_is_collected() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = touch(cache.path(), workspace.path()).unwrap();
+        let staging = state.directory.join("blake3/unit.seeding-123");
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("partial"), b"partial").unwrap();
+        let churn = state.directory.join("blake3/unit.json");
+        std::fs::write(&churn, b"destination churn").unwrap();
+        drop(state.lease);
+        for dry_run in [true, false] {
+            let outcome = collect(cache.path(), Some(0), None, dry_run).unwrap();
+            assert_eq!(outcome.removed_units, 0);
+            assert_eq!(outcome.skipped_active_units, 1);
+            assert!(staging.exists());
+        }
+        std::fs::File::open(&staging)
+            .unwrap()
+            .set_modified(UNIX_EPOCH)
+            .unwrap();
+        let outcome = collect(cache.path(), Some(0), None, false).unwrap();
+        assert_eq!(outcome.removed_units, 1);
+        assert_eq!(outcome.removed_bytes, 7);
+        assert!(!staging.exists());
+        assert!(
+            churn.exists(),
+            "staging must not own the destination's churn record"
+        );
     }
 
     #[test]
