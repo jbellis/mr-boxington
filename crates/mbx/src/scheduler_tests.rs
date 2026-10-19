@@ -1,5 +1,17 @@
 use super::*;
 
+fn wait_until(description: &str, mut ready: impl FnMut() -> bool) {
+    // Wait for the event itself; the deadline only catches a stuck worker.
+    let started = Instant::now();
+    while !ready() {
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "timed out waiting for {description}"
+        );
+        std::thread::yield_now();
+    }
+}
+
 fn pool_at(dir: &Path, capacity: u64, bytes_per_permit: u64) -> Pool {
     let mut pool = Pool::new(
         dir.to_path_buf(),
@@ -194,15 +206,9 @@ fn a_waiting_normal_reservation_holds_low_priority_work_back() {
         pool.reserve(Some(1), None).unwrap()
     });
 
-    for _ in 0..20 {
-        if directory.path().join(PRIORITY_WAIT_STAMP).exists() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(5));
-    }
-    assert!(
-        directory.path().join(PRIORITY_WAIT_STAMP).exists(),
-        "a normal reservation waiting for capacity announces itself"
+    wait_until(
+        "the normal reservation to announce it is waiting for capacity",
+        || directory.path().join(PRIORITY_WAIT_STAMP).exists(),
     );
     drop(held);
     drop(waiter.join().unwrap());
@@ -785,10 +791,18 @@ fn a_waiter_wakes_to_what_its_holder_left() {
     let dir = directory.path().to_path_buf();
 
     let holder = flight_at(&dir, "rustc", "abc123").unwrap();
-    let waiter = std::thread::spawn(move || flight_at(&dir, "rustc", "abc123").unwrap());
-    // Long enough for the thread to block on the lock; a race the other way
-    // only weakens the `waited` assertion into a flake-free pass.
-    std::thread::sleep(std::time::Duration::from_millis(100));
+    let blocked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let waiter_blocked = blocked.clone();
+    let waiter = std::thread::spawn(move || {
+        flight_at_inner(&dir, "rustc", "abc123", || {
+            waiter_blocked.store(true, Ordering::Release);
+        })
+        .unwrap()
+    });
+    wait_until(
+        "the second flight to find the first flight's lock held",
+        || blocked.load(Ordering::Acquire),
+    );
     holder.leave("freshly published");
     drop(holder);
 

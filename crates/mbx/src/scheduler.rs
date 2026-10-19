@@ -1089,6 +1089,21 @@ pub(crate) fn flight(adapter: &'static str, invocation: &str) -> Option<Flight> 
 }
 
 fn flight_at(pool_dir: &Path, adapter: &'static str, invocation: &str) -> Result<Flight> {
+    flight_at_inner(
+        pool_dir,
+        adapter,
+        invocation,
+        #[cfg(test)]
+        || {},
+    )
+}
+
+fn flight_at_inner(
+    pool_dir: &Path,
+    adapter: &'static str,
+    invocation: &str,
+    #[cfg(test)] on_wait: impl FnOnce(),
+) -> Result<Flight> {
     let _phase = crate::phase_timing::phase("flight_wait");
     let dir = pool_dir.join(INFLIGHT_DIR);
     std::fs::create_dir_all(&dir)
@@ -1097,6 +1112,8 @@ fn flight_at(pool_dir: &Path, adapter: &'static str, invocation: &str) -> Result
     let mut lock = fslock::LockFile::open(&path)?;
     let waited = !lock.try_lock()?;
     if waited {
+        #[cfg(test)]
+        on_wait();
         lock.lock()?;
     }
     let inherited = std::fs::read(record_path(&path))
