@@ -2325,6 +2325,52 @@ fn incremental_seed_response_file_rewrites_paths_without_shell_escaping() {
 }
 
 #[test]
+fn incremental_seed_response_file_requires_lossless_arguments() {
+    let project = tempfile::tempdir().unwrap();
+    let input = project.path().join("cargo.args");
+    std::fs::write(&input, "src/lib.rs\n").unwrap();
+    for value in ["message=\"first\nsecond\"", "trailing\r"] {
+        let arguments = [
+            OsString::from(format!("@{}", input.display())),
+            OsString::from(value),
+        ];
+        for bootstrap in [true, false] {
+            let mode = injection_for_invocation(
+                IncrementalSeedMode::Inject { bootstrap },
+                &arguments,
+                false,
+            );
+            assert_eq!(mode, IncrementalSeedMode::Disabled);
+            assert!(!mode.shares_state(), "must not seed from a donor");
+            let (command, file) = private_compiler_command(
+                OsStr::new("rustc"),
+                None,
+                &arguments,
+                project.path(),
+                Some(OsStr::new("-Cincremental=/state")),
+                mode,
+            )
+            .unwrap();
+            assert!(file.is_none());
+            assert_eq!(
+                command.get_args().collect::<Vec<_>>(),
+                [
+                    arguments[0].as_os_str(),
+                    arguments[1].as_os_str(),
+                    OsStr::new("-Cincremental=/state")
+                ]
+            );
+            assert_eq!(command.get_envs().count(), 0);
+        }
+        assert_eq!(
+            injection_for_invocation(IncrementalSeedMode::UserRemap, &arguments, false),
+            IncrementalSeedMode::UserRemap,
+            "explicit remapping must keep its existing behavior"
+        );
+    }
+}
+
+#[test]
 fn incremental_seed_response_file_keeps_newline_arguments_original() {
     let project = tempfile::tempdir().unwrap();
     let input = project.path().join("cargo.args");

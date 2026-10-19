@@ -1590,13 +1590,22 @@ fn injection_for_invocation(
     arguments: &[OsString],
     build_script_name: bool,
 ) -> IncrementalSeedMode {
+    let uses_response_file = arguments
+        .iter()
+        .any(|argument| argument.as_encoded_bytes().starts_with(b"@"));
     let arguments = profile_arguments(arguments);
+    let lossless_response_file = !uses_response_file
+        || arguments
+            .iter()
+            .all(|argument| response_file_argument_is_lossless(argument));
     let build_script = build_script_name && session::compiles_only_a_binary(&arguments);
     let unstable_flags = arguments
         .iter()
         .any(|arg| arg.as_encoded_bytes().starts_with(b"-Z"));
     match mode {
-        IncrementalSeedMode::Inject { .. } if build_script => IncrementalSeedMode::Disabled,
+        IncrementalSeedMode::Inject { .. } if build_script || !lossless_response_file => {
+            IncrementalSeedMode::Disabled
+        }
         IncrementalSeedMode::Inject { bootstrap: true } if unstable_flags => {
             IncrementalSeedMode::Disabled
         }
@@ -1647,13 +1656,19 @@ fn bootstrap_dep_info_requires_retry(mode: IncrementalSeedMode, path: &Path) -> 
 
 /// rustc reads one UTF-8 argument per line, without shell escaping. A trailing
 /// carriage return would become part of a CRLF terminator and lose that byte.
+fn response_file_argument_is_lossless(argument: &OsStr) -> bool {
+    argument
+        .to_str()
+        .is_some_and(|argument| !argument.contains('\n') && !argument.ends_with('\r'))
+}
+
 fn response_file_contents(arguments: &[OsString]) -> Option<Vec<u8>> {
     let mut contents = Vec::new();
     for argument in arguments {
-        let argument = argument.to_str()?;
-        if argument.contains('\n') || argument.ends_with('\r') {
+        if !response_file_argument_is_lossless(argument) {
             return None;
         }
+        let argument = argument.to_str()?;
         contents.extend_from_slice(argument.as_bytes());
         contents.push(b'\n');
     }
