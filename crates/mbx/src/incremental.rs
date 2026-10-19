@@ -1231,8 +1231,7 @@ mod tests {
         let session = unit.join("crate-id/s-session");
         std::fs::create_dir_all(&session).unwrap();
         std::fs::write(session.join("dep-graph.bin"), vec![0; 32]).unwrap();
-        let file = std::fs::File::open(&session).unwrap();
-        file.set_modified(UNIX_EPOCH + Duration::from_secs(used))
+        filetime::set_file_mtime(&session, filetime::FileTime::from_unix_time(used as i64, 0))
             .unwrap();
         unit
     }
@@ -1458,10 +1457,11 @@ mod tests {
         std::fs::hard_link(&shared, old.join("crate-id/s-session/alias.bin")).unwrap();
         // Creating the alias refreshed the session directory; keep this
         // donor old so the test exercises eviction rather than startup grace.
-        std::fs::File::open(old.join("crate-id/s-session"))
-            .unwrap()
-            .set_modified(UNIX_EPOCH)
-            .unwrap();
+        filetime::set_file_mtime(
+            old.join("crate-id/s-session"),
+            filetime::FileTime::from_unix_time(0, 0),
+        )
+        .unwrap();
         drop(first_state.lease);
         drop(second_state.lease);
         let before = stats(cache.path()).unwrap();
@@ -1485,10 +1485,11 @@ mod tests {
         assert!(!old.exists());
         assert!(linked.exists());
 
-        std::fs::File::open(recent.join("crate-id/s-session"))
-            .unwrap()
-            .set_modified(UNIX_EPOCH)
-            .unwrap();
+        filetime::set_file_mtime(
+            recent.join("crate-id/s-session"),
+            filetime::FileTime::from_unix_time(0, 0),
+        )
+        .unwrap();
         let last_removed = collect(cache.path(), Some(0), None, false).unwrap();
         assert_eq!(last_removed.removed_units, 1);
         assert_eq!(last_removed.removed_bytes, 32);
@@ -1580,10 +1581,7 @@ mod tests {
             assert_eq!(outcome.skipped_active_units, 1);
             assert!(staging.exists());
         }
-        std::fs::File::open(&staging)
-            .unwrap()
-            .set_modified(UNIX_EPOCH)
-            .unwrap();
+        filetime::set_file_mtime(&staging, filetime::FileTime::from_unix_time(0, 0)).unwrap();
         let outcome = collect(cache.path(), Some(0), None, false).unwrap();
         assert_eq!(outcome.removed_units, 1);
         assert_eq!(outcome.removed_bytes, 7);
