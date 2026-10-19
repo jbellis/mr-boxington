@@ -104,9 +104,13 @@ no defined standardized residual and skip calibration for that sample.
 
 A compile mode without window samples first uses its retained legacy per-mode
 entry, preserving the old headroom and crate-wide fallback rules. If that entry
-is absent, it uses the largest current charge among sibling modes of the same
-crate. With no sampled siblings it uses the legacy crate-wide maximum, then
-the default one-share memory guess. A link without window samples first uses
+is absent, mbx treats the new mode as another draw from its siblings' window
+maxima: the estimate uses their mean and pooled between-mode spread, stays at
+least the largest current sibling charge, and is capped at the previous
+no-history charge (the legacy crate-wide maximum, or the default one-share
+guess when the crate has none). The cap takes precedence over the floor. With
+no sampled siblings it uses the legacy crate-wide maximum, then the default
+one-share memory guess. A link without window samples first uses
 its legacy per-key maximum, then its profile's recent link maximum if available (the global link window for links
 without a profile), then the two-share link floor. Test-binary and nextest
 histories keep their existing behavior.

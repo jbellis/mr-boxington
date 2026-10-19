@@ -279,12 +279,15 @@ pub(super) fn sibling_estimate(
     let q = sibling_quantile(ledger, n);
     let bound = (mean + q * features.scale).exp().ceil() as u64;
     let charge = floor.max(bound);
-    // Apply the old crate-wide fallback last, including when a calibrated
-    // sibling itself has grown beyond it. With no bare entry there is no cap.
-    let charge = ledger
+    // A mode without samples is never charged more than the previous rule
+    // charged it: the crate-wide maximum, or one share when the crate has
+    // none. This cap wins over the sibling floor.
+    let cap = ledger
         .crates
         .get(name)
-        .map_or(charge, |cap| charge.min(*cap));
+        .copied()
+        .or_else(|| (default > 0).then_some(default));
+    let charge = cap.map_or(charge, |cap| charge.min(cap));
     Some(Estimate {
         n,
         window_max,
@@ -502,6 +505,18 @@ mod tests {
             assert!((shrunk.features.scale - expected_scale).abs() < 1e-12);
             assert!(shrunk.features.scale < e.features.scale);
         }
+    }
+
+    #[test]
+    fn sibling_charge_without_crate_entry_is_capped_at_default() {
+        let ledger = siblings(&[50]);
+        let estimate = sibling_estimate(&ledger, "crate", 200).unwrap();
+        assert!(estimate.bound > 200);
+        assert_eq!(estimate.charge, 200);
+        assert_eq!(
+            compile_prediction(&ledger, "crate", "crate [compile new]", 200),
+            (Some(200), "sibling")
+        );
     }
 
     #[test]
