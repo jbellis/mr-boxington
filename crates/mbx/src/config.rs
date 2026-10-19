@@ -1028,7 +1028,8 @@ pub(crate) struct CliSettings {
     pub plain_output: bool,
     /// Whether a churning crate may compile with its own incremental state.
     pub learned_incremental: bool,
-    /// How much of that state one crate may keep, in bytes; `None` is no limit.
+    /// A retired global setting was present; only the CLI reports this notice.
+    pub removed_incremental_cap: bool,
     /// Whether natively linked programs may be cached.
     pub cache_links: bool,
     /// How many bytes of per-compilation rows one build may record; `None` is
@@ -1047,6 +1048,7 @@ impl Default for CliSettings {
             pretty_inspect: false,
             plain_output: false,
             learned_incremental: true,
+            removed_incremental_cap: false,
             cache_links: true,
             events_max_size: Some(DEFAULT_EVENTS_MAX_SIZE),
         }
@@ -1167,10 +1169,21 @@ impl Default for HttpSettings {
 impl Config {
     /// Load configuration for this machine.
     pub fn load() -> Result<Self> {
-        Self::load_for_cli().map(|(config, _)| config)
+        Self::load_from_environment().map(|(config, _)| config)
     }
 
     pub(crate) fn load_for_cli() -> Result<(Self, CliSettings)> {
+        let (config, settings) = Self::load_from_environment()?;
+        // Compiler shims use load(), so only the outer CLI reports this notice.
+        if settings.removed_incremental_cap {
+            log::warn!(
+                "learned_incremental_max_size was removed and is ignored; use gc.incremental_max_size to bound aggregate state"
+            );
+        }
+        Ok((config, settings))
+    }
+
+    fn load_from_environment() -> Result<(Self, CliSettings)> {
         let env = EnvLayer::from_process();
         let file = config_file_path().map(|path| FileLayer::at(path, FileScope::Global));
         Self::from_layers_for_cli(&env, file.as_ref())
@@ -1200,16 +1213,25 @@ impl Config {
             layers = layers.then(file);
         }
         let resolved = usage_config::resolve(RawConfig::SETTINGS_REGISTRY, layers)?;
-        let warnings = resolved.warnings.iter().filter(|warning| {
-            let removed = warning.kind == usage_config::WarningKind::UnknownSetting
-                && warning.origin.as_ref().is_some_and(|origin|
-                    origin.kind == usage_config::SourceKind::FILE
-                    && origin.identifier.rsplit_once('#').is_some_and(|(_, key)| key == "learned_incremental_max_size"));
-            if removed {
-                log::warn!("learned_incremental_max_size was removed and is ignored; use gc.incremental_max_size to bound aggregate state");
-            }
-            !removed
-        }).collect::<Vec<_>>();
+        let mut removed_incremental_cap = false;
+        let warnings = resolved
+            .warnings
+            .iter()
+            .filter(|warning| {
+                let removed = warning.kind == usage_config::WarningKind::UnknownSetting
+                    && warning.origin.as_ref().is_some_and(|origin| {
+                        origin.kind == usage_config::SourceKind::FILE
+                            && origin
+                                .identifier
+                                .rsplit_once('#')
+                                .is_some_and(|(_, key)| key == "learned_incremental_max_size")
+                    });
+                if removed {
+                    removed_incremental_cap = true;
+                }
+                !removed
+            })
+            .collect::<Vec<_>>();
         if !warnings.is_empty() {
             let problems = warnings
                 .iter()
@@ -1222,7 +1244,9 @@ impl Config {
             bail!("invalid configuration:\n{problems}");
         }
         let raw = RawConfig::read(&resolved)?;
-        Self::from_raw_measuring(raw, measure_disk, measure_memory)
+        let (config, mut settings) = Self::from_raw_measuring(raw, measure_disk, measure_memory)?;
+        settings.removed_incremental_cap = removed_incremental_cap;
+        Ok((config, settings))
     }
 
     /// Resolve settings, measuring the machine with the given probes.
@@ -1462,6 +1486,7 @@ impl Config {
                 pretty_inspect: raw.pretty_inspect,
                 plain_output: raw.display == "plain",
                 learned_incremental: raw._learned_incremental,
+                removed_incremental_cap: false,
                 cache_links: raw.cache_links,
                 events_max_size: parse_optional_byte_size(&raw.events_max_size)
                     .wrap_err(Invalid("events_max_size"))?,
@@ -2669,9 +2694,12 @@ incremental_max_size = "none"
 
     #[test]
     fn removed_incremental_cap_is_ignored_without_hiding_other_errors() {
+        let (_, settings) = configured_for_cli(None, &[]).unwrap();
+        assert!(!settings.removed_incremental_cap);
         for value in ["2GiB", "none", "invalid"] {
             let contents = format!("learned_incremental_max_size = {value:?}");
-            configured_for_cli(Some(&contents), &[]).unwrap();
+            let (_, settings) = configured_for_cli(Some(&contents), &[]).unwrap();
+            assert!(settings.removed_incremental_cap);
         }
         let error = configured_for_cli(
             Some("learned_incremental_max_size = \"2GiB\"\nunknown_key = true"),
