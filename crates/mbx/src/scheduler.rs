@@ -1778,35 +1778,16 @@ impl Pool {
             demand.memory_features.set(Some(
                 estimate.map_or(memory::Features::COLD, |e| e.features),
             ));
-            if let Some(estimate) = estimate {
-                (Some(estimate.charge), "window")
-            } else {
-                let window = match &demand.profile {
-                    Some(profile) => ledger
-                        .profile_link_peaks
-                        .get(profile)
-                        .map_or(&[][..], Vec::as_slice),
-                    None => ledger.link_peaks.as_slice(),
-                };
-                match window.iter().copied().max() {
-                    Some(peak) => (Some(peak), "link-window"),
-                    None => (
-                        Some(LINK_WEIGHT.saturating_mul(self.bytes_per_permit)),
-                        "link-floor",
-                    ),
-                }
-            }
+            memory::link_prediction(
+                &ledger,
+                &key,
+                demand.profile.as_deref(),
+                LINK_WEIGHT.saturating_mul(self.bytes_per_permit),
+            )
         } else {
-            let estimate = memory::estimate(&ledger, &key, "compile");
-            demand.memory_features.set(Some(
-                estimate.map_or(memory::Features::COLD, |e| e.features),
-            ));
-            if let Some(estimate) = estimate {
-                (Some(estimate.charge), "window")
-            } else {
-                let peak = ledger.crates.get(&key).copied();
-                (peak, if peak.is_some() { "legacy" } else { "default" })
-            }
+            // cc:<filename> aliases different libraries' same-named sources.
+            // All non-mode/non-link keys retain the never-lowered legacy rule.
+            (ledger.crates.get(&key).copied(), "legacy")
         };
         // Project the current prediction into the legacy scalar weight.
         // Admission uses independent resources without this capacity clamp.
@@ -1816,13 +1797,14 @@ impl Pool {
             .map_or(1, |bytes| bytes.div_ceil(self.bytes_per_permit))
             .max(threads)
             .clamp(1, self.capacity);
-        let memory_bytes = if matches!(source, "unmeasured" | "default" | "link-floor") {
-            predicted
-                .unwrap_or(0)
-                .max(weight.saturating_mul(self.bytes_per_permit))
-        } else {
-            predicted.unwrap_or(0)
-        };
+        let memory_bytes =
+            if predicted.is_none() || matches!(source, "unmeasured" | "default" | "link-floor") {
+                predicted
+                    .unwrap_or(0)
+                    .max(weight.saturating_mul(self.bytes_per_permit))
+            } else {
+                predicted.unwrap_or(0)
+            };
         Plan {
             resources: Resources {
                 cpu: threads,
@@ -2098,8 +2080,9 @@ impl Pool {
             status.success(),
             self.bytes_per_permit,
         );
-        let eligible = !demand.learns_cpu && status.success() && demand.count_compile_samples;
-        let sample_peak = if !demand.learns_cpu && oom {
+        let eligible =
+            demand.links && !demand.learns_cpu && status.success() && demand.count_compile_samples;
+        let sample_peak = if demand.links && !demand.learns_cpu && oom {
             peak
         } else {
             eligible.then_some(measured).filter(|p| *p > 0)
@@ -2298,6 +2281,8 @@ impl Pool {
         profile: Option<&str>,
         sample: Option<memory::Sample>,
     ) -> Result<()> {
+        // Plain native keys collide across libraries and never teach windows.
+        let sample = sample.filter(|_| links);
         std::fs::create_dir_all(&self.dir)?;
         let mut lock = fslock::LockFile::open(&self.dir.join(LEDGER_LOCK))?;
         lock.lock()?;
@@ -2723,33 +2708,24 @@ fn scheduler_snapshot(
             let mode = key.split_once(" [compile ");
             let kind = memory::kind(key);
             let predictable = mode.is_some() || !key.contains(" [") || kind == "link";
-            let estimate = memory::estimate(&ledger, key, kind);
+            let estimate = (mode.is_some() || kind == "link")
+                .then(|| memory::estimate(&ledger, key, kind))
+                .flatten();
             let (charge, source) = if kind == "link" {
-                if let Some(e) = estimate {
-                    (Some(e.charge), "window")
-                } else {
-                    // Profile suffixes precede [link]; bare links use the global window.
-                    let profile = key
-                        .strip_suffix(" [link]")
-                        .and_then(|name| name.split_once(" ["))
-                        .map(|(_, profile)| profile.trim_end_matches(']'));
-                    let window = profile.map_or(Some(&ledger.link_peaks), |profile| {
-                        ledger.profile_link_peaks.get(profile)
-                    });
-                    match window.and_then(|window| window.iter().copied().max()) {
-                        Some(peak) => (Some(peak), "link-window"),
-                        None => (
-                            Some(LINK_WEIGHT.saturating_mul(bytes_per_permit)),
-                            "link-floor",
-                        ),
-                    }
-                }
-            } else if predictable {
-                memory::compile_prediction(
+                let profile = key
+                    .strip_suffix(" [link]")
+                    .and_then(|name| name.split_once(" ["))
+                    .map(|(_, profile)| profile.trim_end_matches(']'));
+                memory::link_prediction(
                     &ledger,
-                    mode.map_or(key.as_str(), |(name, _)| name),
                     key,
+                    profile,
+                    LINK_WEIGHT.saturating_mul(bytes_per_permit),
                 )
+            } else if let Some((name, _)) = mode {
+                memory::compile_prediction(&ledger, name, key)
+            } else if predictable {
+                (ledger.crates.get(key).copied(), "legacy")
             } else {
                 (None, "see admission")
             };

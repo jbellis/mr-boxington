@@ -2306,8 +2306,8 @@ fn scheduler_stats_compile_charges_match_admission_predictions() {
                     (Some(planned.0), planned.1)
                 );
             } else if entry.key == "crate" {
-                assert_eq!(entry.charge_bytes, planned.1);
-                assert_eq!(entry.charge_permits, Some(planned.0));
+                assert_eq!(entry.charge_bytes, Some(1000));
+                assert_eq!(entry.charge_permits, Some(10));
             }
         }
         pool.record_compile(&demand, 81, false, true).unwrap();
@@ -4158,7 +4158,7 @@ fn calibrated_link_hierarchy_and_wrapped_failures_preserve_legacy_windows() {
     assert_eq!(pool.demand_vector(&demand).source, "link-floor");
     pool.record_link_measurement("crate [link]", Some(300), true, None, None)
         .unwrap();
-    assert_eq!(pool.demand_vector(&demand).source, "link-window");
+    assert_eq!(pool.demand_vector(&demand).source, "legacy");
     assert_eq!(pool.demand_vector(&demand).resources.memory_bytes, 300);
     assert!(
         !read_ledger(&pool.ledger_path())
@@ -4230,30 +4230,55 @@ fn calibrated_stats_show_window_math_and_kind_calibration() {
 }
 
 #[test]
-fn calibrated_plain_compile_keys_learn_light_peaks_without_changing_legacy_fields() {
+fn native_filename_collisions_keep_the_legacy_maximum_and_never_teach_windows() {
     let dir = tempfile::tempdir().unwrap();
-    let pool = pool_at(dir.path(), 100, 100);
-    let demand = Demand::new("cc:file.c", false);
-    assert_eq!(pool.demand_vector(&demand).source, "default");
-    // Successful unwrapped light work teaches the window, but has no legacy peak.
-    pool.record_link_measurement(
-        "cc:file.c",
-        None,
-        false,
-        None,
-        Some(memory::Sample {
-            peak: 50,
-            features: demand.memory_features.take(),
-            calibrate: true,
-        }),
-    )
-    .unwrap();
-    assert_eq!(pool.demand_vector(&demand).source, "window");
-    let ledger = read_ledger(&pool.ledger_path());
-    assert!(ledger.crates.is_empty());
-    assert_eq!(ledger.memory_windows["cc:file.c"], vec![50]);
-    assert!(ledger.memory_residuals.is_empty());
-    assert_eq!(pool.demand_vector(&demand).resources.memory_bytes, 226);
+    let unit = 1024 * 1024;
+    let pool = pool_at(dir.path(), 100, unit);
+    for name in ["cc:common.cpp", "other-plain-key"] {
+        let demand = Demand::new(name, false);
+        assert_eq!(pool.demand_vector(&demand).source, "legacy");
+        assert_eq!(pool.demand_vector(&demand).resources.memory_bytes, unit);
+        for peak in std::iter::once(GIB).chain(std::iter::repeat_n(unit, 16)) {
+            pool.record_link_measurement(
+                name,
+                ledger_peak(peak, false, false, true, unit),
+                false,
+                None,
+                Some(memory::Sample {
+                    peak,
+                    features: None,
+                    calibrate: true,
+                }),
+            )
+            .unwrap();
+        }
+        let stored: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(pool.ledger_path()).unwrap()).unwrap();
+        assert!(
+            !stored["memory_windows"]
+                .as_object()
+                .unwrap()
+                .contains_key(name)
+        );
+        assert!(stored["memory_residuals"].as_object().unwrap().is_empty());
+        // Even stale windows from the previous implementation must not retire
+        // the filename's maximum or influence the pooled spread on read.
+        let mut ledger = read_ledger(&pool.ledger_path());
+        ledger.memory_windows.insert(name.into(), vec![unit; 16]);
+        std::fs::write(pool.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
+        let plan = pool.demand_vector(&demand);
+        assert_eq!(plan.predicted, Some(GIB));
+        assert_eq!(plan.resources.memory_bytes, GIB);
+        assert_eq!(plan.source, "legacy");
+        let ledger = read_ledger(&pool.ledger_path());
+        assert!(!ledger.memory_windows.contains_key(name));
+        assert!(ledger.memory_residuals.is_empty());
+        let report = scheduler_snapshot(dir.path(), 100, unit, true);
+        let entry = report.entries.iter().find(|e| e.key == name).unwrap();
+        assert_eq!(entry.charge_bytes, Some(GIB));
+        assert_eq!(entry.source, "legacy");
+        assert_eq!(entry.n, 0);
+    }
 }
 
 #[test]
@@ -4271,4 +4296,121 @@ fn a_cold_compile_does_not_calibrate_from_another_completion_while_waiting() {
         vec![200, 300]
     );
     assert!(ledger.memory_residuals.is_empty());
+}
+
+#[test]
+fn missing_windows_consult_legacy_keys_before_siblings_and_profile_links() {
+    let dir = tempfile::tempdir().unwrap();
+    let unit = 1024 * 1024;
+    let pool = pool_at(dir.path(), 100, unit);
+    let heavy_link = Demand::new("heavy", true).with_link_profile(&[]);
+    let mode = compile_demand("crate", &["--emit=metadata"]);
+    let sibling = compile_demand("crate", &["--emit=mir"]);
+    pool.record_link_peak(
+        &ledger_key(&heavy_link.name, true),
+        GIB,
+        true,
+        heavy_link.profile.as_deref(),
+    )
+    .unwrap();
+    for _ in 0..16 {
+        pool.record_link_peak("tiny [link]", unit, true, heavy_link.profile.as_deref())
+            .unwrap();
+        pool.record_compile(&sibling, unit, false, true).unwrap();
+    }
+    pool.record_peak("crate", 2 * GIB, false).unwrap();
+    for _ in 0..3 {
+        pool.record_compile(&mode, GIB, false, true).unwrap();
+    }
+    let mut ledger = read_ledger(&pool.ledger_path());
+    // Reproduce eviction without dropping the sibling or profile windows.
+    ledger
+        .memory_windows
+        .remove(&ledger_key(&heavy_link.name, true));
+    ledger
+        .memory_windows
+        .remove(mode.compile_mode.as_ref().unwrap());
+    std::fs::write(pool.ledger_path(), serde_json::to_vec(&ledger).unwrap()).unwrap();
+    for (demand, expected) in [(&heavy_link, GIB), (&mode, GIB + GIB / 2)] {
+        let plan = pool.demand_vector(demand);
+        assert_eq!(plan.source, "legacy");
+        assert_eq!(plan.resources.memory_bytes, expected);
+        let report = scheduler_snapshot(dir.path(), 100, unit, true);
+        let key = demand
+            .compile_mode
+            .clone()
+            .unwrap_or_else(|| ledger_key(&demand.name, true));
+        let entry = report
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .unwrap();
+        assert_eq!(entry.source, plan.source);
+        assert_eq!(entry.charge_bytes, plan.predicted);
+    }
+}
+
+#[test]
+fn an_old_writer_rewrite_preserves_at_least_f47d416_mode_and_link_charges() {
+    let dir = tempfile::tempdir().unwrap();
+    let unit = 1024 * 1024;
+    let pool = pool_at(dir.path(), 100, unit);
+    let mut demands = Vec::new();
+    // Include untrusted modes (1/2 samples), trusted modes, and different
+    // profile links. Old charges include the original headroom/capping rule.
+    for count in 1..=4 {
+        let name = format!("crate{count}");
+        pool.record_peak(&name, 2 * GIB, false).unwrap();
+        let mode = compile_demand(&name, &["--emit=metadata"]);
+        for _ in 0..count {
+            pool.record_compile(&mode, GIB, false, true).unwrap();
+        }
+        demands.push(mode);
+    }
+    for flags in [vec![], vec!["-Clto=fat".into()]] {
+        let link = Demand::new("heavy", true).with_link_profile(&flags);
+        pool.record_link_peak(
+            &ledger_key(&link.name, true),
+            GIB,
+            true,
+            link.profile.as_deref(),
+        )
+        .unwrap();
+        for _ in 0..16 {
+            pool.record_link_peak("tiny [link]", unit, true, link.profile.as_deref())
+                .unwrap();
+        }
+        demands.push(link);
+    }
+    // Include the unrelated small link too: check every recorded link key.
+    demands.push(Demand::new("tiny", true));
+    let mut json = serde_json::to_value(read_ledger(&pool.ledger_path())).unwrap();
+    let object = json.as_object_mut().unwrap();
+    object.remove("memory_windows");
+    object.remove("memory_residuals");
+    assert!(!object.contains_key("pooled_spreads"));
+    std::fs::write(pool.ledger_path(), serde_json::to_vec(&json).unwrap()).unwrap();
+    let report = scheduler_snapshot(dir.path(), 100, unit, true);
+    for demand in demands {
+        let (_, old_charge, _) = legacy::prediction(&pool, &demand);
+        let plan = pool.demand_vector(&demand);
+        assert!(
+            plan.predicted.unwrap() >= old_charge.unwrap(),
+            "{}",
+            demand.name
+        );
+        assert_eq!(plan.source, "legacy");
+        let key = demand
+            .compile_mode
+            .clone()
+            .unwrap_or_else(|| ledger_key(&demand.name, true));
+        let entry = report
+            .entries
+            .iter()
+            .find(|entry| entry.key == key)
+            .unwrap();
+        assert_eq!(entry.source, plan.source);
+        assert_eq!(entry.charge_bytes, plan.predicted);
+    }
+    assert!(read_ledger(&pool.ledger_path()).memory_windows.is_empty());
 }

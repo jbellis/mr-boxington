@@ -79,10 +79,13 @@ units, debug info, incremental compilation and compiler thread settings.
 Repeated emit and crate-type flags are combined, sorted and deduplicated;
 output paths and dep-info do not distinguish modes. With no emit flag, rustc
 emits a link output. Clippy has separate modes. Links retain their existing
-crate and code-generation-profile keys. Native C/C++ compiles use their existing
-per-file keys with the same window estimator.
+crate and code-generation-profile keys. Native C/C++ compiles keep their
+never-lowered legacy maximum: their filename-only keys can collide across libraries, so small compiles must not
+push another library’s heavy peak out of history. Other keys without a Rust
+compile mode or link identity also retain the legacy rule.
 
-Each key keeps the last **16 successful, unwrapped peak-RSS measurements**.
+Each Rust compile-mode or link key keeps the last **16 successful, unwrapped
+peak-RSS measurements**.
 Starting with the first sample, mbx estimates an upper bound in log space:
 `exp(mean(log peaks) + q * s * sqrt(1 + 1/n))`. The charge is the larger of
 that bound and the window maximum. The spread `s` shrinks the key's sample
@@ -93,16 +96,18 @@ use a spread of 0.5. This is recomputed when the ledger is read.
 
 The target probability is **0.95**, selected by causal admission replay.
 For each kind, the latest 256 standardized prediction residuals calibrate
-`q` using the empirical 95th percentile (nearest rank). Before 50 residuals,
-mbx uses a one-sided Student-t multiplier with `4 + n - 1` degrees of freedom.
+`q` using finite-sample rank `ceil(0.95 * (N + 1))`, clamped to the
+`N` available residuals. Before 50 residuals, mbx uses a one-sided Student-t multiplier with `4 + n - 1` degrees of freedom.
 Residuals use the prediction features frozen before admission waiting, and
 only successful, unwrapped runs calibrate them. Zero-spread predictions have
 no defined standardized residual and skip calibration for that sample.
 
-A compile mode without samples uses the largest current charge among sibling
-modes of the same crate. With no sampled siblings it uses the legacy crate-wide
-maximum, then the default one-share memory guess. An unmeasured link uses its
-profile's recent link maximum if available (the global link window for links
+A compile mode without window samples first uses its retained legacy per-mode
+entry, preserving the old headroom and crate-wide fallback rules. If that entry
+is absent, it uses the largest current charge among sibling modes of the same
+crate. With no sampled siblings it uses the legacy crate-wide maximum, then
+the default one-share memory guess. A link without window samples first uses
+its legacy per-key maximum, then its profile's recent link maximum if available (the global link window for links
 without a profile), then the two-share link floor. Test-binary and nextest
 histories keep their existing behavior.
 

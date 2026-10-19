@@ -112,6 +112,10 @@ pub(super) fn sigma_pool(ledger: &MemoryLedger, kind: &str) -> f64 {
         .unwrap_or(DEFAULT_SIGMA_POOL)
 }
 
+fn conformal_rank(n: usize) -> usize {
+    ((TARGET_P * (n + 1) as f64).ceil() as usize).min(n)
+}
+
 pub(super) fn quantile(ledger: &MemoryLedger, kind: &str, n: usize) -> f64 {
     let mut residuals: Vec<_> = ledger
         .memory_residuals
@@ -123,8 +127,9 @@ pub(super) fn quantile(ledger: &MemoryLedger, kind: &str, n: usize) -> f64 {
         .collect();
     if residuals.len() >= MIN_RESIDUALS {
         residuals.sort_by(f64::total_cmp);
-        // Empirical inverse CDF (nearest rank), without interpolation.
-        residuals[(TARGET_P * residuals.len() as f64).ceil() as usize - 1]
+        // Finite-sample conformal rank, clamped to the available history.
+        let rank = conformal_rank(residuals.len());
+        residuals[rank - 1]
     } else {
         let df = NU0 + n.max(1) - 1;
         T_QUANTILES.get(df - 1).copied().unwrap_or(NORMAL_QUANTILE)
@@ -164,6 +169,18 @@ pub(super) fn compile_prediction(
     if let Some(estimate) = estimate(ledger, key, "compile") {
         return (Some(estimate.charge), "window");
     }
+    if let Some(peak) = ledger.crates.get(key).copied() {
+        // An old writer can discard windows. Preserve its charge, including
+        // mode headroom or the crate-wide fallback before three successes.
+        let bare = ledger.crates.get(name).copied();
+        let old_charge = if ledger.compile_samples.get(key).copied().unwrap_or(0) >= 3 {
+            let padded = peak.saturating_add(peak.div_ceil(2));
+            bare.map_or(padded, |bare| padded.min(bare))
+        } else {
+            bare.unwrap_or(peak)
+        };
+        return (Some(peak.max(old_charge)), "legacy");
+    }
     let prefix = format!("{name} [compile ");
     if let Some(charge) = ledger
         .memory_windows
@@ -177,6 +194,32 @@ pub(super) fn compile_prediction(
     match ledger.crates.get(name).copied() {
         Some(peak) => (Some(peak), "legacy"),
         None => (None, "default"),
+    }
+}
+
+/// Shared by admission and stats, including old-writer and eviction fallbacks.
+pub(super) fn link_prediction(
+    ledger: &MemoryLedger,
+    key: &str,
+    profile: Option<&str>,
+    floor: u64,
+) -> (Option<u64>, &'static str) {
+    if let Some(estimate) = estimate(ledger, key, "link") {
+        return (Some(estimate.charge), "window");
+    }
+    if let Some(peak) = ledger.crates.get(key).copied() {
+        return (Some(peak), "legacy");
+    }
+    let window = match profile {
+        Some(profile) => ledger
+            .profile_link_peaks
+            .get(profile)
+            .map_or(&[][..], Vec::as_slice),
+        None => ledger.link_peaks.as_slice(),
+    };
+    match window.iter().copied().max() {
+        Some(peak) => (Some(peak), "link-window"),
+        None => (Some(floor), "link-floor"),
     }
 }
 
@@ -198,7 +241,11 @@ pub(super) fn prepare(ledger: &mut MemoryLedger) {
         window.retain(|p| *p > 0);
         window.drain(..window.len().saturating_sub(WINDOW));
     }
-    ledger.memory_windows.retain(|_, w| !w.is_empty());
+    ledger.memory_windows.retain(|key, w| {
+        // Native cc:<filename> keys collide across libraries; their history
+        // must remain a never-lowered legacy maximum, not a rolling window.
+        (key.contains(" [compile ") || key.ends_with(" [link]")) && !w.is_empty()
+    });
     trim(ledger);
     ledger
         .memory_residuals
@@ -301,7 +348,7 @@ mod tests {
         ledger
             .memory_residuals
             .insert("compile".into(), (0..50).map(|i| i as f64).collect());
-        assert_eq!(quantile(&ledger, "compile", 1), 47.0);
+        assert_eq!(quantile(&ledger, "compile", 1), 48.0);
         ledger
             .memory_residuals
             .insert("compile".into(), vec![-10.0; 50]);
@@ -309,6 +356,23 @@ mod tests {
         assert!(e.bound < 100);
         assert_eq!(e.charge, 100);
         assert_eq!(quantile(&ledger, "link", 1), T_QUANTILES[3]);
+    }
+    #[test]
+    fn finite_sample_rank_matches_review_scenario_and_clamps_to_history() {
+        let mut ledger = MemoryLedger::default();
+        ledger.memory_windows.insert("key".into(), vec![100; 16]);
+        ledger
+            .memory_residuals
+            .insert("compile".into(), (0..50).map(|i| i as f64 / 10.0).collect());
+        assert_eq!(quantile(&ledger, "compile", 16), 4.8);
+        assert_eq!(estimate(&ledger, "key", "compile").unwrap().charge, 312);
+        ledger
+            .memory_residuals
+            .insert("compile".into(), (0..256).map(|i| i as f64).collect());
+        assert_eq!(quantile(&ledger, "compile", 16), 244.0); // rank 245
+        assert_eq!(conformal_rank(50), 49);
+        assert_eq!(conformal_rank(256), 245);
+        assert_eq!(conformal_rank(1), 1); // Clamp to the available history.
     }
     #[test]
     fn pooled_spread_qualifies_ten_keys_of_each_kind_independently() {
@@ -325,7 +389,7 @@ mod tests {
         assert_eq!(sigma_pool(&ledger, "compile"), 0.5);
         ledger
             .memory_windows
-            .insert("tenth".into(), vec![100, 200, 400, 800]);
+            .insert("tenth [compile mode]".into(), vec![100, 200, 400, 800]);
         prepare(&mut ledger);
         assert!((sigma_pool(&ledger, "compile") - 0.8948491622597644).abs() < 1e-12);
         assert_eq!(sigma_pool(&ledger, "link"), 0.5);
