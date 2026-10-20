@@ -70,18 +70,16 @@ impl LearnedPlan {
     /// Find somewhere to keep the state, for a unit that earned it. State
     /// that does not depend on the checkout's location may start from another
     /// checkout's; see [`incremental::seed`].
-    fn resolved(mut self, compilation: &Compilation<'_>, unit: &CacheDigest) -> Self {
+    fn resolved(
+        mut self,
+        compilation: &Compilation<'_>,
+        unit: &CacheDigest,
+        mode: IncrementalSeedMode,
+    ) -> Self {
         if self.hot {
-            let mode = incremental_seed_mode(
-                compilation.rustc,
-                compilation.invocation,
-                compilation.arguments,
-                true,
-            );
-            let unit = incremental_state_identity(unit, mode);
             // Check this checkout's existing state before seeding. A rejected
             // unit takes the shared path without copying a donor's sessions.
-            let directory = incremental_unit_path(&unit);
+            let directory = incremental_unit_path(unit);
             if directory.as_ref().is_some_and(|directory| {
                 incremental_state_exceeds_backstop(directory, session::incremental_budget())
             }) {
@@ -90,7 +88,7 @@ impl LearnedPlan {
                 self.directory = None;
             } else {
                 self.directory = incremental_directory(
-                    &unit,
+                    unit,
                     compilation.invocation.crate_name(),
                     mode_in_state_directory(mode, directory.as_deref()).shares_state(),
                 );
@@ -1744,6 +1742,27 @@ fn private_compiler_command(
     Ok((command, response_file))
 }
 
+/// Choose the private unit identity before reading or writing its history.
+/// The injection policy is known even before the unit earns private state;
+/// a bootstrap env-dependency marker only suppresses injection within that unit.
+fn incremental_unit_identity(
+    compilation: &Compilation<'_>,
+) -> Result<(CacheDigest, IncrementalSeedMode)> {
+    let context = base_action_context(
+        compilation.rustc,
+        compilation.working_dir,
+        compilation.portable,
+    )?;
+    let unit = compilation.invocation.invocation_digest(&context)?;
+    let mode = incremental_seed_mode(
+        compilation.rustc,
+        compilation.invocation,
+        compilation.arguments,
+        true,
+    );
+    Ok((incremental_state_identity(&unit, mode), mode))
+}
+
 /// Separate automatically remapped state from state compiled with Cargo's flags.
 fn incremental_state_identity(unit: &CacheDigest, mode: IncrementalSeedMode) -> CacheDigest {
     if matches!(mode, IncrementalSeedMode::Inject { .. }) {
@@ -1926,12 +1945,7 @@ fn plan_learned_reuse(
 ) -> LearnedPlan {
     let planned = (|| {
         let sources = compilation.invocation.source_fingerprint(discovered);
-        let context = base_action_context(
-            compilation.rustc,
-            compilation.working_dir,
-            compilation.portable,
-        )?;
-        let unit = compilation.invocation.invocation_digest(&context)?;
+        let (unit, mode) = incremental_unit_identity(compilation)?;
         let Some(state_path) = churn_state_path(&unit) else {
             return Result::<LearnedPlan>::Ok(LearnedPlan::default());
         };
@@ -1952,7 +1966,7 @@ fn plan_learned_reuse(
             record: Some((state_path, sources)),
             ..plan
         }
-        .resolved(compilation, &unit))
+        .resolved(compilation, &unit, mode))
     })();
     match planned {
         Ok(plan) => plan,
@@ -2071,18 +2085,13 @@ fn eager_incremental_plan(compilation: &Compilation<'_>) -> LearnedPlan {
         return LearnedPlan::default();
     }
     let planned = (|| {
-        let context = base_action_context(
-            compilation.rustc,
-            compilation.working_dir,
-            compilation.portable,
-        )?;
-        let unit = compilation.invocation.invocation_digest(&context)?;
+        let (unit, mode) = incremental_unit_identity(compilation)?;
         Ok::<_, eyre::Report>(
             LearnedPlan {
                 hot: true,
                 ..LearnedPlan::default()
             }
-            .resolved(compilation, &unit),
+            .resolved(compilation, &unit, mode),
         )
     })();
     planned.unwrap_or_else(|error| {
@@ -2110,12 +2119,7 @@ fn reuse_hot_workspace_plan(
         return LearnedPlan::default();
     }
     let planned = (|| {
-        let context = base_action_context(
-            compilation.rustc,
-            compilation.working_dir,
-            compilation.portable,
-        )?;
-        let unit = compilation.invocation.invocation_digest(&context)?;
+        let (unit, mode) = incremental_unit_identity(compilation)?;
         let Some(state_path) = churn_state_path(&unit) else {
             return Result::<LearnedPlan>::Ok(LearnedPlan::default());
         };
@@ -2149,7 +2153,7 @@ fn reuse_hot_workspace_plan(
             directory: None,
             record: Some((state_path, sources)),
         }
-        .resolved(compilation, &unit))
+        .resolved(compilation, &unit, mode))
     })();
     match planned {
         Ok(plan) => plan,
@@ -2228,12 +2232,7 @@ fn source_is_in_workspace(compilation: &Compilation<'_>) -> bool {
 /// recognized immediately.
 fn record_learned_baseline(compilation: &Compilation<'_>, discovered: &DiscoveredInputs) {
     let recorded = (|| {
-        let context = base_action_context(
-            compilation.rustc,
-            compilation.working_dir,
-            compilation.portable,
-        )?;
-        let unit = compilation.invocation.invocation_digest(&context)?;
+        let (unit, _) = incremental_unit_identity(compilation)?;
         let Some(path) = churn_state_path(&unit) else {
             return Result::<()>::Ok(());
         };
@@ -2255,10 +2254,7 @@ fn record_learned_baseline(compilation: &Compilation<'_>, discovered: &Discovere
 /// A sibling of the unit's incremental directory, so the decision and the
 /// state survive or disappear together.
 fn churn_state_path(unit: &CacheDigest) -> Option<PathBuf> {
-    let root = incremental_root()?;
-    let key = unit.key();
-    let shard = key.get(..16)?;
-    Some(root.join(format!("{shard}.json")))
+    Some(incremental_unit_path(unit)?.with_extension("json"))
 }
 
 /// Persistent per-checkout storage for learned incremental state. Sessions

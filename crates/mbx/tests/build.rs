@@ -1603,6 +1603,11 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
     for unit in &units {
         // <unit>/<crate>-<hash>/<session>/query-cache.bin
         let unit = unit.ancestors().nth(3).unwrap();
+        assert!(
+            unit.with_extension("json").is_file(),
+            "state and history must share a unit identity: {}",
+            unit.display()
+        );
         std::fs::write(unit.join(MARKER), b"").unwrap();
     }
 
@@ -1622,6 +1627,18 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
     .0;
     assert!(compiled_incrementally(&seeded) >= 1, "{seeded}");
     let second_state = incremental_checkout(store.path(), second.path());
+    let seeded_units = find_files(&second_state, |path| {
+        file_name_is(path, |name| name == MARKER)
+    })
+    .into_iter()
+    .map(|path| path.parent().unwrap().to_path_buf())
+    .collect::<Vec<_>>();
+    for unit in &seeded_units {
+        assert!(
+            unit.with_extension("json").is_file(),
+            "seeded state must have its own churn record"
+        );
+    }
     let seeded_from_first = !find_files(&second_state, |path| {
         file_name_is(path, |name| name == MARKER)
     })
@@ -1724,6 +1741,108 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
         find_files(&unremapped_state, |path| file_name_is(path, |name| name
             == MARKER))
         .is_empty()
+    );
+
+    // Age this fixture's rustc sessions past the collector's start grace.
+    let mut pending = vec![store.path().join("incremental")];
+    while let Some(directory) = pending.pop() {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() {
+                pending.push(entry.path());
+            }
+            filetime::set_file_mtime(entry.path(), filetime::FileTime::from_unix_time(1, 0))
+                .unwrap();
+        }
+    }
+    let collected = mbx_command()
+        .args(["gc", "--max-size", "20GiB"])
+        .env("MBX_CACHE_DIR", store.path())
+        .env("MBX_GC_INCREMENTAL_MAX_SIZE", "0B")
+        .env("MBX_GC_MIN_FREE_SIZE", "0B")
+        .output()
+        .unwrap();
+    assert!(collected.status.success(), "{collected:?}");
+    for unit in seeded_units {
+        assert!(!unit.exists(), "gc must collect the seeded unit");
+        assert!(
+            !unit.with_extension("json").exists(),
+            "gc must collect its marked churn record too"
+        );
+    }
+    for state in [first_state, second_state, unremapped_state] {
+        assert!(
+            find_files(&state.join("blake3"), |path| path
+                .extension()
+                .is_some_and(|extension| extension == "json"))
+            .is_empty(),
+            "no churn record should be orphaned after collecting this fixture's units"
+        );
+    }
+}
+
+#[test]
+fn learned_incremental_marked_history_survives_edits_and_seed_policy_changes() {
+    if !rustc_relocates_incremental_state() {
+        return;
+    }
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    let records = || {
+        find_files(
+            &incremental_checkout(store.path(), project.path()).join("blake3"),
+            |path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "json")
+            },
+        )
+    };
+    let build_revision = |revision, seed| {
+        edit_project(project.path(), revision);
+        build_with(
+            project.path(),
+            store.path(),
+            &reports.path().join(format!("{revision}.json")),
+            &[("MBX_SEED_INCREMENTAL", seed)],
+        )
+        .0
+    };
+    assert_eq!(compiled_incrementally(&build_revision(0, "1")), 0);
+    let marked = records();
+    assert_eq!(marked.len(), 1);
+    for revision in [1, 2] {
+        assert_eq!(compiled_incrementally(&build_revision(revision, "1")), 1);
+        assert_eq!(records(), marked, "edits keep the marked history");
+        let record: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&marked[0]).unwrap()).unwrap();
+        assert_eq!(record["streak"], 1);
+    }
+    assert_eq!(
+        compiled_incrementally(&build_revision(3, "0")),
+        0,
+        "turning seeding off starts separate history"
+    );
+    let both = records();
+    assert_eq!(both.len(), 2);
+    let unmarked = both.iter().find(|path| !marked.contains(path)).unwrap();
+    let record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(unmarked).unwrap()).unwrap();
+    assert_eq!(record["streak"], 0);
+    assert_eq!(compiled_incrementally(&build_revision(4, "0")), 1);
+    assert_eq!(
+        compiled_incrementally(&build_revision(5, "1")),
+        1,
+        "the marked streak survives while seeding is off"
+    );
+    let mut after = records();
+    let mut before = both;
+    after.sort();
+    before.sort();
+    assert_eq!(
+        after, before,
+        "neither policy creates another identity on later edits"
     );
 }
 
