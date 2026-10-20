@@ -7051,9 +7051,13 @@ fn main() {
     .unwrap();
     assert!(output.status.success());
     let path = String::from_utf8(output.stdout).unwrap();
+    let path = Path::new(path.trim());
+    assert!(path.is_absolute(), "build script saw {}", path.display());
+    // Windows can spell the temp directory with a short name; compare the
+    // files the two spellings name.
     assert_eq!(
-        Path::new(path.trim()),
-        project.path().canonicalize().unwrap().join("embedded.rs")
+        path.canonicalize().unwrap(),
+        project.path().join("embedded.rs").canonicalize().unwrap()
     );
 }
 
