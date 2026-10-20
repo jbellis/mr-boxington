@@ -106,7 +106,7 @@ pub(crate) const GC_MIN_FREE_ENV: &str = "MBX_SESSION_GC_MIN_FREE";
 pub(crate) const GC_CACHE_DIR_ENV: &str = "MBX_SESSION_GC_CACHE_DIR";
 pub(crate) const GC_TARGET_ROOT_ENV: &str = "MBX_SESSION_GC_TARGET_ROOT";
 pub(crate) const GC_EXECUTABLE_ENV: &str = "MBX_SESSION_GC_EXECUTABLE";
-pub(crate) const SEED_INCREMENTAL_ENV: &str = "MBX_SEED_INCREMENTAL";
+pub(crate) const SESSION_SEED_INCREMENTAL_ENV: &str = "MBX_SESSION_SEED_INCREMENTAL";
 pub(crate) const LEARNED_INCREMENTAL_ENV: &str = "MBX_LEARNED_INCREMENTAL";
 pub(crate) const LEARNED_INCREMENTAL_MAX_SIZE_ENV: &str = "MBX_LEARNED_INCREMENTAL_MAX_SIZE";
 pub(crate) const INCREMENTAL_ROOT_ENV: &str = "MBX_INCREMENTAL_ROOT";
@@ -2313,11 +2313,12 @@ pub(crate) fn learned_incremental_requested() -> bool {
 
 /// Whether private state may be made portable automatically.
 pub(crate) fn seed_incremental_requested() -> bool {
-    seed_incremental_from_env(std::env::var_os(SEED_INCREMENTAL_ENV).as_deref())
+    seed_incremental_from_env(|name| std::env::var_os(name))
 }
 
-fn seed_incremental_from_env(value: Option<&OsStr>) -> bool {
-    value.is_none_or(|value| {
+fn seed_incremental_from_env(environment: impl FnOnce(&str) -> Option<OsString>) -> bool {
+    let value = environment(SESSION_SEED_INCREMENTAL_ENV);
+    value.as_deref().is_none_or(|value| {
         value.to_str().is_some_and(|value| {
             matches!(
                 usage_config::Ty::Bool.coerce(usage_config::Value::String(value.trim().to_owned())),

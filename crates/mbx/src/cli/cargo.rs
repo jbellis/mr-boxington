@@ -470,7 +470,7 @@ fn cargo_with_settings_bypass_log_and_roots(
             if learned_incremental { "1" } else { "0" }.into(),
         );
         environment.insert(
-            session::SEED_INCREMENTAL_ENV.into(),
+            session::SESSION_SEED_INCREMENTAL_ENV.into(),
             if settings.seed_incremental { "1" } else { "0" }.into(),
         );
         environment.insert(

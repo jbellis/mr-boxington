@@ -2718,6 +2718,23 @@ incremental_max_size = "none"
     }
 
     #[test]
+    fn seed_incremental_config_ignores_inherited_session_policy() {
+        for (file, inherited, expected) in [
+            (None, "0", true),
+            (Some("seed_incremental = false"), "1", false),
+            (Some("seed_incremental = true"), "0", true),
+        ] {
+            assert_eq!(
+                configured_for_cli(file, &[("MBX_SESSION_SEED_INCREMENTAL", inherited)])
+                    .unwrap()
+                    .1
+                    .seed_incremental,
+                expected
+            );
+        }
+    }
+
+    #[test]
     fn learned_incremental_is_on_until_it_is_turned_off() {
         let (_, settings) = configured_for_cli(None, &[]).unwrap();
         assert!(settings.learned_incremental);

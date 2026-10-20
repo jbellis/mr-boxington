@@ -632,6 +632,7 @@ fn isolated_cargo_command(
         // job, so leaving it would make this suite pass locally and fail in CI.
         .env_remove("MBX_INCREMENTAL")
         .env_remove("MBX_SEED_INCREMENTAL")
+        .env_remove("MBX_SESSION_SEED_INCREMENTAL")
         .env_remove("RUSTC_BOOTSTRAP")
         .env_remove("CARGO_INCREMENTAL")
         .env_remove("CI")
@@ -1903,6 +1904,78 @@ fn main() {
             u64::from(expected),
             "outer={outer_eager}, override={user_override:?}: {stats}"
         );
+    }
+}
+
+#[test]
+fn nested_workspaces_keep_their_seed_incremental_policy_and_user_override() {
+    for (inherited_seed, user_override) in [
+        (false, None),
+        (true, None),
+        (false, Some("1")),
+        (true, Some("0")),
+    ] {
+        let store = tempfile::tempdir().unwrap();
+        let outer = tempfile::tempdir().unwrap();
+        let inner = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_named_project(outer.path(), "outer");
+        write_named_project(inner.path(), "inner");
+        let check_policy = r#"
+fn check_policy() {
+    let expected = std::env::var("TEST_EXPECTED_OVERRIDE").unwrap();
+    assert_eq!(std::env::var("MBX_SEED_INCREMENTAL").ok(), if expected.is_empty() { None } else { Some(expected) });
+    assert_eq!(std::env::var("MBX_SESSION_SEED_INCREMENTAL").unwrap(), std::env::var("TEST_EXPECTED_SESSION").unwrap());
+}
+"#;
+        std::fs::write(
+            inner.path().join("build.rs"),
+            format!("{check_policy}\nfn main() {{ check_policy(); }}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            outer.path().join("build.rs"),
+            format!(
+                "{check_policy}{}",
+                r#"
+fn main() {
+    check_policy();
+    let output = std::process::Command::new(std::env::var_os("TEST_MBX").unwrap())
+        .current_dir(std::env::var_os("TEST_INNER").unwrap())
+        .args(["build", "--offline"])
+        .env("TEST_EXPECTED_SESSION", std::env::var_os("TEST_INNER_SESSION").unwrap())
+        .env("MBX_STATS_REPORT", std::env::var_os("TEST_INNER_REPORT").unwrap())
+        .output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+"#
+            ),
+        )
+        .unwrap();
+        let inner_report = reports.path().join("inner.json");
+        let policy = user_override.unwrap_or("1");
+        let mut settings = vec![
+            ("TEST_MBX", env!("CARGO_BIN_EXE_mbx")),
+            ("TEST_INNER", inner.path().to_str().unwrap()),
+            ("TEST_INNER_REPORT", inner_report.to_str().unwrap()),
+            ("TEST_EXPECTED_OVERRIDE", user_override.unwrap_or("")),
+            ("TEST_EXPECTED_SESSION", policy),
+            ("TEST_INNER_SESSION", policy),
+            (
+                "MBX_SESSION_SEED_INCREMENTAL",
+                if inherited_seed { "1" } else { "0" },
+            ),
+        ];
+        if let Some(value) = user_override {
+            settings.push(("MBX_SEED_INCREMENTAL", value));
+        }
+        build_with(
+            outer.path(),
+            store.path(),
+            &reports.path().join("outer.json"),
+            &settings,
+        );
+        assert!(inner_report.exists(), "the nested build must run");
     }
 }
 
