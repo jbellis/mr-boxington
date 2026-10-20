@@ -2252,14 +2252,14 @@ fn incremental_seed_response_file_rewrites_paths_without_shell_escaping() {
     let project = tempfile::tempdir().unwrap();
     let root = project.path();
     let input = root.join("cargo.args");
+    // Native separators throughout, as Cargo passes them; the rewrite keeps
+    // whatever follows the checkout root as written.
+    let deps = root.join("target").join("debug").join("deps");
     let arguments = [
-        root.join("src/lib.rs").display().to_string(),
-        format!("--out-dir={}", root.join("target/debug/deps").display()),
-        format!("-Ldependency={}", root.join("target/debug/deps").display()),
-        format!(
-            "--extern=dep={}",
-            root.join("target/debug/deps/libdep.rlib").display()
-        ),
+        root.join("src").join("lib.rs").display().to_string(),
+        format!("--out-dir={}", deps.display()),
+        format!("-Ldependency={}", deps.display()),
+        format!("--extern=dep={}", deps.join("libdep.rlib").display()),
         "--cfg=message=\"spaces and quotes\"".to_owned(),
         "literal\\backslash".to_owned(),
         "日本語".to_owned(),
