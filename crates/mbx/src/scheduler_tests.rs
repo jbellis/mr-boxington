@@ -4816,3 +4816,57 @@ fn repredicted_waiter_gate_logs_current_charge_and_dequeues_old_record() {
     assert_eq!(dequeued["waited_ms"], 900);
     drop(held);
 }
+
+#[test]
+fn nextest_admission_reads_only_per_test_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool_at(dir.path(), 8, 100);
+    pool.record_test_history("project/bin", "case", Some(350), Some(3))
+        .unwrap();
+    let demand = Demand::nextest("project/bin", "case");
+    let mut cache = None;
+    let plan = pool.admission_plan(&demand, &mut cache);
+    assert!(cache.is_none());
+    assert_eq!(
+        plan.resources,
+        Resources {
+            cpu: 3,
+            memory_bytes: 350
+        }
+    );
+    LEDGER_READS.with(|reads| reads.set(0));
+    let permit = pool.admit(&demand).unwrap();
+    assert_eq!(LEDGER_READS.with(|reads| reads.get()), 0);
+    let observation = demand.observation.get().unwrap();
+    assert_eq!(observation.resources, plan.resources);
+    assert_eq!(observation.source, "test-history");
+    drop(permit);
+    // Per-test history changes must be visible without a compiler-ledger reload.
+    pool.record_test_history("project/bin", "case", Some(450), Some(4))
+        .unwrap();
+    let refreshed = pool.admission_plan(&demand, &mut cache);
+    assert!(cache.is_none());
+    assert_eq!(
+        refreshed.resources,
+        Resources {
+            cpu: 4,
+            memory_bytes: 450
+        }
+    );
+}
+
+#[test]
+fn cpu_only_compile_admission_does_not_read_compiler_history() {
+    let dir = tempfile::tempdir().unwrap();
+    let pool = pool_at(dir.path(), 8, 0);
+    let demand = compile_demand("crate", &[]);
+    let mut cache = None;
+    let plan = pool.admission_plan(&demand, &mut cache);
+    assert!(cache.is_none());
+    LEDGER_READS.with(|reads| reads.set(0));
+    let permit = pool.admit(&demand).unwrap();
+    assert_eq!(LEDGER_READS.with(|reads| reads.get()), 0);
+    assert_eq!(demand.observation.get().unwrap().resources, plan.resources);
+    assert_eq!(plan.resources.memory_bytes, 0);
+    drop(permit);
+}

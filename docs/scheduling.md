@@ -107,12 +107,13 @@ samples; fewer than ten qualifying keys use 0.5. This allows the bound to
 exceed the measured peak even for a key with just one measurement. The key's reported `q` expresses this
 bound as a log ratio to its window maximum.
 
-Waiting requests check history on every poll and re-predict their charge when
-the cached ledger reloads. The parsed ledger and prediction are reused until
+Waiting requests that use the compiler ledger check it on every poll and
+re-predict their charge when the cached ledger reloads. The parsed ledger and prediction are reused until
 the file changes, for at most one second.
 On Unix, file identity also detects replacements with matching timestamps and sizes. When a request is admitted,
 its prediction features are retained for calibration after the run, even if
-other jobs update the ledger in the meantime.
+other jobs update the ledger in the meantime. Nextest requests read their
+separate per-test history directly and do not load the compiler ledger.
 
 A compile mode without window samples first uses its retained legacy per-mode
 entry, preserving the old headroom and crate-wide fallback rules. If that entry

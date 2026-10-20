@@ -1730,7 +1730,7 @@ impl Pool {
         let mut delay = POLL_INITIAL;
         let mut stamped: Option<Instant> = None;
         let mut complained = false;
-        let mut ledger_cache = LedgerCache::default();
+        let mut ledger_cache = None;
         loop {
             // Polls run every 2 to 25 ms. Reuse the plan until history reloads;
             // its calibration features remain paired with the cached charge.
@@ -1739,9 +1739,7 @@ impl Pool {
                 weight,
                 predicted,
                 source,
-            } = ledger_cache.prediction(&self.ledger_path(), |ledger| {
-                self.demand_vector_with_ledger(demand, ledger)
-            });
+            } = self.admission_plan(demand, &mut ledger_cache);
             // Features are refreshed with the plan and retained on admission.
             // The gate stops applying at its deadline so a machine that stays
             // short of memory delays this compilation rather than starving it.
@@ -1870,7 +1868,20 @@ impl Pool {
 
     #[cfg(test)]
     fn demand_vector(&self, demand: &Demand) -> Plan {
-        self.demand_vector_with_ledger(demand, &read_ledger(&self.ledger_path()))
+        self.admission_plan(demand, &mut None)
+    }
+
+    fn admission_plan(&self, demand: &Demand, cache: &mut Option<LedgerCache>) -> Plan {
+        // Nextest uses separate per-test history. CPU-only compilers have no
+        // ledger prediction, while test binaries may still need learned cores.
+        if demand.per_test.is_some() || (self.bytes_per_permit == 0 && !demand.learns_cpu) {
+            return self.demand_vector_with_ledger(demand, &MemoryLedger::default());
+        }
+        cache
+            .get_or_insert_with(LedgerCache::default)
+            .prediction(&self.ledger_path(), |ledger| {
+                self.demand_vector_with_ledger(demand, ledger)
+            })
     }
 
     fn demand_vector_with_ledger(&self, demand: &Demand, ledger: &MemoryLedger) -> Plan {
@@ -3303,7 +3314,14 @@ impl LedgerCache {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    static LEDGER_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn read_ledger(path: &Path) -> MemoryLedger {
+    #[cfg(test)]
+    LEDGER_READS.with(|reads| reads.set(reads.get() + 1));
     let mut ledger: MemoryLedger = std::fs::read(path)
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
