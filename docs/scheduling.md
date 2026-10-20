@@ -86,27 +86,44 @@ compile mode or link identity also retain the legacy rule.
 
 Each Rust compile-mode or link key keeps the last **16 successful, unwrapped
 peak-RSS measurements**.
-Starting with the first sample, mbx estimates an upper bound in log space:
-`exp(mean(log peaks) + q * s * sqrt(1 + 1/n))`. The charge is the larger of
-that bound and the window maximum. The spread `s` shrinks the key's sample
-variance toward a pooled spread with four prior degrees of freedom. The
-pooled spread is the median log-space sample standard deviation over keys
-of the same kind with at least four samples; fewer than ten qualifying keys
-use a spread of 0.5. This is recomputed when the ledger is read.
+The charge is the larger of the window maximum and
+`window_max * exp(q)`. The calibration score is
+`ln(actual_peak / admission_time_window_max)`, so a given percentage increase
+has the same score for every key, regardless of its measured spread.
 
 The target probability is **0.95**, selected by causal admission replay.
-For each kind, the latest 256 standardized prediction residuals calibrate
-`q` using finite-sample rank `ceil(0.95 * (N + 1))`, clamped to the
-`N` available residuals. Before 50 residuals, mbx uses a one-sided Student-t multiplier with `4 + n - 1` degrees of freedom.
-Residuals use the prediction features frozen before admission waiting, and
-only successful, unwrapped runs calibrate them. Zero-spread predictions have
-no defined standardized residual and skip calibration for that sample.
+For each kind, the latest 256 scores calibrate `q` using finite-sample rank
+`ceil(0.95 * (N + 1))`, clamped to the `N` available scores. Only successful,
+unwrapped runs calibrate the estimate. Scores saved by older versions used a
+different scale and are discarded; peak windows and sibling calibration remain.
+
+Before 50 scores, mbx keeps its spread-based upper bound:
+`exp(mean(log peaks) + t * s * sqrt(1 + 1/n))`, with the same window maximum
+floor. Here `t` is a one-sided Student-t multiplier with `4 + n - 1` degrees
+of freedom. The spread `s` shrinks the key's sample variance toward a pooled
+spread with four prior degrees of freedom. The pool uses the median log-space
+sample standard deviation over keys of the same kind with at least four
+samples; fewer than ten qualifying keys use 0.5. This allows the bound to
+exceed the measured peak even for a key with just one measurement. The key's reported `q` expresses this
+bound as a log ratio to its window maximum.
+
+Waiting requests that use the compiler ledger check it on every poll and
+re-predict their charge when the cached ledger reloads. The parsed ledger and prediction are reused until
+the file changes, for at most one second.
+On Unix, file identity also detects replacements with matching timestamps and sizes. When a request is admitted,
+its prediction features are retained for calibration after the run, even if
+other jobs update the ledger in the meantime. Nextest requests read their
+separate per-test history directly and do not load the compiler ledger.
 
 A compile mode without window samples first uses its retained legacy per-mode
 entry, preserving the old headroom and crate-wide fallback rules. If that entry
-is absent, it uses the largest current charge among sibling modes of the same
-crate. With no sampled siblings it uses the legacy crate-wide maximum, then
-the default one-share memory guess. A link without window samples first uses
+is absent, mbx treats the new mode as another draw from its siblings' window
+maxima: the estimate uses their mean and pooled between-mode spread, stays at
+least the largest current sibling charge, and is capped at the previous
+no-history charge (the legacy crate-wide maximum, or the default one-share
+guess when the crate has none). The cap takes precedence over the floor. With
+no sampled siblings it uses the legacy crate-wide maximum, then the default
+one-share memory guess. A link without window samples first uses
 its legacy per-key maximum, then its profile's recent link maximum if available (the global link window for links
 without a profile), then the two-share link floor. Test-binary and nextest
 histories keep their existing behavior.
@@ -122,9 +139,10 @@ which makes new readers return to the cold-start hierarchy until they relearn.
 
 `mbx stats --scheduler` shows each key's window size, window maximum, bound,
 charge and source, alongside its legacy peak and sample count. It also shows
-pooled spreads, residual counts and quantile multipliers for each kind.
-Before calibration the kind summary shows the cold-key multiplier (n=1);
-JSON includes each measured key's actual multiplier. Test-run charges still
+pooled spreads, score counts and log-ratio quantiles for each kind.
+Before calibration the kind summary shows the cold-key log ratio (n=1);
+JSON includes each measured key's actual log ratio. Sibling summaries keep
+their standardized multipliers. Test-run charges still
 defer to admission. Add `--json` for raw bytes. Without `--scheduler`, the
 stats output omits this section. Charges use global scheduler settings;
 a workspace `.mbx.toml` can change them for that workspace's builds.
@@ -153,6 +171,44 @@ waiting, then rotates to `observations.jsonl.1`, replacing the previous generati
 The usual retention bound is two approximately 8 MiB files. A busy rotation lock
 can temporarily allow growth; concurrent appends and rotation can lose a few lines.
 Observation failures are debug-logged and do not prevent the workload from running.
+
+Admission transitions are recorded in `<cache_dir>/scheduler/decisions.jsonl`,
+also gated by `events`, with the same best-effort 8 MiB rotation to `.1`.
+Enqueue, dequeue (including gate or error reason), admission, and reclamation of
+dead waiters record identity, resources, and wait age. A request gated before it
+joins the queue records a `gated` event when its gate reason changes, rather than
+on every retry. A dequeue records that reason too, so continued gating does not
+repeat it. Request arrival time survives requeues. Admissions include the
+ordered/passing rule, free resources in each scope, and the oldest overtaken
+waiters with exception reasons or the actual CPU/memory slack bounds (legacy
+scalar checks include their permit size). Events are collected while admission
+is locked, then encoded and appended after the registrar is released. Concurrent
+writers can therefore append events in a different order from their decisions;
+use their timestamps and tickets to follow a request.
+
+A waiter that releases its place empties its waiter file before unlocking it, so
+a scan skips it instead of reporting it as abandoned. An abandoned event therefore
+means the waiting process ended without releasing its place: it was killed,
+exited without unwinding, or panicked (release builds abort on panic). Emptying
+the file is best effort and has not been tested on Windows; if it fails, a normal
+release can still be reported as abandoned. Abandoned events are incomplete: an
+older mbx, or a process with `events = false`, can reclaim a dead waiter without
+logging it. Logging errors and rotation can also lose events. In an abandoned
+event, `waited_ms` is the age of the last queue stint, which a gate requeue
+resets; `first_arrival_ms` gives the request's total age, and `mbx stats` uses it
+to list abandoned waits over 15 minutes. With `events =
+false`, admission does no decision-log work; the only remaining cost is emptying
+the waiter file on release.
+
+Transitions are under 1 KiB; admission records fit within 4 KiB including the
+newline and retain at most 16 overtaken waiters, oldest first. The total and
+logged counts expose truncation. A normal append uses one write. After a short
+write, the writer appends a newline to end the partial line; this is a separate
+write, so a line from another process can still land in between and be lost.
+`mbx stats --scheduler` summarizes admissions, overtakes, dequeues, gate reasons,
+and abandoned waits over 15 minutes; its JSON retains all recorded ranked
+overtakes. Missing entries make overtake reason counts and rankings incomplete.
+Logging never changes admission policy.
 
 The estimate-accuracy section of `mbx stats --scheduler` reads both generations,
 ignoring malformed lines, and shows the retained time span as UTC dates and

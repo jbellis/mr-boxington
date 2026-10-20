@@ -631,6 +631,9 @@ fn isolated_cargo_command(
         // defers to it, and `Swatinem/rust-cache` sets it to 0 for the whole
         // job, so leaving it would make this suite pass locally and fail in CI.
         .env_remove("MBX_INCREMENTAL")
+        .env_remove("MBX_SEED_INCREMENTAL")
+        .env_remove("MBX_SESSION_SEED_INCREMENTAL")
+        .env_remove("RUSTC_BOOTSTRAP")
         .env_remove("CARGO_INCREMENTAL")
         .env_remove("CI")
         .env_remove("GITHUB_ACTIONS")
@@ -1463,20 +1466,98 @@ fn rustc_relocates_incremental_state() -> bool {
 
 #[test]
 fn learned_state_seeds_another_checkout_when_rustc_remaps_the_working_directory() {
+    check_incremental_seeding(&[
+        ("RUSTC_BOOTSTRAP", "1"),
+        ("RUSTFLAGS", "-Zremap-cwd-prefix=/src"),
+    ]);
+}
+
+#[test]
+fn learned_incremental_state_seeds_another_checkout_by_default() {
+    check_incremental_seeding(&[]);
+}
+
+#[test]
+fn incremental_seed_preserves_bootstrap_env_dependencies_across_edits() {
+    let version = Command::new("rustc").arg("-vV").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    if !rustc_relocates_incremental_state()
+        || version.lines().any(|line| {
+            line.starts_with("release:") && (line.contains("nightly") || line.contains("dev"))
+        })
+    {
+        return;
+    }
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    std::fs::write(
+        project.path().join("src/main.rs"),
+        "fn main() { println!(\"{:?}\", fixture::bootstrap()); }\n",
+    )
+    .unwrap();
+    let mut remembered = Vec::new();
+    for revision in 0..2 {
+        std::fs::write(project.path().join("src/lib.rs"), format!("pub fn bootstrap() -> Option<&'static str> {{ option_env!(\"RUSTC_BOOTSTRAP\") }}\npub fn revision() -> u32 {{ {revision} }}\n")).unwrap();
+        let mut command = mbx_command();
+        command.env_remove("RUSTC_BOOTSTRAP");
+        cargo_with_command(
+            command,
+            project.path(),
+            store.path(),
+            &reports.path().join(format!("{revision}.json")),
+            &["build", "--locked"],
+            &[("MBX_EAGER_INCREMENTAL", "1")],
+        );
+        let output = Command::new(project.path().join(format!(
+            "target/debug/fixture{}",
+            std::env::consts::EXE_SUFFIX
+        )))
+        .output()
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "None");
+        if revision == 0 {
+            remembered = find_files(
+                &incremental_checkout(store.path(), project.path()),
+                |path| file_name_is(path, |name| name == "bootstrap-env-dependency"),
+            );
+            assert!(
+                !remembered.is_empty(),
+                "the unit should remember its bootstrap dependency"
+            );
+            for path in &remembered {
+                std::fs::write(path, "remembered").unwrap();
+            }
+        } else {
+            for path in &remembered {
+                assert_eq!(
+                    std::fs::read_to_string(path).unwrap(),
+                    "remembered",
+                    "the next edit should not inject again"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn learned_incremental_state_reuses_donors_with_cargo_response_files() {
+    check_incremental_seeding(&[("__CARGO_TEST_FORCE_ARGFILE", "1")]);
+}
+
+fn check_incremental_seeding(remapped: &[(&str, &str)]) {
     const MARKER: &str = "seeded-from-first";
     let store = tempfile::tempdir().unwrap();
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
     let unremapped = tempfile::tempdir().unwrap();
     let reports = tempfile::tempdir().unwrap();
-    let remapped = [
-        ("RUSTC_BOOTSTRAP", "1"),
-        ("RUSTFLAGS", "-Zremap-cwd-prefix=/src"),
-        // The backstop applies to existing state before seeding. A checkout
-        // with no state can still seed even when its donor exceeds the cap.
-        ("MBX_GC_INCREMENTAL_MAX_SIZE", "0B"),
-        ("MBX_GC_AUTO", "0"),
-    ];
+    // Apply the GC branch's seeding backstop checks to both remap modes.
+    let mut environment = remapped.to_vec();
+    environment.extend([("MBX_GC_INCREMENTAL_MAX_SIZE", "0B"), ("MBX_GC_AUTO", "0")]);
+    let remapped = environment.as_slice();
     // A module the edit never touches compiles to its own codegen units, which
     // rustc reuses rather than recompiles when it accepts the state.
     let stable = (0..64)
@@ -1500,14 +1581,14 @@ fn learned_state_seeds_another_checkout_when_rustc_remaps_the_working_directory(
         first.path(),
         store.path(),
         &reports.path().join("first.json"),
-        &remapped,
+        remapped,
     );
     edit(first.path());
     let edited = build_with(
         first.path(),
         store.path(),
         &reports.path().join("first-edit.json"),
-        &remapped,
+        remapped,
     )
     .0;
     assert!(compiled_incrementally(&edited) >= 1, "{edited}");
@@ -1529,14 +1610,14 @@ fn learned_state_seeds_another_checkout_when_rustc_remaps_the_working_directory(
         second.path(),
         store.path(),
         &reports.path().join("second.json"),
-        &remapped,
+        remapped,
     );
     edit(second.path());
     let seeded = build_with(
         second.path(),
         store.path(),
         &reports.path().join("second-edit.json"),
-        &remapped,
+        remapped,
     )
     .0;
     assert!(compiled_incrementally(&seeded) >= 1, "{seeded}");
@@ -1554,7 +1635,7 @@ fn learned_state_seeds_another_checkout_when_rustc_remaps_the_working_directory(
         second.path(),
         store.path(),
         &reports.path().join("oversized-edit.json"),
-        &remapped,
+        remapped,
     )
     .0;
     assert_eq!(
@@ -1624,20 +1705,19 @@ fn learned_state_seeds_another_checkout_when_rustc_remaps_the_working_directory(
         );
     }
 
-    // Without the flag rustc would ignore another checkout's state, so none
-    // is copied.
+    // Turning automatic seeding off keeps unremapped state separate from donors.
     build_with(
         unremapped.path(),
         store.path(),
         &reports.path().join("unremapped.json"),
-        &[],
+        &[("MBX_SEED_INCREMENTAL", "0")],
     );
     edit(unremapped.path());
     build_with(
         unremapped.path(),
         store.path(),
         &reports.path().join("unremapped-edit.json"),
-        &[],
+        &[("MBX_SEED_INCREMENTAL", "0")],
     );
     let unremapped_state = incremental_checkout(store.path(), unremapped.path());
     assert!(
@@ -1850,6 +1930,78 @@ fn main() {
             u64::from(expected),
             "outer={outer_eager}, override={user_override:?}: {stats}"
         );
+    }
+}
+
+#[test]
+fn nested_workspaces_keep_their_seed_incremental_policy_and_user_override() {
+    for (inherited_seed, user_override) in [
+        (false, None),
+        (true, None),
+        (false, Some("1")),
+        (true, Some("0")),
+    ] {
+        let store = tempfile::tempdir().unwrap();
+        let outer = tempfile::tempdir().unwrap();
+        let inner = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_named_project(outer.path(), "outer");
+        write_named_project(inner.path(), "inner");
+        let check_policy = r#"
+fn check_policy() {
+    let expected = std::env::var("TEST_EXPECTED_OVERRIDE").unwrap();
+    assert_eq!(std::env::var("MBX_SEED_INCREMENTAL").ok(), if expected.is_empty() { None } else { Some(expected) });
+    assert_eq!(std::env::var("MBX_SESSION_SEED_INCREMENTAL").unwrap(), std::env::var("TEST_EXPECTED_SESSION").unwrap());
+}
+"#;
+        std::fs::write(
+            inner.path().join("build.rs"),
+            format!("{check_policy}\nfn main() {{ check_policy(); }}\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            outer.path().join("build.rs"),
+            format!(
+                "{check_policy}{}",
+                r#"
+fn main() {
+    check_policy();
+    let output = std::process::Command::new(std::env::var_os("TEST_MBX").unwrap())
+        .current_dir(std::env::var_os("TEST_INNER").unwrap())
+        .args(["build", "--offline"])
+        .env("TEST_EXPECTED_SESSION", std::env::var_os("TEST_INNER_SESSION").unwrap())
+        .env("MBX_STATS_REPORT", std::env::var_os("TEST_INNER_REPORT").unwrap())
+        .output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+}
+"#
+            ),
+        )
+        .unwrap();
+        let inner_report = reports.path().join("inner.json");
+        let policy = user_override.unwrap_or("1");
+        let mut settings = vec![
+            ("TEST_MBX", env!("CARGO_BIN_EXE_mbx")),
+            ("TEST_INNER", inner.path().to_str().unwrap()),
+            ("TEST_INNER_REPORT", inner_report.to_str().unwrap()),
+            ("TEST_EXPECTED_OVERRIDE", user_override.unwrap_or("")),
+            ("TEST_EXPECTED_SESSION", policy),
+            ("TEST_INNER_SESSION", policy),
+            (
+                "MBX_SESSION_SEED_INCREMENTAL",
+                if inherited_seed { "1" } else { "0" },
+            ),
+        ];
+        if let Some(value) = user_override {
+            settings.push(("MBX_SEED_INCREMENTAL", value));
+        }
+        build_with(
+            outer.path(),
+            store.path(),
+            &reports.path().join("outer.json"),
+            &settings,
+        );
+        assert!(inner_report.exists(), "the nested build must run");
     }
 }
 
@@ -7002,5 +7154,154 @@ fn mbx_clean_under_rejects_relative_and_root_paths_and_conflicting_workspace() {
             "arguments unexpectedly succeeded: {}",
             String::from_utf8_lossy(&output.stdout)
         );
+    }
+}
+
+#[test]
+fn private_build_script_rustc_keeps_absolute_source_paths() {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_project(project.path());
+    std::fs::write(
+        project.path().join("build.rs"),
+        r#"include!(concat!(env!("CARGO_MANIFEST_DIR"), "/embedded.rs"));
+fn main() {
+    println!("cargo:rerun-if-changed=embedded.rs");
+    println!("cargo:rustc-env=WHERE={WHERE}");
+}
+"#,
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("embedded.rs"),
+        "const WHERE: &str = file!();\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.path().join("src/main.rs"),
+        "fn main() { println!(\"{}\", env!(\"WHERE\")); }\n",
+    )
+    .unwrap();
+    let stats = build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("build.json"),
+        &[
+            ("MBX_EAGER_INCREMENTAL", "1"),
+            ("MBX_BUILD_SCRIPT_EXECUTION", "1"),
+        ],
+    )
+    .0;
+    assert!(compiled_incrementally(&stats) >= 1, "{stats}");
+    let output = Command::new(project.path().join(format!(
+        "target/debug/fixture{}",
+        std::env::consts::EXE_SUFFIX
+    )))
+    .output()
+    .unwrap();
+    assert!(output.status.success());
+    let path = String::from_utf8(output.stdout).unwrap();
+    let path = Path::new(path.trim());
+    assert!(path.is_absolute(), "build script saw {}", path.display());
+    // Windows can spell the temp directory with a short name; compare the
+    // files the two spellings name.
+    assert_eq!(
+        path.canonicalize().unwrap(),
+        project.path().join("embedded.rs").canonicalize().unwrap()
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn incremental_seed_retries_failed_bootstrap_const_but_not_genuine_rustc_errors() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let version = Command::new("rustc").arg("-vV").output().unwrap();
+    let version = String::from_utf8(version.stdout).unwrap();
+    if !rustc_relocates_incremental_state()
+        || version.lines().any(|line| {
+            line.starts_with("release:") && (line.contains("nightly") || line.contains("dev"))
+        })
+    {
+        return;
+    }
+    let real_rustc = which::which("rustc").unwrap();
+    for (name, source, succeeds, attempts) in [
+        (
+            "bootstrap-const",
+            "const _: () = assert!(option_env!(\"RUSTC_BOOTSTRAP\").is_none());\npub fn value() {}\n",
+            true,
+            vec!["1", "unset"],
+        ),
+        (
+            "genuine-error",
+            "compile_error!(\"genuine-compile-error\");\n",
+            false,
+            vec!["1"],
+        ),
+        ("no-dep-info", "pub fn broken( {\n", false, vec!["1"]),
+    ] {
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_project(project.path());
+        std::fs::write(project.path().join("src/lib.rs"), source).unwrap();
+        let wrapper = project.path().join("counting-rustc");
+        let log = project.path().join("attempts.log");
+        std::fs::write(
+            &wrapper,
+            r#"#!/bin/sh
+case " $* " in
+  *" --crate-name fixture "*)
+    printf '%s\n' "${RUSTC_BOOTSTRAP-unset}" >> "$TEST_COMPILER_ATTEMPTS"
+    ;;
+esac
+exec "$TEST_REAL_RUSTC" "$@"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let mut command = mbx_command();
+        command.env_remove("RUSTC_BOOTSTRAP");
+        let output = isolated_cargo_command(
+            command,
+            project.path(),
+            store.path(),
+            &reports.path().join("build.json"),
+            &["build", "--locked"],
+            &[
+                ("MBX_EAGER_INCREMENTAL", "1"),
+                ("RUSTC", wrapper.to_str().unwrap()),
+                ("TEST_REAL_RUSTC", real_rustc.to_str().unwrap()),
+                ("TEST_COMPILER_ATTEMPTS", log.to_str().unwrap()),
+            ],
+        )
+        .output()
+        .unwrap();
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(output.status.success(), succeeds, "{name}: {stderr}");
+        let actual = std::fs::read_to_string(&log).unwrap();
+        assert_eq!(
+            actual.lines().collect::<Vec<_>>(),
+            attempts,
+            "{name}: {stderr}"
+        );
+        let markers = find_files(&store.path().join("incremental"), |path| {
+            file_name_is(path, |name| name == "bootstrap-env-dependency")
+        });
+        assert_eq!(
+            !markers.is_empty(),
+            succeeds,
+            "{name}: retry marker should match bootstrap dependency"
+        );
+        if succeeds {
+            assert!(
+                !stderr.contains("E0080"),
+                "discarded diagnostics reached Cargo: {stderr}"
+            );
+        } else if name == "genuine-error" {
+            assert!(stderr.contains("genuine-compile-error"), "{stderr}");
+        }
     }
 }

@@ -188,17 +188,21 @@ fn outcome(status: &ExitStatus) -> String {
 
 /// Bound escaped JSON strings too. A hash suffix preserves distinct long keys.
 fn compact(value: &mut String) -> Result<()> {
-    if serde_json::to_vec(value.as_str())?.len() <= 128 {
+    compact_to(value, 128)
+}
+
+pub(super) fn compact_to(value: &mut String, limit: usize) -> Result<()> {
+    if serde_json::to_vec(value.as_str())?.len() <= limit {
         return Ok(());
     }
     let suffix = format!("…{:016x}", test_history_hash(value));
-    let mut end = value.len().min(128);
+    let mut end = value.len().min(limit);
     while !value.is_char_boundary(end) {
         end -= 1;
     }
     let prefix = &value[..end];
     let mut shortened = format!("{prefix}{suffix}");
-    while serde_json::to_vec(&shortened)?.len() > 128 {
+    while serde_json::to_vec(&shortened)?.len() > limit {
         end -= 1;
         while !value.is_char_boundary(end) {
             end -= 1;
@@ -210,16 +214,6 @@ fn compact(value: &mut String) -> Result<()> {
 }
 
 fn append(dir: &Path, mut observation: Observation) -> Result<()> {
-    std::fs::create_dir_all(dir)?;
-    let path = dir.join(FILE);
-    if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES) {
-        let mut lock = fslock::LockFile::open(&dir.join(LOCK))?;
-        if lock.try_lock()? && std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES) {
-            // Replaces the previous generation. A writer that already opened
-            // the old inode can lose its line if another rotation overtakes it.
-            std::fs::rename(&path, dir.join(PREVIOUS))?;
-        }
-    }
     // Shorten every long identity the same way on every line, whatever the
     // rest of the line holds, so one key is never split between spellings.
     compact(&mut observation.name)?;
@@ -231,13 +225,41 @@ fn append(dir: &Path, mut observation: Observation) -> Result<()> {
     let mut line = serde_json::to_vec(&observation)?;
     line.push(b'\n');
     eyre::ensure!(line.len() < 1024, "observation exceeds line size limit");
+    append_line(dir, FILE, PREVIOUS, LOCK, &line)
+}
+
+/// Shared best-effort rotation and single O_APPEND write for scheduler logs.
+pub(super) fn append_line(
+    dir: &Path,
+    filename: &str,
+    previous: &str,
+    lockname: &str,
+    line: &[u8],
+) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let path = dir.join(filename);
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES) {
+        let mut lock = fslock::LockFile::open(&dir.join(lockname))?;
+        if lock.try_lock()? && std::fs::metadata(&path).is_ok_and(|m| m.len() > MAX_BYTES) {
+            // Replaces the previous generation. A writer that already opened
+            // the old inode can lose its line if another rotation overtakes it.
+            std::fs::rename(&path, dir.join(previous))?;
+        }
+    }
     let mut file = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(path)?;
-    // Exactly one O_APPEND write; never retry a short write or take a ledger
-    // lock. A partial line is ignored by readers.
-    eyre::ensure!(file.write(&line)? == line.len(), "short observation write");
+    write_line(&mut file, line)
+}
+
+fn write_line(file: &mut impl Write, line: &[u8]) -> Result<()> {
+    if file.write(line)? != line.len() {
+        // Do not retry the record. This newline is a separate append, so a
+        // concurrent writer's line can still land before it and be lost.
+        let _ = file.write(b"\n");
+        eyre::bail!("short scheduler event write");
+    }
     Ok(())
 }
 
@@ -531,6 +553,55 @@ mod tests {
             use std::os::windows::process::ExitStatusExt;
             ExitStatus::from_raw(code)
         }
+    }
+
+    #[test]
+    fn short_append_salvages_framing_without_retrying_the_record() {
+        #[derive(Default)]
+        struct Writer {
+            bytes: Vec<u8>,
+            calls: usize,
+            short: Option<usize>,
+            fail_newline: bool,
+        }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.calls += 1;
+                if bytes == b"\n" && self.fail_newline {
+                    return Err(std::io::Error::other("newline failed"));
+                }
+                let count = self.short.take().unwrap_or(bytes.len());
+                self.bytes.extend_from_slice(&bytes[..count]);
+                Ok(count)
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let mut writer = Writer {
+            short: Some(3),
+            ..Default::default()
+        };
+        assert!(write_line(&mut writer, b"{\"event\":1}\n").is_err());
+        assert_eq!(writer.bytes, b"{\"e\n");
+        assert_eq!(writer.calls, 2);
+        write_line(&mut writer, b"{\"event\":2}\n").unwrap();
+        assert_eq!(writer.calls, 3);
+        let last = writer.bytes.split(|b| *b == b'\n').nth(1).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(last).unwrap()["event"],
+            2
+        );
+        let mut failed = Writer {
+            short: Some(3),
+            fail_newline: true,
+            ..Default::default()
+        };
+        assert!(write_line(&mut failed, b"{\"event\":1}\n").is_err());
+        assert_eq!(failed.calls, 2);
+        let mut normal = Writer::default();
+        write_line(&mut normal, b"{}\n").unwrap();
+        assert_eq!(normal.calls, 1);
     }
 
     #[test]

@@ -34,31 +34,50 @@ publish again after the edited crate compiles once more without a source change.
 
 ### Start new checkouts warm
 
-rustc ignores incremental state recorded under another working directory, so a
-new checkout's first edit to each crate compiles that crate from scratch. Give
-rustc the same working directory in every checkout and that state carries over:
+With rustc 1.98 or later, mbx seeds private incremental state from another
+checkout by default. When a crate first needs private state, mbx copies the
+most recently used checkout's state for the same crate and flags, hard-linking
+its files. rustc validates that state against the current sources, so the first
+edit in a new checkout can compile incrementally too.
 
-```toml
-# .cargo/config.toml
-[build]
-rustflags = ["-Zremap-cwd-prefix=/src"]
+For these compilations only, mbx adds `-Zremap-cwd-prefix=.` and makes paths
+under the checkout relative. Cargo's arguments and shared cache keys stay the
+same. Debug info records `.` as the working directory for crates being edited,
+and backtrace frames show paths such as `./src/lib.rs`. For sources passed by
+absolute path, `file!()` and panic locations also change to that relative path.
+Build-script compilations are not affected. Debuggers started from
+the checkout can find those sources. When starting a debugger elsewhere, map
+that directory to the checkout:
+
+```text
+# gdb
+set substitute-path . /absolute/path/to/checkout
+# lldb
+settings set target.source-map . /absolute/path/to/checkout
 ```
 
-The flag needs a nightly toolchain, or `RUSTC_BOOTSTRAP=1` on a stable one, and
-seeding needs rustc 1.98 or later: earlier releases check incremental state
-against the real working directory and ignore another checkout's, so mbx copies
-nothing for them.
-With it, when a crate first needs private state in a checkout, mbx copies the
-state of the most recently used checkout that has some for the same crate and
-flags, hard-linking its files. rustc validates the copied state against the
-sources it compiles, as after any edit, so the first edit in a new worktree
-compiles incrementally.
+On stable and beta compilers, mbx sets `RUSTC_BOOTSTRAP=1` only on the compiler
+processes using this private state. It appends `-Zallow-features=` so that
+`#![feature]` declarations remain rejected. Nightly and dev compilers need
+neither addition. If `RUSTC_BOOTSTRAP` is already set to any value, mbx leaves
+that choice in place and does not add the remap flag. On stable and beta it
+also skips injection when the invocation has any `-Z` flag. If a crate reads
+`RUSTC_BOOTSTRAP` with `env!()` or `option_env!()`, mbx retries without injection
+and remembers that choice for the unit. It checks that the compiler accepts the
+flag before adding it.
 
-rustc also records the paths of the crates it links and the outputs it writes,
-and each checkout has its own target directory. So that those match too, mbx
-names every path under the working directory relative to it when it compiles a
-crate with private state under this flag. Debug info and panic messages then
-name paths under `/src` instead of the checkout.
+To turn off automatic seeding, run:
+
+```sh
+mbx settings set seed_incremental false
+# Or for one build:
+MBX_SEED_INCREMENTAL=0 mbx build
+```
+
+A user-supplied `-Zremap-cwd-prefix` still enables seeding on rustc 1.98 or
+later, even with `seed_incremental` off. mbx keeps its value and does not add a
+second flag or change bootstrap. Earlier compilers keep checkout-specific
+state and do not seed it.
 
 ### Where state lives
 
