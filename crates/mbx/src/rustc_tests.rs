@@ -2029,12 +2029,21 @@ fn incremental_seed_identity_separates_automatic_remapping() {
 #[cfg(unix)]
 #[test]
 fn incremental_seed_probe_checks_flags_and_fails_closed() {
-    use std::os::unix::fs::PermissionsExt;
     let directory = tempfile::tempdir().unwrap();
     let compiler = directory.path().join("rustc");
+    // A child shell writes the script. If this process wrote it, another
+    // test's spawn could inherit the open descriptor for a moment, and the
+    // probe's exec would fail with ETXTBSY.
     let write = |body: &str| {
-        std::fs::write(&compiler, format!("#!/bin/sh\n{body}\n")).unwrap();
-        std::fs::set_permissions(&compiler, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let status = Command::new("sh")
+            .arg("-c")
+            .arg("printf '%s\\n' \"#!/bin/sh\" \"$1\" > \"$2\" && chmod 755 \"$2\"")
+            .arg("sh")
+            .arg(body)
+            .arg(&compiler)
+            .status()
+            .unwrap();
+        assert!(status.success());
     };
     write(
         "test \"$*\" = '--print=cfg -Zremap-cwd-prefix=. -Zallow-features=' && test \"$RUSTC_BOOTSTRAP\" = 1",
