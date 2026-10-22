@@ -1479,6 +1479,11 @@ fn learned_incremental_state_seeds_another_checkout_by_default() {
 
 #[test]
 fn incremental_seed_keeps_the_donors_thin_lto_state_linkable() {
+    // Before 1.98 mbx seeds nothing, so there is no donor to protect.
+    if !rustc_relocates_incremental_state() {
+        return;
+    }
+    const MARKER: &str = "seeded-from-first";
     let store = tempfile::tempdir().unwrap();
     let first = tempfile::tempdir().unwrap();
     let second = tempfile::tempdir().unwrap();
@@ -1544,9 +1549,26 @@ fn incremental_seed_keeps_the_donors_thin_lto_state_linkable() {
     edit(first.path(), 1);
     let (learned, _) = build(first.path(), "first-edit");
     assert!(compiled_incrementally(&learned) >= 1, "{learned}");
+    // A seed copies the whole unit, so the marker shows the second checkout
+    // really started from the donor's state rather than from scratch.
+    let units = find_files(&incremental_checkout(store.path(), first.path()), |path| {
+        file_name_is(path, |name| name == "query-cache.bin")
+    });
+    assert!(!units.is_empty(), "the edit should leave rustc state");
+    for unit in &units {
+        // <unit>/<crate>-<hash>/<session>/query-cache.bin
+        std::fs::write(unit.ancestors().nth(3).unwrap().join(MARKER), b"").unwrap();
+    }
     build(second.path(), "second-initial");
     edit(second.path(), 2);
     build(second.path(), "second-edit");
+    assert!(
+        !find_files(&incremental_checkout(store.path(), second.path()), |path| {
+            file_name_is(path, |name| name == MARKER)
+        })
+        .is_empty(),
+        "the second checkout should be seeded from the first"
+    );
     // Check out the receiver's revision in place in the donor. A hard-linked
     // seed makes this build fail to link with an undefined *.llvm.* symbol.
     edit(first.path(), 2);
