@@ -291,7 +291,7 @@ pub(crate) fn collect(
     hot_floor: bool,
     backstop_budget: Option<u64>,
 ) -> Result<PruneOutcome> {
-    let swept_bytes = if dry_run { 0 } else { sweep_retired(root) };
+    let swept_bytes = sweep_retired(root, dry_run);
     let now = now_secs();
     let Snapshot {
         entries,
@@ -525,14 +525,14 @@ pub(crate) fn collect(
 /// link goes is forgotten in the ledger whichever owners still reference it:
 /// the data is gone. Other files are released by their owners as before.
 /// Delete retired trees a crash or an upgrade left behind, returning the bytes
-/// freed.
+/// freed. A preview deletes nothing and returns what deleting would free.
 ///
 /// They are outside the sweep's snapshot, so they get an accounting of their
 /// own under the same rule unit removal follows: all of them are measured
 /// together and a file is credited only when its last link goes. A file
 /// linked from two retired trees counts once, and one still linked from a
 /// live checkout frees nothing.
-fn sweep_retired(root: &Path) -> u64 {
+fn sweep_retired(root: &Path, dry_run: bool) -> u64 {
     let mut trees = retired_children(root);
     for entry in nested_entries(root) {
         if entry.file_type().is_ok_and(|kind| kind.is_dir())
@@ -541,6 +541,9 @@ fn sweep_retired(root: &Path) -> u64 {
         {
             trees.extend(retired_children(&entry.path().join("blake3")));
         }
+    }
+    if dry_run {
+        return reclaimable(&trees);
     }
     let mut inodes = Inodes::default();
     for tree in &trees {
@@ -551,6 +554,31 @@ fn sweep_retired(root: &Path) -> u64 {
         remove_tree(tree, false, &mut inodes);
     }
     measured.saturating_sub(inodes.bytes)
+}
+
+/// What deleting `trees` would free: each file once, and only when every link
+/// it has is inside them, which is when a real removal would credit it.
+fn reclaimable(trees: &[PathBuf]) -> u64 {
+    let mut files: HashMap<FileKey, (u64, u64, Option<u64>)> = HashMap::new();
+    for tree in trees {
+        let mut pending = vec![tree.clone()];
+        while let Some(path) = pending.pop() {
+            let Ok(metadata) = std::fs::symlink_metadata(&path) else {
+                continue;
+            };
+            if metadata.is_dir() {
+                pending.extend(nested_entries(&path).into_iter().map(|entry| entry.path()));
+            } else if metadata.is_file() {
+                let (key, links) = file_identity(&path, &metadata);
+                files.entry(key).or_insert((metadata.len(), 0, links)).1 += 1;
+            }
+        }
+    }
+    files
+        .values()
+        .filter(|(_, seen, links)| links.is_some_and(|links| *seen >= links))
+        .map(|(bytes, ..)| bytes)
+        .sum()
 }
 
 fn retired_children(parent: &Path) -> Vec<PathBuf> {
@@ -3002,7 +3030,8 @@ mod tests {
         assert_eq!(stats(cache.path()).unwrap().directories, 1);
         assert_eq!(stats(cache.path()).unwrap().units, 0);
         assert_eq!(workspaces(cache.path()).unwrap(), [workspace.path()]);
-        collect(cache.path(), None, None, true, false, None).unwrap();
+        let preview = collect(cache.path(), None, None, true, false, None).unwrap();
+        assert_eq!(preview.removed_bytes, bytes);
         assert!(retired.iter().all(|path| path.exists()));
         let outcome = collect(cache.path(), None, None, false, false, None).unwrap();
         assert_eq!(outcome.removed_bytes, bytes);
