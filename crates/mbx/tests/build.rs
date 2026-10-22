@@ -3369,7 +3369,11 @@ fn build_script_canonical_out_dir_restores_to_the_receiving_checkout() {
             .file_type()
             .is_symlink()
     );
-    let expected = find_files(&second.path().join("target/debug/build"), |path| {
+    // Cargo starts in the resolved checkout directory, even when the temporary
+    // directory has a symlinked parent (such as /var on macOS). Keep target
+    // unresolved so this still checks that restoration uses the checkout.
+    let receiving_checkout = second.path().canonicalize().unwrap();
+    let expected = find_files(&receiving_checkout.join("target/debug/build"), |path| {
         path.ends_with("out/dep.txt")
     })
     .into_iter()
