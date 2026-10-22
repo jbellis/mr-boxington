@@ -1,12 +1,18 @@
 name: link-discussion
 
 on:
-  pull_request:
+  # A merged pull request from a fork only gets a write token under
+  # pull_request_target, which the action needs to comment on the discussion.
+  # It reads the pull request body and never checks out or runs its code.
+  # jactionlint ignore=dangerous-triggers
+  pull_request_target:
     types: [closed]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
+
+permissions: {}
 
 jobs:
   link-discussion:
