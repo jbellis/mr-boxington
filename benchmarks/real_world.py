@@ -541,6 +541,10 @@ class Runner:
 
     def stop_kache(self, *, subject: dict[str, object], checkout: Path, store: Path) -> None:
         """Stop the daemon for this cell before its scratch directory is removed."""
+        kache = shutil.which("kache")
+        if kache is None:
+            # The trial was skipped before any daemon could start.
+            return
         environment = self.base_environment(subject, checkout / "target", default_target=True)
         environment.update(
             {
@@ -550,7 +554,7 @@ class Runner:
             }
         )
         subprocess.run(
-            [shutil.which("kache") or "kache", "daemon", "stop"],
+            [kache, "daemon", "stop"],
             cwd=checkout,
             env=environment,
             text=True,

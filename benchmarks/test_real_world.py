@@ -416,6 +416,17 @@ class WorktreeScenarioTest(unittest.TestCase):
                 )
         self.assertTrue(runner.stopped)
 
+    def test_stopping_kache_that_is_not_installed_does_nothing(self) -> None:
+        # A missing kache skips the trial, but the worktree scenario still
+        # cleans up in `finally`; that cleanup must not turn the skip into a
+        # FileNotFoundError.
+        runner = real_world.Runner(Path("/out"), Path("/cargo-home"), Path("/mbx"))
+        with mock.patch.object(real_world.shutil, "which", return_value=None), mock.patch.object(
+            real_world.subprocess, "run"
+        ) as run:
+            runner.stop_kache(subject={}, checkout=Path("/checkout"), store=Path("/store"))
+        run.assert_not_called()
+
     def test_git_commands_ignore_outer_repository_variables(self) -> None:
         inherited = {
             "GIT_DIR": "/other/.git",
