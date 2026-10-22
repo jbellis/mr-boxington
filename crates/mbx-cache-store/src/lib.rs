@@ -786,9 +786,11 @@ pub fn import_archive_with_attachments(store: &Path, archive: &Path) -> Result<I
             kept_existing += 1;
         }
     }
-    log::debug!(
-        "cache import kept {kept_existing} intact existing results that differed from the bundle"
-    );
+    if kept_existing > 0 {
+        log::debug!(
+            "cache import kept {kept_existing} intact existing results that differed from the bundle"
+        );
+    }
     for task in manifest.tasks {
         merge_imported_manifest(store, task)?;
     }
