@@ -397,7 +397,10 @@ mbx cache import "$RUNNER_TEMP/mbx-cache.tar"
 ```
 
 Import accepts a tar archive or a directory. It consumes a directory: the
-objects move into the store and the directory is removed.
+objects move into the store and the directory is removed. If the store already
+has an intact result for an action, import keeps it even when the bundle's
+result differs, and continues importing the other actions. Damaged existing
+results can still be repaired by the bundle.
 
 The bundle also carries Cargo's scheduler state for each recorded workspace.
 When import runs from a matching checkout whose target directory is absent or

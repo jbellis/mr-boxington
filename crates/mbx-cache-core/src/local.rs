@@ -17,6 +17,17 @@ pub struct LocalActionCache {
     cas: LocalCas,
 }
 
+/// The result of publishing an action with first-writer semantics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ActionStoreOutcome {
+    /// Published a new result or repaired an invalid existing result.
+    Stored,
+    /// The same result was already present.
+    Unchanged,
+    /// An intact, different result was already present and was kept.
+    KeptExisting,
+}
+
 impl LocalCas {
     /// Create a local content-addressed store beneath `root`.
     pub fn new(root: impl Into<PathBuf>) -> Self {
@@ -333,6 +344,21 @@ impl LocalActionCache {
 
     /// Atomically publish an action result after validating all referenced objects.
     pub fn store(&self, result: &RemoteActionResult) -> Result<PathBuf> {
+        self.store_inner(result, false)?;
+        self.path_for(&result.action)
+    }
+
+    /// Publish a result, keeping an intact existing result for the same action.
+    /// Invalid existing records are repaired just as in [`Self::store`].
+    pub fn store_if_absent(&self, result: &RemoteActionResult) -> Result<ActionStoreOutcome> {
+        self.store_inner(result, true)
+    }
+
+    fn store_inner(
+        &self,
+        result: &RemoteActionResult,
+        keep_existing: bool,
+    ) -> Result<ActionStoreOutcome> {
         if result.version != 1 {
             bail!("unsupported local action result version");
         }
@@ -352,12 +378,15 @@ impl LocalActionCache {
         let replace_invalid = match self.find(&result.action) {
             Ok(Some(existing)) => {
                 if existing == *result {
-                    return Ok(destination);
+                    return Ok(ActionStoreOutcome::Unchanged);
                 }
                 // A different record is kept so a key never changes under a
                 // reader, unless its objects are gone or torn: then it can
                 // never be restored, and this result is the repair.
                 if self.is_intact(&existing) {
+                    if keep_existing {
+                        return Ok(ActionStoreOutcome::KeptExisting);
+                    }
                     bail!("local action key already has a different result");
                 }
                 true
@@ -376,15 +405,19 @@ impl LocalActionCache {
             temporary
                 .persist(&destination)
                 .map_err(|error| error.error)?;
-            return Ok(destination);
+            return Ok(ActionStoreOutcome::Stored);
         }
         match temporary.persist_noclobber(&destination) {
-            Ok(_) => Ok(destination),
-            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => self
-                .find(&result.action)?
-                .filter(|existing| existing == result)
-                .map(|_| destination)
-                .ok_or_else(|| eyre::eyre!("concurrent action write was invalid or conflicting")),
+            Ok(_) => Ok(ActionStoreOutcome::Stored),
+            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+                match self.find(&result.action)? {
+                    Some(existing) if existing == *result => Ok(ActionStoreOutcome::Unchanged),
+                    Some(existing) if keep_existing && self.is_intact(&existing) => {
+                        Ok(ActionStoreOutcome::KeptExisting)
+                    }
+                    _ => bail!("concurrent action write was invalid or conflicting"),
+                }
+            }
             Err(error) => Err(error.error.into()),
         }
     }
@@ -557,6 +590,7 @@ mod tests {
         };
 
         assert!(actions.store(&result).is_err());
+        assert!(actions.store_if_absent(&result).is_err());
         cas.store_bytes(&action, b"action").unwrap();
         cas.store_bytes(&metadata, b"metadata").unwrap();
         cas.store_bytes(&output_root, b"directory").unwrap();
@@ -625,13 +659,34 @@ mod tests {
         let (file, first) = publish(b"libx.rlib", b"built in checkout a");
         let (_, second) = publish(b"libx.rlib", b"built in checkout bb");
 
-        actions.store(&first).unwrap();
+        assert_eq!(
+            actions.store_if_absent(&first).unwrap(),
+            ActionStoreOutcome::Stored
+        );
+        assert_eq!(
+            actions.store_if_absent(&first).unwrap(),
+            ActionStoreOutcome::Unchanged
+        );
+        assert_eq!(
+            actions.store_if_absent(&second).unwrap(),
+            ActionStoreOutcome::KeptExisting
+        );
         let error = actions.store(&second).unwrap_err();
         assert!(error.to_string().contains("different result"));
         assert_eq!(actions.find(&action).unwrap(), Some(first));
 
         fs::remove_file(cas.path_for(&file).unwrap()).unwrap();
-        actions.store(&second).unwrap();
+        assert_eq!(
+            actions.store_if_absent(&second).unwrap(),
+            ActionStoreOutcome::Stored
+        );
+        assert_eq!(actions.find(&action).unwrap(), Some(second.clone()));
+
+        fs::write(actions.path_for(&action).unwrap(), b"truncated").unwrap();
+        assert_eq!(
+            actions.store_if_absent(&second).unwrap(),
+            ActionStoreOutcome::Stored
+        );
         assert_eq!(actions.find(&action).unwrap(), Some(second));
     }
 }

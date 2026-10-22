@@ -2364,3 +2364,97 @@ fn a_due_sweep_is_reported_without_being_claimed() {
     );
     assert!(sweep_is_due(store, Duration::ZERO));
 }
+
+#[test]
+fn import_keeps_intact_conflicting_results_and_imports_other_actions() {
+    for form in [ExportForm::Directory, ExportForm::Tar] {
+        let source = tempfile::tempdir().unwrap();
+        let destination = tempfile::tempdir().unwrap();
+        let workspace = source.path().join("workspace");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let output = store_object(source.path(), b"new artifact");
+        let conflict = store_result(source.path(), "same action", std::slice::from_ref(&output));
+        let other = store_result(source.path(), "other action", std::slice::from_ref(&output));
+        let identical = store_result(source.path(), "identical action", &[]);
+        let repair = store_result(
+            source.path(),
+            "damaged action",
+            std::slice::from_ref(&output),
+        );
+        let identity = "d".repeat(64);
+        record_build(
+            source.path(),
+            &identity,
+            &workspace,
+            &[
+                conflict.clone(),
+                other.clone(),
+                identical.clone(),
+                repair.clone(),
+            ],
+        );
+
+        let old_output = store_object(destination.path(), b"old artifact");
+        assert_eq!(
+            store_result(
+                destination.path(),
+                "same action",
+                std::slice::from_ref(&old_output)
+            ),
+            conflict
+        );
+        assert_eq!(
+            store_result(destination.path(), "identical action", &[]),
+            identical
+        );
+        let torn_output = store_object(destination.path(), b"torn artifact");
+        assert_eq!(
+            store_result(
+                destination.path(),
+                "damaged action",
+                std::slice::from_ref(&torn_output)
+            ),
+            repair
+        );
+        let destination_cas = LocalCas::new(destination.path());
+        std::fs::remove_file(destination_cas.path_for(&torn_output).unwrap()).unwrap();
+        let actions = LocalActionCache::new(destination.path());
+        let existing_path = actions.path_for(&conflict).unwrap();
+        let existing_bytes = std::fs::read(&existing_path).unwrap();
+        let bundle = source.path().join("bundle");
+        export_checkout_as(
+            source.path(),
+            &workspace,
+            &bundle,
+            ExportAdditions::default(),
+            form,
+        )
+        .unwrap();
+
+        let imported = import_archive(destination.path(), &bundle).unwrap();
+
+        assert_eq!(imported.actions, 4);
+        assert_eq!(std::fs::read(&existing_path).unwrap(), existing_bytes);
+        assert!(destination_cas.find(&old_output).unwrap().is_some());
+        assert!(destination_cas.find(&output).unwrap().is_some());
+        let source_actions = LocalActionCache::new(source.path());
+        for action in [&other, &identical, &repair] {
+            assert_eq!(
+                actions.find(action).unwrap(),
+                source_actions.find(action).unwrap()
+            );
+        }
+        assert_eq!(
+            task_manifest_actions(destination.path(), &identity)
+                .unwrap()
+                .len(),
+            4
+        );
+        if form == ExportForm::Directory {
+            assert!(
+                !bundle.exists(),
+                "successful import consumes the directory bundle"
+            );
+        }
+    }
+}

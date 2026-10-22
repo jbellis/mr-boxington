@@ -753,8 +753,9 @@ pub fn import_archive_with_attachments(store: &Path, archive: &Path) -> Result<I
     // a directory bundle's objects into the store, and a bundle cannot be
     // re-imported once that has happened, so every failure that can be moved
     // ahead of it should be: a malformed result has to fail while the bundle
-    // is still whole. What remains after this point is filesystem failure on
-    // the store itself, which a retry would not survive either.
+    // is still whole. Publication can still fail (for example on store I/O or
+    // a concurrent invalid action write); it does not roll back moved objects.
+    // Intact conflicting results follow the first-writer rule and are kept.
     let results = closure
         .results
         .iter()
@@ -778,9 +779,16 @@ pub fn import_archive_with_attachments(store: &Path, archive: &Path) -> Result<I
         cas.adopt_verified_file(&digest, &source)?;
     }
     let action_cache = mbx_cache_core::LocalActionCache::new(store);
+    let mut kept_existing = 0;
     for result in &results {
-        action_cache.store(result)?;
+        if action_cache.store_if_absent(result)? == mbx_cache_core::ActionStoreOutcome::KeptExisting
+        {
+            kept_existing += 1;
+        }
     }
+    log::debug!(
+        "cache import kept {kept_existing} intact existing results that differed from the bundle"
+    );
     for task in manifest.tasks {
         merge_imported_manifest(store, task)?;
     }
