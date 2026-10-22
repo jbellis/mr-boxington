@@ -54,6 +54,14 @@ impl RetiredTree {
     pub(crate) fn path(&self) -> &Path {
         &self.0
     }
+
+    pub(crate) fn bytes(&self) -> u64 {
+        crate::incremental::tree_bytes(self.path())
+    }
+
+    pub(crate) fn remove(self) -> io::Result<()> {
+        remove_tree(self.path())
+    }
 }
 
 pub(crate) fn is_retired_name(name: &OsStr) -> bool {
@@ -68,4 +76,76 @@ pub(crate) fn is_retired_name(name: &OsStr) -> bool {
                 })
         })
     })
+}
+
+#[derive(Default)]
+pub(crate) struct SweepOutcome {
+    pub(crate) removed: usize,
+    pub(crate) bytes: u64,
+}
+
+/// Retired names have no live users. Concurrent sweeps may remove the same
+/// name; a missing tree is already finished.
+pub(crate) fn sweep(parent: &Path) -> SweepOutcome {
+    let mut outcome = SweepOutcome::default();
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return outcome;
+    };
+    for entry in entries.flatten() {
+        if !is_retired_name(&entry.file_name()) {
+            continue;
+        }
+        let tree = RetiredTree(entry.path());
+        let bytes = tree.bytes();
+        if tree.remove().is_ok() {
+            outcome.removed += 1;
+            outcome.bytes = outcome.bytes.saturating_add(bytes);
+        }
+    }
+    outcome
+}
+
+/// Unlinking needs writable directories on Unix. Windows also requires
+/// clearing the read-only attribute on files before removing them.
+pub(crate) fn remove_tree(path: &Path) -> io::Result<()> {
+    let result = (|| {
+        let metadata = std::fs::symlink_metadata(path)?;
+        if !metadata.is_dir() {
+            #[cfg(not(unix))]
+            if metadata.is_file() {
+                let mut permissions = metadata.permissions();
+                #[allow(clippy::permissions_set_readonly_false)]
+                permissions.set_readonly(false);
+                std::fs::set_permissions(path, permissions)?;
+            }
+            return std::fs::remove_file(path);
+        }
+        let mut pending = vec![path.to_path_buf()];
+        while let Some(directory) = pending.pop() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(&directory, std::fs::Permissions::from_mode(0o755))?;
+            }
+            for entry in std::fs::read_dir(&directory)? {
+                let entry = entry?;
+                if entry.file_type()?.is_dir() {
+                    pending.push(entry.path());
+                } else {
+                    #[cfg(not(unix))]
+                    {
+                        let mut permissions = entry.metadata()?.permissions();
+                        #[allow(clippy::permissions_set_readonly_false)]
+                        permissions.set_readonly(false);
+                        std::fs::set_permissions(entry.path(), permissions)?;
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(path)
+    })();
+    match result {
+        Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
