@@ -275,7 +275,7 @@ pub(crate) struct ViewLease {
 impl ViewLease {
     /// Reserve a view exclusively without waiting for commands using it.
     pub(crate) fn reserve(root: &Path, workspace_root: &Path) -> Result<Option<Self>> {
-        Ok(try_reserve_view(&view_dir(root, workspace_root)).map(|file| Self { _file: file }))
+        Ok(try_reserve_view(&view_dir(root, workspace_root)))
     }
 
     /// Take a shared lock on `<root>/v1/<digest>.lock`, waiting for it.
@@ -290,6 +290,18 @@ impl ViewLease {
         file.lock_shared()
             .wrap_err_with(|| format!("could not lock {}", path.display()))?;
         Ok(Self { _file: file })
+    }
+}
+
+impl Drop for ViewLease {
+    fn drop(&mut self) {
+        // Closing the file would release the lock only if no other descriptor
+        // refers to the same open file. A child this process forks inherits
+        // every descriptor until it execs, and a lock on an inherited one
+        // outlives the drop here. Unlocking explicitly ends the lease now, so
+        // a collector or a replacement does not find the view in use by a
+        // command that has already let it go.
+        let _ = self._file.unlock();
     }
 }
 
@@ -335,7 +347,7 @@ fn open_view_lock(path: &Path) -> std::io::Result<std::fs::File> {
 /// The returned file holds the reservation until it is dropped. `None` means a
 /// command is using the view, or that the lock could not be taken for another
 /// reason; either way the view must be left alone.
-fn try_reserve_view(directory: &Path) -> Option<std::fs::File> {
+fn try_reserve_view(directory: &Path) -> Option<ViewLease> {
     let path = view_lock_path(directory);
     let file = match open_view_lock(&path) {
         Ok(file) => file,
@@ -348,7 +360,7 @@ fn try_reserve_view(directory: &Path) -> Option<std::fs::File> {
         }
     };
     match file.try_lock() {
-        Ok(()) => Some(file),
+        Ok(()) => Some(ViewLease { _file: file }),
         Err(std::fs::TryLockError::WouldBlock) => None,
         Err(std::fs::TryLockError::Error(error)) => {
             log::warn!(
@@ -1041,7 +1053,7 @@ struct ReplacedViewLocks {
     /// Cargo's build locks in the old view.
     _cargo: Vec<fslock::LockFile>,
     /// The old view's lease, held exclusively.
-    _reservation: Option<std::fs::File>,
+    _reservation: Option<ViewLease>,
 }
 
 impl ReplacedViewLocks {
