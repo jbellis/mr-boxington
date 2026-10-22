@@ -294,11 +294,15 @@ impl LocalActionCache {
             return Ok(None);
         }
         let bytes = fs::read(&path)?;
-        let result: RemoteActionResult = serde_json::from_slice(&bytes)?;
+        Ok(Some(Self::parse_record(&bytes, action)?))
+    }
+
+    fn parse_record(bytes: &[u8], action: &CacheDigest) -> Result<RemoteActionResult> {
+        let result: RemoteActionResult = serde_json::from_slice(bytes)?;
         if result.version != 1 || result.action != *action || canonical_json(&result)? != bytes {
-            bail!("local action result is invalid: {}", path.display());
+            bail!("local action result is invalid");
         }
-        Ok(Some(result))
+        Ok(result)
     }
 
     /// Whether the objects `result` names that this index can see are all
@@ -381,8 +385,16 @@ impl LocalActionCache {
             }
         }
         let destination = self.path_for(&result.action)?;
-        let replace_invalid = match self.find(&result.action) {
-            Ok(Some(existing)) => {
+        let parent = destination
+            .parent()
+            .expect("action-result path has a parent");
+        fs::create_dir_all(parent)?;
+        let mut pending = None;
+        for _ in 0..8 {
+            let slot = crate::ActionSlot::claim(&destination)?;
+            if let Some(bytes) = slot.read()?
+                && let Ok(existing) = Self::parse_record(&bytes, &result.action)
+            {
                 if existing == *result {
                     return Ok(ActionStoreOutcome::Unchanged);
                 }
@@ -397,55 +409,94 @@ impl LocalActionCache {
                         return Ok(ActionStoreOutcome::KeptExisting);
                     }
                 }
-                true
             }
-            Ok(None) => false,
-            Err(_) => true,
-        };
-        let parent = destination
-            .parent()
-            .expect("action-result path has a parent");
-        fs::create_dir_all(parent)?;
-        let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
-        temporary.write_all(&canonical_json(result)?)?;
-        temporary.flush()?;
-        if replace_invalid {
-            temporary
-                .persist(&destination)
-                .map_err(|error| error.error)?;
-            return Ok(ActionStoreOutcome::Stored);
-        }
-        match temporary.persist_noclobber(&destination) {
-            Ok(_) => Ok(ActionStoreOutcome::Stored),
-            Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                match self.find(&result.action) {
-                    Ok(Some(existing)) if existing == *result => Ok(ActionStoreOutcome::Unchanged),
-                    Ok(Some(existing))
-                        if keep_existing
-                            && self.is_intact(&existing)
-                            && is_restorable(&existing) =>
-                    {
-                        Ok(ActionStoreOutcome::KeptExisting)
-                    }
-                    _ if keep_existing => {
-                        error
-                            .file
-                            .persist(&destination)
-                            .map_err(|error| error.error)?;
-                        Ok(ActionStoreOutcome::Stored)
-                    }
-                    Err(error) => Err(error),
-                    _ => bail!("concurrent action write was invalid or conflicting"),
+            let temporary = if let Some(temporary) = pending.take() {
+                temporary
+            } else {
+                let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+                temporary.write_all(&canonical_json(result)?)?;
+                temporary.flush()?;
+                temporary
+            };
+            if slot.is_vacant() {
+                match slot.publish(temporary)? {
+                    crate::action_slot::Publish::Stored => return Ok(ActionStoreOutcome::Stored),
+                    crate::action_slot::Publish::Taken(temporary) => pending = Some(temporary),
                 }
+            } else {
+                slot.replace(temporary)?;
+                return Ok(ActionStoreOutcome::Stored);
             }
-            Err(error) => Err(error.error.into()),
         }
+        bail!("action record kept changing while publishing")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn concurrent_repair_keeps_the_winning_record() {
+        use crate::action_slot::tests::Holder;
+        use std::sync::mpsc;
+        use std::time::Duration;
+        let directory = tempfile::tempdir().unwrap();
+        let cas = LocalCas::new(directory.path());
+        let actions = LocalActionCache::new(directory.path());
+        let action = CacheDigest::blake3(b"action");
+        cas.store_bytes(&action, b"action").unwrap();
+        let metadata = CacheDigest::blake3(b"metadata");
+        cas.store_bytes(&metadata, b"metadata").unwrap();
+        let first = RemoteActionResult {
+            version: 1,
+            action: action.clone(),
+            metadata: None,
+            output_root: None,
+        };
+        let second = RemoteActionResult {
+            metadata: Some(metadata),
+            ..first.clone()
+        };
+        let path = actions.path_for(&action).unwrap();
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"damaged").unwrap();
+        let replacement = directory.path().join("replacement");
+        fs::write(&replacement, canonical_json(&first).unwrap()).unwrap();
+        let mut holder = Holder::start(&path, &replacement);
+        let writer = actions.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let thread = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(writer.store_unless_restorable(&second, |_| true))
+                .unwrap();
+        });
+        started_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        // A bounded receive checks that repair respects the other process's lock.
+        // The replacement and release themselves are ordered by pipe messages.
+        assert!(
+            matches!(
+                done_rx.recv_timeout(Duration::from_secs(1)),
+                Err(mpsc::RecvTimeoutError::Timeout)
+            ),
+            "repair completed while another process held the damaged incumbent"
+        );
+        holder.command("replace");
+        holder.expect("replaced");
+        holder.command("release");
+        holder.expect("released");
+        assert_eq!(
+            done_rx
+                .recv_timeout(Duration::from_secs(20))
+                .unwrap()
+                .unwrap(),
+            ActionStoreOutcome::KeptExisting
+        );
+        thread.join().unwrap();
+        assert_eq!(actions.find(&action).unwrap(), Some(first));
+    }
 
     #[test]
     fn stores_and_validates_blobs_atomically() {

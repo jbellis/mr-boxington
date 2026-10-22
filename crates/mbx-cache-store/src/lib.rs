@@ -13,8 +13,9 @@ mod events;
 
 use eyre::{Context, Result};
 use mbx_cache_core::{
-    ActionPrediction, CacheDigest, CacheDirectory, LocalCas, RemoteActionResult, RustcMetadata,
-    TaskActionManifest, is_task_identity, merge_task_action_predictions, task_manifest_actions,
+    ActionPrediction, ActionSlot, CacheDigest, CacheDirectory, LocalCas, RemoteActionResult,
+    RustcMetadata, TaskActionManifest, is_task_identity, merge_task_action_predictions,
+    task_manifest_actions,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1778,20 +1779,47 @@ fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome
     // store that is over budget on results alone still needs the sweep.
     let cas = LocalCas::new(store);
     for entry in &results {
-        if action_result_is_dangling(&cas, &entry.path, &virtually_removed)? {
-            match if dry_run {
-                Removal::Removed
-            } else {
-                remove(&entry.path)?
-            } {
-                Removal::Removed => {
-                    live_bytes = live_bytes.saturating_sub(entry.size);
-                    outcome.removed_action_results += 1;
-                    outcome.removed_bytes += entry.size;
-                }
-                Removal::Missing => live_bytes = live_bytes.saturating_sub(entry.size),
-                Removal::Blocked => {}
+        let removal = if dry_run {
+            if !action_result_is_dangling(&cas, &entry.path, &virtually_removed)? {
+                continue;
             }
+            Removal::Removed
+        } else {
+            match ActionSlot::try_claim(&entry.path)? {
+                None => Removal::Blocked,
+                Some(slot) => match slot.read()? {
+                    None => Removal::Missing,
+                    Some(bytes) => {
+                        if !action_result_bytes_are_dangling(&cas, &bytes, &virtually_removed)? {
+                            continue;
+                        }
+                        match slot.remove() {
+                            Ok(true) => Removal::Removed,
+                            Ok(false) => Removal::Missing,
+                            // Open files may prevent deletion on Windows, just
+                            // as they do in the other eviction paths.
+                            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                                log::debug!("could not evict {}: {error}", entry.path.display());
+                                Removal::Blocked
+                            }
+                            Err(error) => {
+                                return Err(error).wrap_err_with(|| {
+                                    format!("failed to evict {}", entry.path.display())
+                                });
+                            }
+                        }
+                    }
+                },
+            }
+        };
+        match removal {
+            Removal::Removed => {
+                live_bytes = live_bytes.saturating_sub(entry.size);
+                outcome.removed_action_results += 1;
+                outcome.removed_bytes += entry.size;
+            }
+            Removal::Missing => live_bytes = live_bytes.saturating_sub(entry.size),
+            Removal::Blocked => {}
         }
     }
 
@@ -2423,8 +2451,16 @@ fn action_result_is_dangling(
             return Err(error).wrap_err_with(|| format!("failed to read {}", path.display()));
         }
     };
+    action_result_bytes_are_dangling(cas, &bytes, virtually_removed)
+}
+
+fn action_result_bytes_are_dangling(
+    cas: &LocalCas,
+    bytes: &[u8],
+    virtually_removed: &HashSet<PathBuf>,
+) -> Result<bool> {
     // An unparseable result is already useless; the cache rejects it on read.
-    let Ok(result) = serde_json::from_slice::<RemoteActionResult>(&bytes) else {
+    let Ok(result) = serde_json::from_slice::<RemoteActionResult>(bytes) else {
         return Ok(false);
     };
     for digest in [
