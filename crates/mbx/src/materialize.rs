@@ -738,6 +738,30 @@ pub(crate) fn normalize_output_text(bytes: &[u8], mappings: &[PathMapping]) -> V
     normalized
 }
 
+/// Include resolved aliases when normalizing build-script text. Restoration
+/// still uses the original mappings, so an alias becomes the receiver's literal
+/// path rather than its resolved storage location.
+pub(crate) fn normalize_output_text_with_aliases(
+    bytes: &[u8],
+    mappings: &[PathMapping],
+) -> Vec<u8> {
+    normalize_output_text(bytes, &with_resolved_root_aliases(mappings))
+}
+
+/// The literal and fully resolved roots whose spellings a build script may
+/// emit. Missing roots retain their literal mapping without inventing an alias.
+pub(crate) fn with_resolved_root_aliases(mappings: &[PathMapping]) -> Vec<PathMapping> {
+    let mut aliases = mappings.to_vec();
+    for mapping in mappings {
+        if let Ok(resolved) = mapping.root.canonicalize()
+            && resolved != mapping.root
+        {
+            aliases.push(PathMapping::new(resolved, &mapping.placeholder));
+        }
+    }
+    aliases
+}
+
 /// Rewrite placeholders in a cached text output back into this machine's paths.
 pub(crate) fn denormalize_output_text(bytes: &[u8], mappings: &[PathMapping]) -> Vec<u8> {
     let mut text = bytes.to_vec();
@@ -790,6 +814,10 @@ fn root_spellings(mappings: &[PathMapping]) -> Vec<(String, String)> {
             spellings.push((spelling, format!("${{{}{suffix}}}", mapping.placeholder)));
         }
     }
+    // An alias may lie under another mapped root, and escaped spellings may
+    // be longer than literal ones. Compare all spellings together so a broad
+    // root cannot consume a more specific alias before it is normalized.
+    spellings.sort_by_key(|(root, _)| std::cmp::Reverse(root.len()));
     spellings
 }
 
@@ -1280,5 +1308,59 @@ mod materialization_tests {
 
         assert!(!linked.exists(), "a read-only restore is removed");
         assert!(written.exists(), "an ordinary output is left alone");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    #[test]
+    fn resolved_aliases_prefer_specific_roots_and_restore_literal_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let root = directory.path().canonicalize().unwrap();
+        let storage = root.join("storage");
+        let managed = storage.join("managed");
+        std::fs::create_dir_all(managed.join("out")).unwrap();
+        let publisher = root.join("publisher");
+        let workspace = root.join("resolved-workspace");
+        std::fs::create_dir(&workspace).unwrap();
+        std::os::unix::fs::symlink(&workspace, &publisher).unwrap();
+        std::os::unix::fs::symlink(&managed, publisher.join("target")).unwrap();
+        let mappings = [
+            PathMapping::new(&storage, "storage"),
+            PathMapping::new(&publisher, "workspace"),
+            PathMapping::new(publisher.join("target"), "target"),
+            PathMapping::new(publisher.join("target/out"), "build_script_out_dir"),
+        ];
+        let original = format!(
+            "{}/dep.txt\n{}/other\n{}/target/out/dep.txt\n{}/managed-backup/keep\n{}/src.rs\n",
+            managed.join("out").display(),
+            managed.display(),
+            publisher.display(),
+            storage.display(),
+            workspace.display(),
+        );
+        let normalized = normalize_output_text_with_aliases(original.as_bytes(), &mappings);
+        assert_eq!(
+            String::from_utf8_lossy(&normalized),
+            "${build_script_out_dir}/dep.txt\n${target}/other\n${build_script_out_dir}/dep.txt\n${storage}/managed-backup/keep\n${workspace}/src.rs\n",
+        );
+        // The receiving target is itself a symlink, with a different resolved
+        // destination: restoring must still choose its literal target path.
+        let receiver = root.join("receiver");
+        let receiving_view = root.join("different-view");
+        std::fs::create_dir_all(receiving_view.join("out")).unwrap();
+        std::fs::create_dir(&receiver).unwrap();
+        std::os::unix::fs::symlink(&receiving_view, receiver.join("target")).unwrap();
+        let receiving = [
+            PathMapping::new(&storage, "storage"),
+            PathMapping::new(&receiver, "workspace"),
+            PathMapping::new(receiver.join("target"), "target"),
+            PathMapping::new(receiver.join("target/out"), "build_script_out_dir"),
+        ];
+        assert_eq!(
+            denormalize_output_text(&normalized, &receiving),
+            format!("{0}/target/out/dep.txt\n{0}/target/other\n{0}/target/out/dep.txt\n{1}/managed-backup/keep\n{0}/src.rs\n", receiver.display(), storage.display()).as_bytes(),
+        );
     }
 }

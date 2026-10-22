@@ -2,9 +2,9 @@
 
 use crate::ar::ArDeterminism;
 use crate::materialize::{
-    apply_file_mode, denormalize_output_text, file_mode, find_blobs, normalize_output_text,
-    read_canonical_blob, read_verified_blob, record_action_hit, replay_bytes, staging_directory,
-    validate_file_mode,
+    apply_file_mode, denormalize_output_text, file_mode, find_blobs,
+    normalize_output_text_with_aliases, read_canonical_blob, read_verified_blob, record_action_hit,
+    replay_bytes, staging_directory, validate_file_mode,
 };
 use crate::session;
 use eyre::{Context as _, Result, bail};
@@ -751,11 +751,9 @@ fn build_action(
         inputs: &inputs,
         kind: ADAPTER,
         out_dir: out_dir.as_deref(),
-        // Bumped with `archive_timestamps`, then again when a script that
-        // wrote into its declared inputs stopped being recorded: an entry
-        // stored before either cannot say which policy produced it, so it is
-        // not reused.
-        version: 4,
+        // Results stored before resolved stream roots were normalized may
+        // still contain the publishing checkout's canonical target paths.
+        version: 5,
     })?;
     let digest = CacheDigest::blake3(&bytes);
     Ok((bytes, digest))
@@ -1402,12 +1400,12 @@ fn publish(action: &CacheDigest, action_bytes: &[u8], stdout: &[u8], stderr: &[u
     let stdout = stage_bytes(
         staging.path(),
         "stdout",
-        &normalize_output_text(stdout, &mappings),
+        &normalize_output_text_with_aliases(stdout, &mappings),
     )?;
     let stderr = stage_bytes(
         staging.path(),
         "stderr",
-        &normalize_output_text(stderr, &mappings),
+        &normalize_output_text_with_aliases(stderr, &mappings),
     )?;
     let action_blob = stage_bytes(staging.path(), "action", action_bytes)?;
     let metadata = canonical_json(&Metadata {
@@ -1628,8 +1626,11 @@ fn build_script_mappings_with_env(
 }
 
 fn normalize_environment_value(value: &str, mappings: &[PathMapping]) -> String {
-    String::from_utf8(normalize_output_text(value.as_bytes(), mappings))
-        .expect("normalizing UTF-8 paths preserves UTF-8")
+    String::from_utf8(normalize_output_text_with_aliases(
+        value.as_bytes(),
+        mappings,
+    ))
+    .expect("normalizing UTF-8 paths preserves UTF-8")
 }
 
 /// Cargo-provided values that are implicit inputs to the build-script unit.

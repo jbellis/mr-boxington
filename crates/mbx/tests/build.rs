@@ -3299,6 +3299,122 @@ fn build_script_execution_and_out_dir_restore_across_checkouts() {
     assert!(count(&warm, "hits") >= 1, "build script should hit: {warm}");
 }
 
+/// Canonical OUT_DIR strings in directives must follow the receiving checkout,
+/// even though Cargo's target path names a symlink to a different managed view.
+#[cfg(unix)]
+#[test]
+fn build_script_canonical_out_dir_restores_to_the_receiving_checkout() {
+    let store = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    for project in [first.path(), second.path()] {
+        std::fs::create_dir_all(project.join("src")).unwrap();
+        std::fs::write(
+            project.join("Cargo.toml"),
+            "[package]\nname = \"canonical-out-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("build.rs"),
+            r#"fn main() {
+    println!("cargo:rerun-if-changed=build.rs");
+    let out = std::fs::canonicalize(std::env::var_os("OUT_DIR").unwrap()).unwrap();
+    std::fs::write(out.join("dep.txt"), "portable\n").unwrap();
+    std::fs::write("ran", "executed").unwrap();
+    println!("cargo:rustc-env=DEP={}", out.join("dep.txt").display());
+    eprintln!("generated {}", out.join("dep.txt").display());
+}
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            project.join("src/main.rs"),
+            "fn main() { println!(\"{}\", env!(\"DEP\")); assert_eq!(std::fs::read_to_string(env!(\"DEP\")).unwrap(), \"portable\\n\"); }\n",
+        )
+        .unwrap();
+        generate_lockfile(project);
+    }
+    let settings = [
+        ("MBX_TARGET_VIEWS", "1"),
+        ("MBX_BUILD_SCRIPT_EXECUTION", "1"),
+        ("MBX_CACHE_LINKS", "0"),
+        ("MBX_INCREMENTAL", "0"),
+        ("MBX_SEED_INCREMENTAL", "0"),
+    ];
+    build_with(
+        first.path(),
+        store.path(),
+        &reports.path().join("first.json"),
+        &settings,
+    );
+    let (warm, stderr) = build_with(
+        second.path(),
+        store.path(),
+        &reports.path().join("second.json"),
+        &settings,
+    );
+    assert!(first.path().join("ran").exists());
+    assert!(
+        !second.path().join("ran").exists(),
+        "build script executed instead of hitting: {warm}\n{stderr}"
+    );
+    assert!(
+        count(&warm, "hits") >= 1,
+        "expected a build-script execution hit: {warm}"
+    );
+    assert!(
+        std::fs::symlink_metadata(second.path().join("target"))
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    let expected = find_files(&second.path().join("target/debug/build"), |path| {
+        path.ends_with("out/dep.txt")
+    })
+    .into_iter()
+    .next()
+    .expect("the receiving checkout should restore dep.txt");
+    let published = find_files(&first.path().join("target/debug/build"), |path| {
+        path.ends_with("out/dep.txt")
+    })
+    .into_iter()
+    .next()
+    .unwrap();
+    // The publisher's file must not be needed after the receiver restored it.
+    std::fs::remove_file(published).unwrap();
+    let output = Command::new(second.path().join("target/debug/canonical-out-fixture"))
+        .output()
+        .unwrap();
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        expected.to_str().unwrap(),
+        "the directive retained the publishing view; hits: {warm}\nstderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let replayed_stderr = find_files(&second.path().join("target/debug/build"), |path| {
+        file_name_is(path, |name| name == "stderr")
+    })
+    .into_iter()
+    .map(|path| std::fs::read_to_string(path).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n");
+    assert!(
+        replayed_stderr.contains(&format!("generated {}", expected.display())),
+        "stderr should use the receiving checkout's literal spelling: {replayed_stderr}"
+    );
+    eprintln!(
+        "restored DEP={}; publisher file removed; execution cache hits={}",
+        expected.display(),
+        count(&warm, "hits")
+    );
+}
+
 /// A script that writes into an input it declared saw a different tree than the
 /// one its result is keyed to: the key is taken from the tree the run left. A
 /// restore of that result would hand back output the script no longer produces
