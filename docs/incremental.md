@@ -42,6 +42,12 @@ so a later compile cannot change the donor's session. rustc validates that state
 against the current sources, so the first edit in a new checkout can compile
 incrementally too.
 
+Upgrading from a version that seeded state with hard links discards learned
+incremental state once: those links let one checkout's compiler overwrite
+another checkout's state. A checkout another build is using at that moment is
+discarded at a later build once it is idle. Stop builds running under older mbx
+versions before upgrading, since an older version can still create shared files.
+
 For these compilations only, mbx adds `-Zremap-cwd-prefix=.` and makes paths
 under the checkout relative. Cargo's arguments and shared cache keys stay the
 same. Debug info records `.` as the working directory for crates being edited,
