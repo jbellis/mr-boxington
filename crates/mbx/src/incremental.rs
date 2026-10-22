@@ -406,19 +406,56 @@ pub(crate) fn collect(
             outcome.skipped_active_units += 1;
             continue;
         };
-        if remove_tree(&unit.directory, dry_run, &mut inodes) {
-            // A real removal credited what it freed, link by link; a preview
-            // removes nothing and estimates by ownership.
+        // Detach the unit and its stamps before another lease can recreate
+        // either name. The recursive walk runs without the registrar.
+        let mut retired_records = Vec::new();
+        let retired_unit = if dry_run {
+            None
+        } else {
+            let tree = match RetiredTree::retire(&unit.directory) {
+                Ok(tree) => tree,
+                Err(error) => {
+                    log::warn!(
+                        "could not retire incremental unit {}: {error}",
+                        unit.directory.display()
+                    );
+                    continue;
+                }
+            };
+            for record in &unit.records {
+                match RetiredTree::retire(record) {
+                    Ok(Some(record)) => retired_records.push(record),
+                    Ok(None) => {}
+                    Err(error) => {
+                        log::warn!(
+                            "could not retire incremental record {}: {error}",
+                            record.display()
+                        );
+                        kept_records.insert(index);
+                    }
+                }
+            }
+            tree
+        };
+        drop(guard);
+        let unit_removed = dry_run
+            || retired_unit
+                .as_ref()
+                .is_none_or(|tree| remove_tree(tree.path(), false, &mut inodes));
+        if unit_removed {
             if dry_run {
                 inodes.release(&unit.files);
             }
-            // Not short-circuited: a stamp left behind would outlive its unit.
-            let records_removed = unit
-                .records
-                .iter()
-                .filter(|record| !remove_tree(record, dry_run, &mut inodes))
-                .count()
-                == 0;
+            let records_removed = if dry_run {
+                true
+            } else {
+                // Try every stamp even if an earlier deletion failed.
+                retired_records
+                    .iter()
+                    .filter(|record| !remove_tree(record.path(), false, &mut inodes))
+                    .count()
+                    == 0
+            };
             if records_removed {
                 if dry_run {
                     inodes.release(&unit.record_files);
@@ -489,14 +526,35 @@ pub(crate) fn collect(
         {
             continue;
         }
-        if remove_tree(&entry.directory, dry_run, &mut inodes) {
-            if dry_run {
-                inodes.release(&entry.files);
+        let tree = if dry_run {
+            None
+        } else {
+            let tree = match RetiredTree::retire(&entry.directory) {
+                Ok(tree) => tree,
+                Err(error) => {
+                    log::warn!(
+                        "could not retire incremental checkout {}: {error}",
+                        entry.directory.display()
+                    );
+                    continue;
+                }
+            };
+            if let Some(tree) = &tree {
+                unlink_retired_checkout_record(tree, Some(&mut inodes))?;
             }
+            guard.cleanup();
+            tree
+        };
+        drop(guard);
+        let removed = if dry_run {
+            inodes.release(&entry.files);
+            true
+        } else {
+            tree.as_ref()
+                .is_none_or(|tree| remove_tree(tree.path(), false, &mut inodes))
+        };
+        if removed {
             outcome.removed_directories += 1;
-            if !dry_run {
-                guard.cleanup();
-            }
         }
     }
     outcome.removed_bytes = outcome
@@ -1123,6 +1181,14 @@ pub(crate) enum RemoveOutcome {
 
 /// Remove learned incremental state for exactly one workspace.
 pub(crate) fn remove_workspace(root: &Path, workspace_root: &Path) -> Result<RemoveOutcome> {
+    remove_workspace_with(root, workspace_root, || {})
+}
+
+fn remove_workspace_with(
+    root: &Path,
+    workspace_root: &Path,
+    on_retired: impl FnOnce(),
+) -> Result<RemoveOutcome> {
     let key = checkout_key(workspace_root);
     let directory = root.join(&key);
     let Some(record) = read_record(&directory.join(RECORD_FILE)) else {
@@ -1135,18 +1201,49 @@ pub(crate) fn remove_workspace(root: &Path, workspace_root: &Path) -> Result<Rem
     if guard.active {
         return Ok(RemoveOutcome::Active);
     }
-    let bytes = tree_bytes(&directory);
-    match std::fs::remove_dir_all(&directory) {
-        Ok(()) => {
-            guard.cleanup();
-            Ok(RemoveOutcome::Removed(bytes))
-        }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            guard.cleanup();
-            Ok(RemoveOutcome::Removed(0))
-        }
-        Err(error) => Err(error.into()),
+    let tree = RetiredTree::retire(&directory)?;
+    let record_bytes = tree
+        .as_ref()
+        .map(|tree| unlink_retired_checkout_record(tree, None))
+        .transpose()?
+        .unwrap_or(0);
+    guard.cleanup();
+    drop(guard);
+    on_retired();
+    let bytes = tree
+        .as_ref()
+        .map_or(0, RetiredTree::bytes)
+        .saturating_add(record_bytes);
+    if let Some(tree) = tree {
+        tree.remove()?;
     }
+    Ok(RemoveOutcome::Removed(bytes))
+}
+
+/// Remove the record under the registrar so older binaries cannot discover
+/// the retired checkout as a seed donor, even though they scan its name.
+fn unlink_retired_checkout_record(
+    tree: &RetiredTree,
+    inodes: Option<&mut Inodes>,
+) -> std::io::Result<u64> {
+    let path = tree.path().join(RECORD_FILE);
+    let metadata = match std::fs::symlink_metadata(&path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    }
+    if let Some(inodes) = inodes {
+        let (key, links) = file_identity(&path, &metadata);
+        if links == Some(1) {
+            inodes.forget(&key);
+        }
+    }
+    Ok(metadata.len())
 }
 
 struct Entry {
@@ -2913,6 +3010,77 @@ mod tests {
         assert_eq!(outcome.remaining_units, 1);
         assert!(untracked_unit.exists());
         assert!(directory.exists());
+    }
+
+    #[test]
+    fn removal_releases_registrar_before_deleting_and_allows_same_workspace() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let checkout = touch(cache.path(), workspace.path()).unwrap();
+        let live = checkout.directory.clone();
+        std::fs::write(live.join("old-state"), b"old").unwrap();
+        let expected_bytes = tree_bytes(&live);
+        drop(checkout);
+        // This separate open must observe a held registrar. The pre-retirement
+        // implementation kept this guard through the recursive deletion.
+        let guard = deletion_guard(cache.path(), &checkout_key(workspace.path()), true).unwrap();
+        let mut probe = fslock::LockFile::open(&registrar_path(cache.path())).unwrap();
+        assert!(!probe.try_lock().unwrap());
+        drop(guard);
+        let mut fresh = None;
+        let mut retired = None;
+        let outcome = remove_workspace_with(cache.path(), workspace.path(), || {
+            assert!(
+                probe.try_lock().unwrap(),
+                "deletion must not hold the registrar"
+            );
+            probe.unlock().unwrap();
+            let path = std::fs::read_dir(cache.path())
+                .unwrap()
+                .flatten()
+                .find(|entry| retired::is_retired_name(&entry.file_name()))
+                .unwrap()
+                .path();
+            assert!(path.join("old-state").exists());
+            assert!(!path.join(RECORD_FILE).exists());
+            fresh = Some(touch(cache.path(), workspace.path()).unwrap());
+            assert!(live.exists());
+            assert!(path.exists());
+            retired = Some(path);
+        })
+        .unwrap();
+        assert_eq!(outcome, RemoveOutcome::Removed(expected_bytes));
+        assert!(!retired.unwrap().exists());
+        assert!(fresh.unwrap().directory.exists());
+        assert!(!live.join("old-state").exists());
+    }
+
+    #[test]
+    fn retired_checkouts_and_units_are_hidden_and_swept() {
+        let cache = tempfile::tempdir().unwrap();
+        let unit = "blake3/0123456789";
+        let own = checkout_with_sessions(cache.path(), "own", 40, unit, &[]);
+        let donor = checkout_with_sessions(cache.path(), "donor", 20, unit, &["s-2-b-finished"]);
+        let retired = donor.with_file_name("donor.retired-123-leftover");
+        std::fs::rename(&donor, &retired).unwrap();
+        let nested = own.join("blake3/unused.retired-123-leftover");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("state"), b"nested").unwrap();
+        let bytes = tree_bytes(&retired) + tree_bytes(&nested);
+        assert_eq!(stats(cache.path()).unwrap().directories, 1);
+        assert_eq!(stats(cache.path()).unwrap().units, 0);
+        assert_eq!(
+            workspaces(cache.path()).unwrap(),
+            [PathBuf::from("/work/own")]
+        );
+        assert_eq!(seed(&own, unit).unwrap(), None);
+        collect(cache.path(), None, None, true, false, None).unwrap();
+        assert!(retired.exists());
+        assert!(nested.exists());
+        let outcome = collect(cache.path(), None, None, false, false, None).unwrap();
+        assert!(outcome.removed_bytes >= bytes);
+        assert!(!retired.exists());
+        assert!(!nested.exists());
     }
 
     #[test]

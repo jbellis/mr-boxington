@@ -559,19 +559,73 @@ fn a_collected_tree_leaves_no_half_removed_directory_under_its_name() {
     let stable = stabilize(&source, &root).unwrap().unwrap();
     release_all_under(&root);
 
-    let name = stable.file_name().unwrap().to_string_lossy().into_owned();
-    assert_eq!(discard_tree(&root, &name, &stable).unwrap(), 0);
+    RetiredTree::retire(&stable)
+        .unwrap()
+        .unwrap()
+        .remove()
+        .unwrap();
 
     assert!(!stable.exists());
     let leftovers: Vec<_> = std::fs::read_dir(&root)
         .unwrap()
         .flatten()
-        .filter(|entry| {
-            entry
-                .file_name()
-                .to_string_lossy()
-                .starts_with(STAGING_PREFIX)
-        })
+        .filter(|entry| retired::is_retired_name(&entry.file_name()))
         .collect();
     assert!(leftovers.is_empty(), "the renamed tree is deleted too");
+}
+
+#[test]
+fn collection_releases_registrar_before_deleting_retired_sources() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("out-dirs");
+    let source = directory.path().join("source");
+    write_tree(&source, &[("sub/generated.rs", b"generated")]);
+    let stable = stabilize(&source, &root).unwrap().unwrap();
+    release_all_under(&root);
+    let held = registrar(&root).unwrap();
+    let mut probe = fslock::LockFile::open(&root.join(REGISTRAR)).unwrap();
+    assert!(!probe.try_lock().unwrap());
+    drop(held);
+    let mut retired = None;
+    let outcome = collect_with(&root, Some(0), None, false, || {
+        assert!(
+            probe.try_lock().unwrap(),
+            "deletion must not hold the registrar"
+        );
+        probe.unlock().unwrap();
+        assert!(!stable.exists());
+        let path = std::fs::read_dir(&root)
+            .unwrap()
+            .flatten()
+            .find(|entry| retired::is_retired_name(&entry.file_name()))
+            .unwrap()
+            .path();
+        assert!(path.join("sub/generated.rs").exists());
+        assert!(!leases_dir(&root, &stable.file_name().unwrap().to_string_lossy()).exists());
+        retired = Some(path);
+        // A compilation may republish the same digest while the old tree
+        // still awaits deletion. Only the detached name belongs to collection.
+        assert_eq!(stabilize(&source, &root).unwrap(), Some(stable.clone()));
+    })
+    .unwrap();
+    assert_eq!(outcome.removed_bytes, 9);
+    assert!(!retired.unwrap().exists());
+    assert!(stable.join("sub/generated.rs").exists());
+    release_all_under(&root);
+}
+
+#[test]
+fn retired_sources_are_hidden_and_swept_even_without_limits() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("out-dirs");
+    let retired = root.join(format!("{}.retired-123-leftover", "a".repeat(64)));
+    write_tree(&retired, &[("sub/generated.rs", b"leftover")]);
+    make_directory_read_only(&retired.join("sub")).unwrap();
+    make_directory_read_only(&retired).unwrap();
+    assert_eq!(stats(&root).unwrap().remaining_directories, 0);
+    assert!(retired.exists());
+    let outcome = collect(&root, None, None, false).unwrap();
+    assert_eq!(outcome.removed_bytes, 8);
+    assert_eq!(outcome.removed_directories, 1);
+    assert!(!retired.exists());
 }
