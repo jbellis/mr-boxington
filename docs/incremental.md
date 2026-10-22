@@ -36,9 +36,11 @@ publish again after the edited crate compiles once more without a source change.
 
 With rustc 1.98 or later, mbx seeds private incremental state from another
 checkout by default. When a crate first needs private state, mbx copies the
-most recently used checkout's state for the same crate and flags, hard-linking
-its files. rustc validates that state against the current sources, so the first
-edit in a new checkout can compile incrementally too.
+most recently used checkout's state for the same crate and flags. Files use
+copy-on-write filesystem clones where supported and plain copies otherwise,
+so a later compile cannot change the donor's session. rustc validates that state
+against the current sources, so the first edit in a new checkout can compile
+incrementally too.
 
 For these compilations only, mbx adds `-Zremap-cwd-prefix=.` and makes paths
 under the checkout relative. Cargo's arguments and shared cache keys stay the
@@ -122,11 +124,13 @@ real run keeps.
 defaults to 5% of the cache disk, between 10 GiB and 100 GiB.
 `gc.incremental_max_age` defaults to 30 days. Collection removes expired units
 first, then remaining units least recently used first until the budget is met.
+Seeded copies have separate inodes and count separately toward this logical
+budget, even when filesystem clones share their data blocks.
 Shared hard-linked files count once across the whole sweep and in
 `mbx cache stats`. A collection credits a file's bytes as freed only when it
 removes the file's last link, whether it removes a whole unit or a session:
 rustc links the files a new session reuses from the one before it, and a
-compile or seed can link a file after the sweep listed it. Counts reflect each
+compile can link a file after the sweep listed it. Counts reflect each
 sweep's snapshot, so links created during a sweep are counted at the next one. Live checkouts retain their bookkeeping even when all their units are removed;
 a deleted checkout loses its directory and bookkeeping after its last unit
 is collected.

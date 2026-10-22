@@ -1172,13 +1172,9 @@ fn cleanup_lock_dir(locks: &Path) {
 /// leaves no partial state; a donor that cannot be copied gives way to the
 /// next.
 ///
-/// Files are hard-linked. rustc writes a session once, into a directory of
-/// its own, and links what it reuses into the next one rather than changing
-/// it, so sharing them is as safe as rustc's own reuse. A clone would be just
-/// as correct, but it is a new file: the donor's pages in the file cache do
-/// not carry over, and the first compilation rereads every object and bitcode
-/// file in the state. Lock files, which rustc locks rather than reads, are
-/// copied, and so is any file that cannot be linked.
+/// Files are independent copies, using a filesystem clone where supported.
+/// rustc can rewrite inherited files in place (including ThinLTO bitcode),
+/// so hard links would let a later compilation change the donor's session.
 pub(crate) fn seed(checkout: &Path, unit: &str) -> Result<Option<PathBuf>> {
     let (Some(root), Some(own)) = (checkout.parent(), checkout.file_name()) else {
         return Ok(None);
@@ -1375,16 +1371,18 @@ fn copy_tree(source: &Path, destination: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Hard-link a state file, or copy it: a lock file, which rustc locks rather
-/// than reads, or one that cannot be linked.
+/// Copy a state file without sharing its inode with the donor. The enclosing
+/// staging directory keeps partial copies out of rustc's session search.
 fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    let lock = from
-        .extension()
-        .is_some_and(|extension| extension == "lock");
-    if lock || std::fs::hard_link(from, to).is_err() {
-        std::fs::copy(from, to)?;
-    }
-    Ok(())
+    let modified = std::fs::metadata(from)?.modified()?;
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    reflink_copy::reflink_or_copy(from, to)?;
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    std::fs::copy(from, to)?;
+    // rustc selects sessions by the timestamp in their name, but keep the
+    // original mtime too, independent of the platform's copy implementation.
+    crate::materialize::set_modified(to, modified)
+        .map_err(|error| std::io::Error::other(error.to_string()))
 }
 
 fn read_record(path: &Path) -> Option<CheckoutRecord> {
@@ -1401,7 +1399,7 @@ fn now_secs() -> u64 {
 }
 
 // A sweep owns one reference per unit (and per bookkeeping tree), even if
-// multiple session paths in that owner hard-link the same immutable file.
+// multiple session paths in that owner hard-link the same file.
 #[derive(Clone, PartialEq, Eq, Hash)]
 enum FileKey {
     Object(u64, u64),
@@ -2794,10 +2792,10 @@ mod tests {
             use std::os::unix::fs::MetadataExt as _;
             let donor = cache.path().join("newer").join(unit).join("widget-0abc");
             let inode = |path: &Path| std::fs::metadata(path).unwrap().ino();
-            assert_eq!(
+            assert_ne!(
                 inode(&copied.join("s-2-b-finished/dep-graph.bin")),
                 inode(&donor.join("s-2-b-finished/dep-graph.bin")),
-                "state files are shared, not copied"
+                "state files must have independent inodes"
             );
             assert_ne!(
                 inode(&copied.join("s-2-b.lock")),
@@ -2805,6 +2803,19 @@ mod tests {
                 "lock files are not shared"
             );
         }
+        let original = cache
+            .path()
+            .join("newer")
+            .join(unit)
+            .join("widget-0abc/s-2-b-finished/dep-graph.bin");
+        let copy = copied.join("s-2-b-finished/dep-graph.bin");
+        assert_eq!(
+            std::fs::metadata(&original).unwrap().modified().unwrap(),
+            std::fs::metadata(&copy).unwrap().modified().unwrap()
+        );
+        // Model rustc truncating and rewriting an inherited session file.
+        std::fs::write(&copy, b"rewritten by recipient").unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), b"newer");
         assert_eq!(
             std::fs::read_dir(own.join("blake3")).unwrap().count(),
             1,

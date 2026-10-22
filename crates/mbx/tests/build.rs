@@ -1478,6 +1478,93 @@ fn learned_incremental_state_seeds_another_checkout_by_default() {
 }
 
 #[test]
+fn incremental_seed_keeps_the_donors_thin_lto_state_linkable() {
+    let store = tempfile::tempdir().unwrap();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    let stable = (0..8)
+        .map(|index| {
+            format!(
+                "#[inline(never)] fn f{index}(x: u64) -> u64 {{ super::secret(x.rotate_left({index})) ^ {index} }}\n"
+            )
+        })
+        .collect::<String>()
+        + "pub fn run(x: u64) -> u64 {"
+        + &(0..8)
+            .map(|index| format!("f{index}(x)"))
+            .collect::<Vec<_>>()
+            .join(" ^ ")
+        + "}\n";
+    let edit = |project: &Path, revision: u64| {
+        let table = (0..32)
+            .map(|value| (value + revision).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        // ThinLTO imports secret into stable's codegen unit and promotes the
+        // private table with a .llvm suffix. Corrupting the donor's bitcode
+        // leaves its reused object referencing a table the new object lacks.
+        std::fs::write(
+            project.join("base/src/lib.rs"),
+            format!(
+                "pub mod stable; static TABLE: [u64; 32] = [{table}];\n\
+                 fn secret(x: u64) -> u64 {{ TABLE[(x % 32) as usize] }}\n\
+                 pub fn value(x: u64) -> u64 {{ stable::run(x) + {revision} }}\n"
+            ),
+        )
+        .unwrap();
+    };
+    for project in [first.path(), second.path()] {
+        write_dependent_project(project);
+        let manifest = project.join("Cargo.toml");
+        let mut contents = std::fs::read_to_string(&manifest).unwrap();
+        contents.push_str("\n[profile.dev]\nopt-level = 1\n");
+        std::fs::write(manifest, contents).unwrap();
+        std::fs::remove_file(project.join("above/src/lib.rs")).unwrap();
+        std::fs::write(
+            project.join("above/src/main.rs"),
+            "fn main() { println!(\"{}\", base::value(std::env::args().count() as u64)); }\n",
+        )
+        .unwrap();
+        std::fs::write(project.join("base/src/stable.rs"), &stable).unwrap();
+        edit(project, 0);
+    }
+    // Enabled explicitly so a configuration that turns seeding off cannot
+    // skip what this test checks.
+    let environment = [("MBX_SEED_INCREMENTAL", "1")];
+    let build = |project: &Path, label: &str| {
+        build_with(
+            project,
+            store.path(),
+            &reports.path().join(format!("{label}.json")),
+            &environment,
+        )
+    };
+    build(first.path(), "first-initial");
+    edit(first.path(), 1);
+    let (learned, _) = build(first.path(), "first-edit");
+    assert!(compiled_incrementally(&learned) >= 1, "{learned}");
+    build(second.path(), "second-initial");
+    edit(second.path(), 2);
+    build(second.path(), "second-edit");
+    // Check out the receiver's revision in place in the donor. A hard-linked
+    // seed makes this build fail to link with an undefined *.llvm.* symbol.
+    edit(first.path(), 2);
+    build(first.path(), "first-final");
+    for project in [first.path(), second.path()] {
+        let output = Command::new(
+            project
+                .join("target/debug")
+                .join(format!("above{}", std::env::consts::EXE_SUFFIX)),
+        )
+        .output()
+        .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8(output.stdout).unwrap().trim(), "29");
+    }
+}
+
+#[test]
 fn incremental_seed_preserves_bootstrap_env_dependencies_across_edits() {
     let version = Command::new("rustc").arg("-vV").output().unwrap();
     let version = String::from_utf8(version.stdout).unwrap();
@@ -1573,6 +1660,12 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
     let edit = |project: &Path| std::fs::write(project.join("base/src/lib.rs"), lib(21)).unwrap();
     for project in [first.path(), second.path(), unremapped.path()] {
         write_dependent_project(project);
+        // ThinLTO retains bitcode that rustc can rewrite in place when loading
+        // a seeded session. A hard-linked seed would corrupt the donor.
+        let manifest = project.join("Cargo.toml");
+        let mut contents = std::fs::read_to_string(&manifest).unwrap();
+        contents.push_str("\n[profile.dev]\nopt-level = 1\n");
+        std::fs::write(manifest, contents).unwrap();
         std::fs::write(project.join("base/src/stable.rs"), &stable).unwrap();
         std::fs::write(project.join("base/src/lib.rs"), lib(0)).unwrap();
     }
@@ -1611,13 +1704,21 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
         std::fs::write(unit.join(MARKER), b"").unwrap();
     }
 
+    let donor_files = find_files(&first_state, |_| true)
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).unwrap();
+            (path, bytes)
+        })
+        .collect::<Vec<_>>();
+
     build_with(
         second.path(),
         store.path(),
         &reports.path().join("second.json"),
         remapped,
     );
-    edit(second.path());
+    std::fs::write(second.path().join("base/src/lib.rs"), lib(22)).unwrap();
     let seeded = build_with(
         second.path(),
         store.path(),
@@ -1626,6 +1727,14 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
     )
     .0;
     assert!(compiled_incrementally(&seeded) >= 1, "{seeded}");
+    for (path, bytes) in &donor_files {
+        assert_eq!(
+            &std::fs::read(path).unwrap(),
+            bytes,
+            "a seeded compile must not change donor file {}",
+            path.display()
+        );
+    }
     let second_state = incremental_checkout(store.path(), second.path());
     let seeded_units = find_files(&second_state, |path| {
         file_name_is(path, |name| name == MARKER)
@@ -1647,7 +1756,7 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
         file_name_is(path, |name| name == "query-cache.bin")
     });
     assert!(!saved_sessions.is_empty());
-    std::fs::write(second.path().join("base/src/lib.rs"), lib(22)).unwrap();
+    std::fs::write(second.path().join("base/src/lib.rs"), lib(23)).unwrap();
     let oversized = build_with(
         second.path(),
         store.path(),
@@ -1679,10 +1788,8 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
         seeded_from_first,
         "the second checkout's first edit should start from the first checkout's state"
     );
-    // Copied is not reused: rustc rejects state recorded with different
-    // options and compiles everything afresh. It links each codegen unit it
-    // reuses from the previous session into the new one, so only reuse leaves
-    // the newest session holding the donor's own object files.
+    // Check both isolation and reuse: every inode must be private to its
+    // checkout, but reused codegen units retain their contents and mtimes.
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt as _;
@@ -1691,9 +1798,30 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
                 path.extension().is_some_and(|extension| extension == "o")
             })
         };
+        let inode = |path: &Path| {
+            let metadata = std::fs::metadata(path).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+        let donor_inodes = donor_files
+            .iter()
+            .map(|(path, _)| inode(path))
+            .collect::<std::collections::HashSet<_>>();
+        for path in find_files(&second_state, |_| true) {
+            assert!(
+                !donor_inodes.contains(&inode(&path)),
+                "seeded file must have its own inode: {}",
+                path.display()
+            );
+        }
+        let object_identity = |path: &Path| {
+            (
+                std::fs::read(path).unwrap(),
+                std::fs::metadata(path).unwrap().modified().unwrap(),
+            )
+        };
         let donor = objects(&first_state)
             .iter()
-            .map(|path| std::fs::metadata(path).unwrap().ino())
+            .map(|path| object_identity(path))
             .collect::<std::collections::HashSet<_>>();
         let newest = find_files(&second_state, |path| {
             file_name_is(path, |name| name == "dep-graph.bin")
@@ -1713,7 +1841,7 @@ fn check_incremental_seeding(remapped: &[(&str, &str)]) {
         .to_path_buf();
         let reused = objects(&newest)
             .iter()
-            .filter(|path| donor.contains(&std::fs::metadata(path).unwrap().ino()))
+            .filter(|path| donor.contains(&object_identity(path)))
             .count();
         assert!(
             reused > 0,
