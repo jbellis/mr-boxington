@@ -1323,7 +1323,7 @@ fn is_rustc_wrapper_invocation(program: &OsStr, arguments: &[&OsStr]) -> bool {
                     argument == "-vV"
                         || argument == "-"
                         || argument.starts_with('@')
-                        || ["--print", "--crate-name", "--emit", "--edition"]
+                        || ["--crate-name", "--emit", "--edition"]
                             .iter()
                             .any(|flag| argument.starts_with(flag))
                 })

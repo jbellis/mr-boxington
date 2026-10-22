@@ -2089,9 +2089,14 @@ fn configured_rustc_wrapper_is_recognized() {
         os("mbx"),
         &[os("rustc"), os("@/tmp/args")]
     ));
-    assert!(is_rustc_wrapper_invocation(
+    // `cargo rustc --print` is a nightly Cargo option.
+    assert!(!is_rustc_wrapper_invocation(
         os("mbx"),
         &[os("rustc"), os("--print=cfg")]
+    ));
+    assert!(is_rustc_wrapper_invocation(
+        os("mbx"),
+        &[os("rustc"), os("-"), os("--crate-name"), os("___")]
     ));
     assert!(!is_rustc_wrapper_invocation(
         os("mbx"),
