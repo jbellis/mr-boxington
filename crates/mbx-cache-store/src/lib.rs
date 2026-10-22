@@ -781,7 +781,16 @@ pub fn import_archive_with_attachments(store: &Path, archive: &Path) -> Result<I
     let action_cache = mbx_cache_core::LocalActionCache::new(store);
     let mut kept_existing = 0;
     for result in &results {
-        if action_cache.store_if_absent(result)? == mbx_cache_core::ActionStoreOutcome::KeptExisting
+        if action_cache.store_unless_restorable(result, |existing| {
+            extend_result_closure(
+                &cas,
+                &mut Closure::default(),
+                &mut BTreeSet::new(),
+                existing,
+                false,
+            )
+            .is_ok()
+        })? == mbx_cache_core::ActionStoreOutcome::KeptExisting
         {
             kept_existing += 1;
         }
@@ -866,33 +875,54 @@ fn strict_closure(store: &Path, actions: &BTreeSet<CacheDigest>) -> Result<Closu
             .find(action)?
             .ok_or_else(|| eyre::eyre!("action result is missing for {}", action.hash))?;
         closure.results.insert(action_cache.path_for(action)?);
-        require_object(&cas, &mut closure, &result.action)?;
-        if let Some(metadata) = &result.metadata {
-            let path = require_parsed_object(&cas, &mut closure, metadata)?;
-            let captured: CapturedOutput = serde_json::from_slice(&std::fs::read(path)?)
-                .wrap_err("action metadata is invalid")?;
-            require_object(&cas, &mut closure, &captured.stdout)?;
-            require_object(&cas, &mut closure, &captured.stderr)?;
+        extend_result_closure(&cas, &mut closure, &mut directories, &result, true)?;
+    }
+    Ok(closure)
+}
+
+/// Walk one result's dependencies. Export/import validation hashes descriptors;
+/// checking an existing result for repair only needs presence and length checks.
+fn extend_result_closure(
+    cas: &LocalCas,
+    closure: &mut Closure,
+    directories: &mut BTreeSet<CacheDigest>,
+    result: &RemoteActionResult,
+    verify_descriptors: bool,
+) -> Result<()> {
+    let parsed_object = |closure: &mut Closure, digest: &CacheDigest| {
+        if verify_descriptors {
+            require_parsed_object(cas, closure, digest)
+        } else {
+            require_object(cas, closure, digest)?;
+            cas.path_for(digest)
         }
-        if let Some(root) = &result.output_root {
-            let mut nodes = vec![root.clone()];
-            while let Some(digest) = nodes.pop() {
-                if !directories.insert(digest.clone()) {
-                    continue;
-                }
-                let path = require_parsed_object(&cas, &mut closure, &digest)?;
-                let directory: CacheDirectory = serde_json::from_slice(&std::fs::read(path)?)
-                    .wrap_err("output directory is invalid")?;
-                for file in directory.files {
-                    require_object(&cas, &mut closure, &file.digest)?;
-                }
-                for child in directory.directories {
-                    nodes.push(child.digest);
-                }
+    };
+    require_object(cas, closure, &result.action)?;
+    if let Some(metadata) = &result.metadata {
+        let path = parsed_object(closure, metadata)?;
+        let captured: CapturedOutput =
+            serde_json::from_slice(&std::fs::read(path)?).wrap_err("action metadata is invalid")?;
+        require_object(cas, closure, &captured.stdout)?;
+        require_object(cas, closure, &captured.stderr)?;
+    }
+    if let Some(root) = &result.output_root {
+        let mut nodes = vec![root.clone()];
+        while let Some(digest) = nodes.pop() {
+            if !directories.insert(digest.clone()) {
+                continue;
+            }
+            let path = parsed_object(closure, &digest)?;
+            let directory: CacheDirectory = serde_json::from_slice(&std::fs::read(path)?)
+                .wrap_err("output directory is invalid")?;
+            for file in directory.files {
+                require_object(cas, closure, &file.digest)?;
+            }
+            for child in directory.directories {
+                nodes.push(child.digest);
             }
         }
     }
-    Ok(closure)
+    Ok(())
 }
 
 /// Verify every recorded leaf's contents, spread across the machine.

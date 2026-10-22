@@ -24,7 +24,7 @@ pub enum ActionStoreOutcome {
     Stored,
     /// The same result was already present.
     Unchanged,
-    /// An intact, different result was already present and was kept.
+    /// An intact, restorable, different result was already present and was kept.
     KeptExisting,
 }
 
@@ -344,20 +344,26 @@ impl LocalActionCache {
 
     /// Atomically publish an action result after validating all referenced objects.
     pub fn store(&self, result: &RemoteActionResult) -> Result<PathBuf> {
-        self.store_inner(result, false)?;
+        self.store_inner(result, false, &|_| true)?;
         self.path_for(&result.action)
     }
 
-    /// Publish a result, keeping an intact existing result for the same action.
-    /// Invalid existing records are repaired just as in [`Self::store`].
-    pub fn store_if_absent(&self, result: &RemoteActionResult) -> Result<ActionStoreOutcome> {
-        self.store_inner(result, true)
+    /// Publish a result unless an intact existing result is also restorable.
+    /// The caller checks any dependencies this index does not understand.
+    /// Invalid or unrestorable existing records are repaired as in [`Self::store`].
+    pub fn store_unless_restorable(
+        &self,
+        result: &RemoteActionResult,
+        is_restorable: impl Fn(&RemoteActionResult) -> bool,
+    ) -> Result<ActionStoreOutcome> {
+        self.store_inner(result, true, &is_restorable)
     }
 
     fn store_inner(
         &self,
         result: &RemoteActionResult,
         keep_existing: bool,
+        is_restorable: &impl Fn(&RemoteActionResult) -> bool,
     ) -> Result<ActionStoreOutcome> {
         if result.version != 1 {
             bail!("unsupported local action result version");
@@ -384,10 +390,12 @@ impl LocalActionCache {
                 // reader, unless its objects are gone or torn: then it can
                 // never be restored, and this result is the repair.
                 if self.is_intact(&existing) {
-                    if keep_existing {
+                    if !keep_existing {
+                        bail!("local action key already has a different result");
+                    }
+                    if is_restorable(&existing) {
                         return Ok(ActionStoreOutcome::KeptExisting);
                     }
-                    bail!("local action key already has a different result");
                 }
                 true
             }
@@ -410,11 +418,23 @@ impl LocalActionCache {
         match temporary.persist_noclobber(&destination) {
             Ok(_) => Ok(ActionStoreOutcome::Stored),
             Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
-                match self.find(&result.action)? {
-                    Some(existing) if existing == *result => Ok(ActionStoreOutcome::Unchanged),
-                    Some(existing) if keep_existing && self.is_intact(&existing) => {
+                match self.find(&result.action) {
+                    Ok(Some(existing)) if existing == *result => Ok(ActionStoreOutcome::Unchanged),
+                    Ok(Some(existing))
+                        if keep_existing
+                            && self.is_intact(&existing)
+                            && is_restorable(&existing) =>
+                    {
                         Ok(ActionStoreOutcome::KeptExisting)
                     }
+                    _ if keep_existing => {
+                        error
+                            .file
+                            .persist(&destination)
+                            .map_err(|error| error.error)?;
+                        Ok(ActionStoreOutcome::Stored)
+                    }
+                    Err(error) => Err(error),
                     _ => bail!("concurrent action write was invalid or conflicting"),
                 }
             }
@@ -590,7 +610,7 @@ mod tests {
         };
 
         assert!(actions.store(&result).is_err());
-        assert!(actions.store_if_absent(&result).is_err());
+        assert!(actions.store_unless_restorable(&result, |_| true).is_err());
         cas.store_bytes(&action, b"action").unwrap();
         cas.store_bytes(&metadata, b"metadata").unwrap();
         cas.store_bytes(&output_root, b"directory").unwrap();
@@ -618,6 +638,48 @@ mod tests {
         assert!(actions.find(&action).is_err());
         assert_eq!(actions.store(&result).unwrap(), path);
         assert_eq!(actions.find(&action).unwrap(), Some(result));
+    }
+
+    #[test]
+    fn keeps_only_existing_results_accepted_by_the_restore_predicate() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = LocalCas::new(directory.path());
+        let actions = LocalActionCache::new(directory.path());
+        let action = CacheDigest::blake3(b"action");
+        cas.store_bytes(&action, b"action").unwrap();
+        let metadata = CacheDigest::blake3(b"metadata");
+        cas.store_bytes(&metadata, b"metadata").unwrap();
+        let first = RemoteActionResult {
+            action: action.clone(),
+            metadata: None,
+            output_root: None,
+            version: 1,
+        };
+        let second = RemoteActionResult {
+            metadata: Some(metadata),
+            ..first.clone()
+        };
+        actions.store(&first).unwrap();
+        assert_eq!(
+            actions
+                .store_unless_restorable(&second, |existing| {
+                    assert_eq!(existing, &first);
+                    true
+                })
+                .unwrap(),
+            ActionStoreOutcome::KeptExisting
+        );
+        assert_eq!(actions.find(&action).unwrap(), Some(first.clone()));
+        assert_eq!(
+            actions
+                .store_unless_restorable(&second, |existing| {
+                    assert_eq!(existing, &first);
+                    false
+                })
+                .unwrap(),
+            ActionStoreOutcome::Stored
+        );
+        assert_eq!(actions.find(&action).unwrap(), Some(second));
     }
 
     #[test]
@@ -660,15 +722,15 @@ mod tests {
         let (_, second) = publish(b"libx.rlib", b"built in checkout bb");
 
         assert_eq!(
-            actions.store_if_absent(&first).unwrap(),
+            actions.store_unless_restorable(&first, |_| true).unwrap(),
             ActionStoreOutcome::Stored
         );
         assert_eq!(
-            actions.store_if_absent(&first).unwrap(),
+            actions.store_unless_restorable(&first, |_| true).unwrap(),
             ActionStoreOutcome::Unchanged
         );
         assert_eq!(
-            actions.store_if_absent(&second).unwrap(),
+            actions.store_unless_restorable(&second, |_| true).unwrap(),
             ActionStoreOutcome::KeptExisting
         );
         let error = actions.store(&second).unwrap_err();
@@ -677,14 +739,14 @@ mod tests {
 
         fs::remove_file(cas.path_for(&file).unwrap()).unwrap();
         assert_eq!(
-            actions.store_if_absent(&second).unwrap(),
+            actions.store_unless_restorable(&second, |_| true).unwrap(),
             ActionStoreOutcome::Stored
         );
         assert_eq!(actions.find(&action).unwrap(), Some(second.clone()));
 
         fs::write(actions.path_for(&action).unwrap(), b"truncated").unwrap();
         assert_eq!(
-            actions.store_if_absent(&second).unwrap(),
+            actions.store_unless_restorable(&second, |_| true).unwrap(),
             ActionStoreOutcome::Stored
         );
         assert_eq!(actions.find(&action).unwrap(), Some(second));
