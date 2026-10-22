@@ -323,8 +323,14 @@ fn a_short_disk_collects_live_targets_past_their_budget() {
     for (name, updated_secs) in [("older", 1), ("newer", 2)] {
         let workspace = directory.path().join(name);
         std::fs::create_dir_all(&workspace).unwrap();
-        let view = crate::target::place(&config, &workspace, &workspace.join("target"), false)
-            .expect("the target is managed");
+        let view = crate::target::place(
+            &config,
+            &workspace,
+            &workspace.join("target"),
+            false,
+            &crate::target::ViewLease::acquire(&config.target.root, &workspace).unwrap(),
+        )
+        .expect("the target is managed");
         std::fs::write(view.join("artifact"), vec![0_u8; 64]).unwrap();
         // Long ago, so neither reads as a build that is starting, and in
         // order, so `newer` is the most recently used.
@@ -364,8 +370,14 @@ fn json_report_includes_low_disk_target_removals() {
     for (name, updated_secs) in [("older", 1), ("newer", 2)] {
         let workspace = directory.path().join(name);
         std::fs::create_dir_all(&workspace).unwrap();
-        let view = crate::target::place(&config, &workspace, &workspace.join("target"), false)
-            .expect("the target is managed");
+        let view = crate::target::place(
+            &config,
+            &workspace,
+            &workspace.join("target"),
+            false,
+            &crate::target::ViewLease::acquire(&config.target.root, &workspace).unwrap(),
+        )
+        .expect("the target is managed");
         std::fs::write(view.join("artifact"), vec![0_u8; 64]).unwrap();
         let record = view.with_extension("json");
         let mut fields: serde_json::Value =
@@ -474,8 +486,14 @@ fn a_combined_budget_shares_unoccupied_store_capacity() {
         for (name, updated_secs) in [("older", 1), ("newer", 2)] {
             let workspace = directory.path().join(name);
             std::fs::create_dir_all(&workspace).unwrap();
-            let view = crate::target::place(&config, &workspace, &workspace.join("target"), false)
-                .unwrap();
+            let view = crate::target::place(
+                &config,
+                &workspace,
+                &workspace.join("target"),
+                false,
+                &crate::target::ViewLease::acquire(&config.target.root, &workspace).unwrap(),
+            )
+            .unwrap();
             std::fs::write(view.join("artifact"), [0_u8; 64]).unwrap();
             let record = view.with_extension("json");
             let mut fields: serde_json::Value =
