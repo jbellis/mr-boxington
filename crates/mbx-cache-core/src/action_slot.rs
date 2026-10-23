@@ -116,9 +116,15 @@ impl ActionSlot {
         if self.is_vacant() {
             return Err(io::Error::other("cannot replace a vacant action slot"));
         }
-        // Windows may transiently refuse a rename over a file another process
-        // has open. Report that failure to the caller rather than retry forever.
-        temporary.persist(&self.path).map_err(|error| error.error)?;
+        // The incumbent is open here, and may be open in a process waiting to
+        // claim it. `std::fs::rename` replaces it anyway on Windows, using
+        // POSIX rename semantics where the system supports them; tempfile's
+        // `persist` uses MoveFileExW, which refuses to replace an open file.
+        // A failure is reported to the caller rather than retried.
+        let staged = temporary.into_temp_path();
+        std::fs::rename(&staged, &self.path)?;
+        // The staged name is gone now; keep its guard from deleting anything.
+        let _ = staged.keep();
         Ok(())
     }
 
