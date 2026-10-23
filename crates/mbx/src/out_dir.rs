@@ -576,7 +576,13 @@ fn collect_with(
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
         if retired::is_retired_name(&entry.file_name()) {
-            staging_bytes = staging_bytes.saturating_add(tree_bytes(&path));
+            let bytes = tree_bytes(&path);
+            if dry_run && (max_bytes.is_some() || max_age.is_some()) {
+                outcome.removed_directories += 1;
+                outcome.removed_bytes = outcome.removed_bytes.saturating_add(bytes);
+            } else {
+                staging_bytes = staging_bytes.saturating_add(bytes);
+            }
             continue;
         }
         let is_dir = match entry.file_type() {

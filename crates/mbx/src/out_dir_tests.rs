@@ -660,3 +660,60 @@ fn failed_retired_source_deletion_stays_counted_until_retry() {
     assert_eq!(outcome.remaining_bytes, 0);
     assert!(!retired.exists());
 }
+
+#[test]
+fn limited_preview_sweeps_retired_sources_before_budgeting_live_trees() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("out-dirs");
+    let live = root.join("b".repeat(64));
+    let retired = root.join(format!("{}.retired-123-leftover", "a".repeat(64)));
+    write_tree(&live, &[("generated.rs", b"keep")]);
+    write_tree(&retired, &[("generated.rs", b"leftover")]);
+    assert_eq!(stats(&root).unwrap().remaining_bytes, 12);
+
+    let preview = collect(&root, Some(4), None, true).unwrap();
+    assert_eq!(preview.remaining_bytes, 4);
+    assert_eq!(preview.remaining_directories, 1);
+    assert_eq!(preview.removed_bytes, 8);
+    assert_eq!(preview.removed_directories, 1);
+    assert!(live.exists());
+    assert!(retired.exists());
+
+    let actual = collect(&root, Some(4), None, false).unwrap();
+    assert_eq!(actual.remaining_bytes, preview.remaining_bytes);
+    assert_eq!(actual.remaining_directories, preview.remaining_directories);
+    assert_eq!(actual.removed_bytes, preview.removed_bytes);
+    assert_eq!(actual.removed_directories, preview.removed_directories);
+    assert!(live.exists());
+    assert!(!retired.exists());
+}
+
+#[test]
+fn partial_retired_source_deletion_credits_freed_bytes_and_counts_survivors() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("out-dirs");
+    let retired = root.join(format!("{}.retired-123-leftover", "a".repeat(64)));
+    write_tree(
+        &retired,
+        &[("removed.rs", b"removed"), ("survivor.rs", b"keep")],
+    );
+    let outcome = collect_with(
+        &root,
+        Some(0),
+        None,
+        false,
+        |root| {
+            retired::sweep_with(root, |tree| {
+                std::fs::remove_file(tree.path().join("removed.rs"))?;
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            })
+        },
+        || panic!("retired trees must not enter normal collection"),
+    )
+    .unwrap();
+    assert_eq!(outcome.removed_bytes, 7);
+    assert_eq!(outcome.removed_directories, 0);
+    assert_eq!(outcome.remaining_bytes, 4);
+    assert_eq!(stats(&root).unwrap().remaining_bytes, 4);
+    assert!(retired.join("survivor.rs").exists());
+}

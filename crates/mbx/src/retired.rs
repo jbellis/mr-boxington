@@ -103,11 +103,17 @@ pub(crate) fn sweep_with(
         if !is_retired_name(&entry.file_name()) {
             continue;
         }
-        let tree = RetiredTree(entry.path());
+        let path = entry.path();
+        let tree = RetiredTree(path.clone());
         let bytes = tree.bytes();
         if remove(tree).is_ok() {
             outcome.removed += 1;
             outcome.bytes = outcome.bytes.saturating_add(bytes);
+        } else {
+            let remaining = crate::incremental::tree_bytes(&path);
+            outcome.bytes = outcome
+                .bytes
+                .saturating_add(bytes.saturating_sub(remaining));
         }
     }
     outcome
@@ -137,11 +143,12 @@ pub(crate) fn remove_tree(path: &Path) -> io::Result<()> {
             }
             for entry in std::fs::read_dir(&directory)? {
                 let entry = entry?;
-                if entry.file_type()?.is_dir() {
+                let kind = entry.file_type()?;
+                if kind.is_dir() {
                     pending.push(entry.path());
                 } else {
                     #[cfg(not(unix))]
-                    {
+                    if kind.is_file() {
                         let mut permissions = entry.metadata()?.permissions();
                         #[allow(clippy::permissions_set_readonly_false)]
                         permissions.set_readonly(false);
@@ -155,5 +162,45 @@ pub(crate) fn remove_tree(path: &Path) -> io::Result<()> {
     match result {
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(()),
         result => result,
+    }
+}
+
+#[cfg(all(test, windows))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn removal_does_not_follow_file_symlinks() {
+        use std::os::windows::fs::symlink_file;
+
+        let directory = tempfile::tempdir().unwrap();
+        let outside = directory.path().join("outside");
+        std::fs::write(&outside, b"keep").unwrap();
+        let tree = directory.path().join("tree");
+        std::fs::create_dir(&tree).unwrap();
+        // Windows requires Developer Mode or symlink privileges.
+        if let Err(error) = symlink_file(&outside, tree.join("link")) {
+            assert_eq!(error.raw_os_error(), Some(1314), "{error}");
+            return;
+        }
+        symlink_file(directory.path().join("missing"), tree.join("broken")).unwrap();
+        let mut permissions = std::fs::metadata(&outside).unwrap().permissions();
+        permissions.set_readonly(true);
+        std::fs::set_permissions(&outside, permissions).unwrap();
+
+        let result = remove_tree(&tree);
+        let still_readonly = std::fs::metadata(&outside)
+            .unwrap()
+            .permissions()
+            .readonly();
+        // Restore the attribute so TempDir can clean up even if an assertion fails.
+        let mut permissions = std::fs::metadata(&outside).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        permissions.set_readonly(false);
+        std::fs::set_permissions(&outside, permissions).unwrap();
+        result.unwrap();
+        assert!(!tree.exists());
+        assert!(still_readonly);
+        assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
     }
 }
