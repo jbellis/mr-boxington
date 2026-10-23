@@ -7970,9 +7970,30 @@ impl Drop for TargetLease {
 }
 
 /// Hold the existing sibling lock while a CLI process tries to reserve it.
+///
+/// The view is keyed by the workspace root as Cargo reports it, which on
+/// Windows is not what `canonicalize` returns (that adds a `\\?\` prefix), so
+/// ask Cargo for it the way mbx does.
 fn hold_target_lease(root: &Path, workspace: &Path) -> TargetLease {
-    let workspace = workspace.canonicalize().unwrap();
-    let key = mbx_cache_core::CacheDigest::blake3(workspace.to_string_lossy().as_bytes()).hash;
+    let metadata = Command::new(cargo())
+        .args([
+            "metadata",
+            "--format-version",
+            "1",
+            "--no-deps",
+            "--offline",
+        ])
+        .current_dir(workspace)
+        .output()
+        .unwrap();
+    assert!(
+        metadata.status.success(),
+        "{}",
+        String::from_utf8_lossy(&metadata.stderr)
+    );
+    let metadata: serde_json::Value = serde_json::from_slice(&metadata.stdout).unwrap();
+    let workspace = metadata["workspace_root"].as_str().unwrap();
+    let key = mbx_cache_core::CacheDigest::blake3(workspace.as_bytes()).hash;
     std::fs::create_dir_all(root.join("v1")).unwrap();
     let file = std::fs::OpenOptions::new()
         .read(true)
