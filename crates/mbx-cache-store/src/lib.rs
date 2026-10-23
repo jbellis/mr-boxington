@@ -1716,8 +1716,14 @@ pub fn gc_dry_run(store: &Path, max_bytes: u64) -> Result<GcOutcome> {
 }
 
 #[cfg(test)]
+type DanglingReadHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
 thread_local! {
     static ACTION_RECORD_CLAIMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Runs after collection finds a record dangling and before it claims it.
+    static AFTER_DANGLING_READ: std::cell::RefCell<Option<DanglingReadHook>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome> {
@@ -1804,6 +1810,12 @@ fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome
         let removal = if dry_run {
             Removal::Removed
         } else {
+            #[cfg(test)]
+            AFTER_DANGLING_READ.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook(&entry.path);
+                }
+            });
             #[cfg(test)]
             ACTION_RECORD_CLAIMS.with(|count| count.set(count.get() + 1));
             match ActionSlot::try_claim(&entry.path) {

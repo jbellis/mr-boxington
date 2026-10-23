@@ -2662,6 +2662,45 @@ mod action_record_locking {
         );
     }
 
+    /// A writer can repair a record between collection's lock-free read, which
+    /// found it dangling, and collection's claim. The check repeated under the
+    /// lock must see the repair and keep the record.
+    #[test]
+    fn gc_keeps_a_record_repaired_after_it_was_found_dangling() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path();
+        let action = store_object(store, b"action");
+        let dangling = RemoteActionResult {
+            version: 1,
+            action: action.clone(),
+            metadata: Some(CacheDigest::blake3(b"missing metadata")),
+            output_root: None,
+        };
+        let intact = RemoteActionResult {
+            metadata: None,
+            ..dangling.clone()
+        };
+        let path = LocalActionCache::new(store).path_for(&action).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, mbx_cache_core::canonical_json(&dangling).unwrap()).unwrap();
+        let repaired = mbx_cache_core::canonical_json(&intact).unwrap();
+        AFTER_DANGLING_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |found: &Path| {
+                let mut temporary =
+                    tempfile::NamedTempFile::new_in(found.parent().unwrap()).unwrap();
+                temporary.write_all(&repaired).unwrap();
+                temporary.persist(found).unwrap();
+            }));
+        });
+        let swept = gc(store, u64::MAX);
+        AFTER_DANGLING_READ.with(|hook| *hook.borrow_mut() = None);
+        assert_eq!(swept.unwrap().removed_action_results, 0);
+        assert_eq!(
+            LocalActionCache::new(store).find(&action).unwrap(),
+            Some(intact)
+        );
+    }
+
     #[test]
     fn gc_skips_a_record_under_repair_and_keeps_its_replacement() {
         let directory = tempfile::tempdir().unwrap();
