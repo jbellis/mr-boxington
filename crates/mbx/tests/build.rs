@@ -51,6 +51,77 @@ impl Drop for BuildChildGuard {
 mod semantic_oracle;
 mod support;
 
+/// Run `command`, failing with the last lines it printed if it has not finished
+/// within `limit` instead of hanging the suite. Output is read line by line
+/// over a channel: a killed mbx can leave a Cargo it started holding the pipes
+/// open, so the readers may never see end of file.
+fn output_within(command: &mut Command, limit: std::time::Duration) -> std::process::Output {
+    use std::io::BufRead as _;
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let (sender, receiver) = std::sync::mpsc::channel::<(bool, String)>();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    let out_sender = sender.clone();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = out_sender.send((false, line));
+        }
+    });
+    let readers = std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stderr)
+            .lines()
+            .map_while(Result::ok)
+        {
+            let _ = sender.send((true, line));
+        }
+    });
+    let deadline = std::time::Instant::now() + limit;
+    let (mut out, mut err) = (String::new(), String::new());
+    let mut collect = |receiver: &std::sync::mpsc::Receiver<(bool, String)>| {
+        while let Ok((is_err, line)) = receiver.try_recv() {
+            let buffer = if is_err { &mut err } else { &mut out };
+            buffer.push_str(&line);
+            buffer.push('\n');
+        }
+    };
+    let status = loop {
+        collect(&receiver);
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            collect(&receiver);
+            let tail: Vec<&str> = err.lines().rev().take(200).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            panic!(
+                "command did not finish within {limit:?}; last stderr lines:\n{}",
+                tail.join("\n")
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    };
+    // The process exited; give the readers a moment to drain, without
+    // waiting on pipes a grandchild might still hold.
+    let _ = readers;
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    collect(&receiver);
+    std::process::Output {
+        status,
+        stdout: out.into_bytes(),
+        stderr: err.into_bytes(),
+    }
+}
+
 /// A Cargo subcommand can inherit toolchain Cargo without rustup's environment.
 /// Cargo must still pass that toolchain's compiler to every wrapper invocation.
 #[test]
@@ -68,16 +139,17 @@ fn inherited_toolchain_cargo_uses_its_absolute_rustc() {
     let cargo = PathBuf::from(String::from_utf8(cargo.stdout).unwrap().trim());
     let rustc = cargo.with_file_name(if cfg!(windows) { "rustc.exe" } else { "rustc" });
     assert!(rustc.is_absolute() && rustc.is_file());
-    let output = mbx_command()
+    let mut command = mbx_command();
+    command
         .current_dir(&project)
         .env("CARGO", &cargo)
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("RUSTC")
         .env("MBX_CACHE_DIR", directory.path().join("cache"))
         .env("MBX_TARGET_ROOT", directory.path().join("targets"))
-        .args(["build", "--offline", "-v"])
-        .output()
-        .unwrap();
+        .env("MBX_LOG", "mbx=debug")
+        .args(["build", "--offline", "-v"]);
+    let output = output_within(&mut command, std::time::Duration::from_secs(180));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(
@@ -92,16 +164,16 @@ fn inherited_toolchain_cargo_uses_its_absolute_rustc() {
     // `mbx run --config ...` launches Cargo plainly, without a session, and
     // must still give it the same compiler.
     std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
-    let output = mbx_command()
+    let mut command = mbx_command();
+    command
         .current_dir(&project)
         .env("CARGO", &cargo)
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("RUSTC")
         .env("MBX_CACHE_DIR", directory.path().join("cache"))
         .env("MBX_TARGET_ROOT", directory.path().join("targets"))
-        .args(["run", "--offline", "-v", "--config", "build.jobs=1"])
-        .output()
-        .unwrap();
+        .args(["run", "--offline", "-v", "--config", "build.jobs=1"]);
+    let output = output_within(&mut command, std::time::Duration::from_secs(180));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(
