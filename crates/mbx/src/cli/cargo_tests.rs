@@ -1016,3 +1016,24 @@ fn resolves_only_a_rustup_toolchain_cargos_sibling_compiler() {
     assert_eq!(toolchain_rustc(Path::new("cargo")), None);
     assert_eq!(toolchain_rustc(&directory.path().join("bin/cargo")), None);
 }
+
+#[test]
+fn an_explicit_compiler_or_toolchain_wins_over_cargos_own() {
+    let directory = tempfile::tempdir().unwrap();
+    let bin = directory.path().join("toolchains/custom-toolchain/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
+    let rustc = bin.join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&rustc, "").unwrap();
+    let set = |names: &'static [&'static str]| {
+        move |name: &str| {
+            names
+                .contains(&name)
+                .then(|| std::ffi::OsString::from("set"))
+        }
+    };
+    assert_eq!(compiler_for_cargo(&cargo, set(&[])), Some(rustc));
+    assert_eq!(compiler_for_cargo(&cargo, set(&["RUSTC"])), None);
+    assert_eq!(compiler_for_cargo(&cargo, set(&["RUSTUP_TOOLCHAIN"])), None);
+    assert_eq!(compiler_for_cargo(&bin.join("wrapper"), set(&[])), None);
+}

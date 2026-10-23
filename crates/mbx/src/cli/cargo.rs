@@ -82,12 +82,11 @@ fn cargo_with_settings_bypass_log_and_roots(
     };
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
     // Running a toolchain Cargo directly skips rustup's compiler selection.
-    // Keep an explicit RUSTC override, as rustup does, but otherwise select
-    // Cargo's own compiler before crate working directories can change it.
-    let rustc = std::env::var_os("RUSTC")
-        .is_none()
-        .then(|| toolchain_rustc(Path::new(&cargo)))
-        .flatten();
+    // Select Cargo's own compiler before crate working directories can change
+    // it. An explicit RUSTC wins, as it does for rustup, and so does
+    // RUSTUP_TOOLCHAIN: with it set, rustup sends every compiler invocation to
+    // that one toolchain, so nothing can mix.
+    let rustc = compiler_for_cargo(Path::new(&cargo), |name| std::env::var_os(name));
     if super::launch::needs_plain_launch(arguments) {
         return super::launch::plain_launch(&cargo, arguments, rustc.as_deref());
     }
@@ -1096,6 +1095,20 @@ pub(super) fn manage_existing_target_with(
         return Ok(Some(ExistingTarget::Adopt));
     }
     Ok(ask_to_remove(&roots.target_dir)?.then_some(ExistingTarget::Remove))
+}
+
+/// The compiler mbx gives `cargo`, if it needs to choose one at all.
+///
+/// Cargo already resolves the right compiler when RUSTC or RUSTUP_TOOLCHAIN is
+/// set; otherwise a Cargo inside a rustup toolchain gets that toolchain's own.
+pub(super) fn compiler_for_cargo(
+    cargo: &Path,
+    get_env: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Option<PathBuf> {
+    if get_env("RUSTC").is_some() || get_env("RUSTUP_TOOLCHAIN").is_some() {
+        return None;
+    }
+    toolchain_rustc(cargo)
 }
 
 /// Recognize rustup's toolchain layout without guessing what a Cargo wrapper

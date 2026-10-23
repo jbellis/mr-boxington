@@ -59,19 +59,22 @@ pub(super) fn plain_launch(
             }
         }
     }
-    // A `+toolchain` argument asks rustup for another toolchain, and an
-    // explicit RUSTC is the caller's choice; either one wins over Cargo's own.
+    // A `+toolchain` argument asks rustup for another toolchain, and the
+    // caller's RUSTC or RUSTUP_TOOLCHAIN already settles which compiler runs;
+    // any of them wins over Cargo's own.
     let toolchain_argument = arguments
         .iter()
         .take_while(|argument| argument.as_str() != "--")
         .any(|argument| argument.starts_with('+'));
-    let caller_rustc = CALLER.get().map_or_else(
-        || std::env::var_os("RUSTC").is_some(),
-        |caller| caller.contains_key(OsStr::new("RUSTC")),
-    );
+    let caller_chose = ["RUSTC", "RUSTUP_TOOLCHAIN"].iter().any(|name| {
+        CALLER.get().map_or_else(
+            || std::env::var_os(name).is_some(),
+            |caller| caller.contains_key(OsStr::new(name)),
+        )
+    });
     if let Some(rustc) = rustc
         && !toolchain_argument
-        && !caller_rustc
+        && !caller_chose
     {
         command.env("RUSTC", rustc);
     }
