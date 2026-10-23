@@ -81,6 +81,13 @@ fn cargo_with_settings_bypass_log_and_roots(
         settings.summary
     };
     let cargo = std::env::var_os("CARGO").unwrap_or_else(|| "cargo".into());
+    // Running a toolchain Cargo directly skips rustup's compiler selection.
+    // Keep an explicit RUSTC override, as rustup does, but otherwise select
+    // Cargo's own compiler before crate working directories can change it.
+    let rustc = std::env::var_os("RUSTC")
+        .is_none()
+        .then(|| toolchain_rustc(Path::new(&cargo)))
+        .flatten();
     if super::launch::needs_plain_launch(arguments) {
         return super::launch::plain_launch(&cargo, arguments);
     }
@@ -427,6 +434,9 @@ fn cargo_with_settings_bypass_log_and_roots(
                     ("MBX_DISABLE".into(), "1".into()),
                     (session::SOCKET_ENV.into(), String::new()),
                 ]);
+                if let Some(rustc) = &rustc {
+                    environment.insert("RUSTC".into(), rustc.to_string_lossy().into_owned());
+                }
                 if settings.plain_output {
                     environment.insert("CARGO_TERM_PROGRESS_WHEN".into(), "never".into());
                 }
@@ -438,6 +448,9 @@ fn cargo_with_settings_bypass_log_and_roots(
             Err(error) => return Err(error),
         };
         let mut environment = inherited_environment(|name| std::env::var(name).ok(), &working_dir);
+        if let Some(rustc) = &rustc {
+            environment.insert("RUSTC".into(), rustc.to_string_lossy().into_owned());
+        }
         let _lease = super::launch::lease(session_dir.path(), &mut environment)?;
         if let Some(path) = bypass_log {
             let path = if path.is_absolute() {
@@ -1083,6 +1096,21 @@ pub(super) fn manage_existing_target_with(
         return Ok(Some(ExistingTarget::Adopt));
     }
     Ok(ask_to_remove(&roots.target_dir)?.then_some(ExistingTarget::Remove))
+}
+
+/// Recognize rustup's toolchain layout without guessing what a Cargo wrapper
+/// or a system installation runs. The rustup proxy on PATH remains untouched.
+pub(super) fn toolchain_rustc(cargo: &Path) -> Option<PathBuf> {
+    let executable = if cfg!(windows) { "cargo.exe" } else { "cargo" };
+    if !cargo.is_absolute() || cargo.file_name()? != executable {
+        return None;
+    }
+    let bin = cargo.parent()?;
+    if bin.file_name()? != "bin" || bin.parent()?.parent()?.file_name()? != "toolchains" {
+        return None;
+    }
+    let rustc = bin.join(if cfg!(windows) { "rustc.exe" } else { "rustc" });
+    rustc.is_file().then_some(rustc)
 }
 
 pub(super) fn run_cargo(

@@ -1001,3 +1001,18 @@ fn a_real_rustc_wrapper_is_kept() {
         Some(std::path::PathBuf::from("workspace-wrapper"))
     );
 }
+
+#[test]
+fn resolves_only_a_rustup_toolchain_cargos_sibling_compiler() {
+    let directory = tempfile::tempdir().unwrap();
+    let bin = directory.path().join("toolchains/custom-toolchain/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
+    let rustc = bin.join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    assert_eq!(toolchain_rustc(&cargo), None);
+    std::fs::write(&rustc, "").unwrap();
+    assert_eq!(toolchain_rustc(&cargo), Some(rustc));
+    assert_eq!(toolchain_rustc(&bin.join("wrapper")), None);
+    assert_eq!(toolchain_rustc(Path::new("cargo")), None);
+    assert_eq!(toolchain_rustc(&directory.path().join("bin/cargo")), None);
+}

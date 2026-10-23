@@ -51,6 +51,45 @@ impl Drop for BuildChildGuard {
 mod semantic_oracle;
 mod support;
 
+/// A Cargo subcommand can inherit toolchain Cargo without rustup's environment.
+/// Cargo must still pass that toolchain's compiler to every wrapper invocation.
+#[test]
+fn inherited_toolchain_cargo_uses_its_absolute_rustc() {
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().join("project");
+    write_project(&project);
+    // The layout this covers is rustup's; without rustup there is nothing to test.
+    let Ok(cargo) = Command::new("rustup").args(["which", "cargo"]).output() else {
+        return;
+    };
+    if !cargo.status.success() {
+        return;
+    }
+    let cargo = PathBuf::from(String::from_utf8(cargo.stdout).unwrap().trim());
+    let rustc = cargo.with_file_name(if cfg!(windows) { "rustc.exe" } else { "rustc" });
+    assert!(rustc.is_absolute() && rustc.is_file());
+    let output = mbx_command()
+        .current_dir(&project)
+        .env("CARGO", &cargo)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTC")
+        .env("MBX_CACHE_DIR", directory.path().join("cache"))
+        .env("MBX_TARGET_ROOT", directory.path().join("targets"))
+        .args(["build", "--offline", "-v"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.lines().any(|line| {
+            line.contains("mbx-rustc")
+                && line.contains("--crate-name fixture")
+                && line.contains(rustc.to_string_lossy().as_ref())
+        }),
+        "Cargo did not pass its toolchain's absolute rustc: {stderr}"
+    );
+}
+
 fn write_project(directory: &Path) {
     write_named_project(directory, "fixture");
 }
