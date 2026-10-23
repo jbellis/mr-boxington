@@ -1,6 +1,6 @@
 //! Coordination for replacing and removing action records.
 
-use std::fs::File;
+use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek};
 use std::path::{Path, PathBuf};
 
@@ -12,9 +12,12 @@ use tempfile::NamedTempFile;
 /// Never hold two slots at once, and do no CAS writes while holding a slot.
 /// Reading CAS objects to validate a record is allowed.
 ///
-/// On Windows the kernel lock is mandatory, so a lock-free reader during
-/// repair may get a transient read error. A damaged or dangling record would
-/// already have produced a cache miss.
+/// Callers first inspect records without locking and claim only records that
+/// need repair or removal, then recheck that decision through the locked file.
+/// Records found intact and restorable by that first inspection need no claim.
+/// On Windows the kernel lock is mandatory, so lock-free readers of a repair
+/// or removal candidate may get a transient read error. Candidates were observed
+/// unusable before claiming; the locked recheck may discover a concurrent repair.
 pub struct ActionSlot {
     path: PathBuf,
     file: Option<File>,
@@ -45,7 +48,9 @@ impl ActionSlot {
         opened: &mut impl FnMut(),
     ) -> io::Result<Option<Self>> {
         for _ in 0..64 {
-            let file = match File::open(path) {
+            // Linux NFS implements flock with fcntl locks, which require a
+            // writable descriptor for an exclusive lock.
+            let file = match OpenOptions::new().read(true).write(true).open(path) {
                 Ok(file) => file,
                 Err(error) if error.kind() == io::ErrorKind::NotFound => {
                     return Ok(Some(Self {
@@ -56,6 +61,8 @@ impl ActionSlot {
                 Err(error) => return Err(error),
             };
             opened();
+            #[cfg(test)]
+            tests::record_opened();
             if nonblocking {
                 match file.try_lock() {
                     Ok(()) => {}
@@ -160,6 +167,23 @@ pub(crate) mod tests {
     use std::sync::mpsc::{self, Receiver};
     use std::time::Duration;
 
+    thread_local! {
+        static CLAIM_OPENED: std::cell::RefCell<Option<Box<dyn FnMut()>>> =
+            std::cell::RefCell::new(None);
+    }
+
+    pub(crate) fn observe_claims(callback: impl FnMut() + 'static) {
+        CLAIM_OPENED.with(|hook| *hook.borrow_mut() = Some(Box::new(callback)));
+    }
+
+    pub(super) fn record_opened() {
+        CLAIM_OPENED.with(|hook| {
+            if let Some(callback) = hook.borrow_mut().as_mut() {
+                callback();
+            }
+        });
+    }
+
     pub(crate) struct Holder {
         child: Child,
         events: Receiver<String>,
@@ -241,6 +265,17 @@ pub(crate) mod tests {
                 other => panic!("unexpected command: {other}"),
             }
         }
+    }
+
+    #[test]
+    fn claim_opens_record_for_reading_and_writing() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("record");
+        std::fs::write(&path, b"record").unwrap();
+        let slot = ActionSlot::claim(&path).unwrap();
+        let mut file = slot.file.as_ref().unwrap();
+        file.write_all(b"record").unwrap();
+        assert_eq!(slot.read().unwrap().unwrap(), b"record");
     }
 
     #[test]

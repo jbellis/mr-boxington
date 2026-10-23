@@ -2633,6 +2633,35 @@ mod action_record_locking {
         }
     }
 
+    // Windows mandatory locks prevent the initial read under this artificial
+    // holder; production GC never claims an intact record.
+    #[cfg(unix)]
+    #[test]
+    fn gc_does_not_claim_an_intact_record() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path();
+        let action = store_object(store, b"action");
+        let result = RemoteActionResult {
+            version: 1,
+            action,
+            metadata: None,
+            output_root: None,
+        };
+        let path = LocalActionCache::new(store).store(&result).unwrap();
+        let mut holder = Holder::start(&path, &path);
+        ACTION_RECORD_CLAIMS.with(|count| count.set(0));
+        let swept = gc(store, u64::MAX).unwrap();
+        assert_eq!(swept.removed_action_results, 0);
+        // No claim means this record did not take the Blocked branch either.
+        ACTION_RECORD_CLAIMS.with(|count| assert_eq!(count.get(), 0));
+        holder.command("release");
+        holder.expect("released");
+        assert_eq!(
+            LocalActionCache::new(store).find(&result.action).unwrap(),
+            Some(result)
+        );
+    }
+
     #[test]
     fn gc_skips_a_record_under_repair_and_keeps_its_replacement() {
         let directory = tempfile::tempdir().unwrap();

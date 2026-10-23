@@ -389,26 +389,37 @@ impl LocalActionCache {
             .parent()
             .expect("action-result path has a parent");
         fs::create_dir_all(parent)?;
+        // These outcomes do not mutate the record and need no slot lock.
+        let decide = |existing: &RemoteActionResult| -> Result<Option<ActionStoreOutcome>> {
+            if existing == result {
+                return Ok(Some(ActionStoreOutcome::Unchanged));
+            }
+            // A different intact record keeps the first-writer rule unless
+            // the caller establishes that it cannot be restored.
+            if self.is_intact(existing) {
+                if !keep_existing {
+                    bail!("local action key already has a different result");
+                }
+                if is_restorable(existing) {
+                    return Ok(Some(ActionStoreOutcome::KeptExisting));
+                }
+            }
+            Ok(None)
+        };
         let mut pending = None;
         for _ in 0..8 {
+            if let Ok(Some(existing)) = self.find(&result.action)
+                && let Some(outcome) = decide(&existing)?
+            {
+                return Ok(outcome);
+            }
             let slot = crate::ActionSlot::claim(&destination)?;
+            // A writer may have repaired the record since our lock-free read.
             if let Some(bytes) = slot.read()?
                 && let Ok(existing) = Self::parse_record(&bytes, &result.action)
+                && let Some(outcome) = decide(&existing)?
             {
-                if existing == *result {
-                    return Ok(ActionStoreOutcome::Unchanged);
-                }
-                // A different record is kept so a key never changes under a
-                // reader, unless its objects are gone or torn: then it can
-                // never be restored, and this result is the repair.
-                if self.is_intact(&existing) {
-                    if !keep_existing {
-                        bail!("local action key already has a different result");
-                    }
-                    if is_restorable(&existing) {
-                        return Ok(ActionStoreOutcome::KeptExisting);
-                    }
-                }
+                return Ok(outcome);
             }
             let temporary = if let Some(temporary) = pending.take() {
                 temporary
@@ -468,12 +479,16 @@ mod tests {
         let (started_tx, started_rx) = mpsc::channel();
         let (done_tx, done_rx) = mpsc::channel();
         let thread = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
+            crate::action_slot::tests::observe_claims(move || {
+                let _ = started_tx.send(());
+            });
             done_tx
                 .send(writer.store_unless_restorable(&second, |_| true))
                 .unwrap();
         });
-        started_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        started_rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("writer must open the incumbent for its repair claim");
         // A bounded receive checks that repair respects the other process's lock.
         // The replacement and release themselves are ordered by pipe messages.
         assert!(
@@ -496,6 +511,56 @@ mod tests {
         );
         thread.join().unwrap();
         assert_eq!(actions.find(&action).unwrap(), Some(first));
+    }
+
+    // An artificial holder makes even intact reads fail on Windows, where
+    // record locks are mandatory. Production callers never claim intact records.
+    #[cfg(unix)]
+    #[test]
+    fn intact_stores_do_not_claim_the_record() {
+        use crate::action_slot::tests::Holder;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let cas = LocalCas::new(directory.path());
+        let actions = LocalActionCache::new(directory.path());
+        let action = CacheDigest::blake3(b"action");
+        cas.store_bytes(&action, b"action").unwrap();
+        let metadata = CacheDigest::blake3(b"metadata");
+        cas.store_bytes(&metadata, b"metadata").unwrap();
+        let first = RemoteActionResult {
+            version: 1,
+            action,
+            metadata: None,
+            output_root: None,
+        };
+        let path = actions.store(&first).unwrap();
+        let mut holder = Holder::start(&path, &path);
+        let (done_tx, done_rx) = mpsc::channel();
+        let expected = path.clone();
+        let thread = std::thread::spawn(move || {
+            crate::action_slot::tests::observe_claims(|| panic!("intact store claimed a slot"));
+            assert_eq!(actions.store(&first).unwrap(), expected);
+            assert_eq!(
+                actions.store_unless_restorable(&first, |_| true).unwrap(),
+                ActionStoreOutcome::Unchanged
+            );
+            let second = RemoteActionResult {
+                metadata: Some(metadata),
+                ..first
+            };
+            assert_eq!(
+                actions.store_unless_restorable(&second, |_| true).unwrap(),
+                ActionStoreOutcome::KeptExisting
+            );
+            assert!(actions.store(&second).is_err());
+            done_tx.send(()).unwrap();
+        });
+        done_rx.recv_timeout(Duration::from_secs(20)).unwrap();
+        holder.command("release");
+        holder.expect("released");
+        thread.join().unwrap();
     }
 
     #[test]

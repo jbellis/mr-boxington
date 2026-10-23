@@ -1715,6 +1715,11 @@ pub fn gc_dry_run(store: &Path, max_bytes: u64) -> Result<GcOutcome> {
     gc_with_mode(store, max_bytes, true)
 }
 
+#[cfg(test)]
+thread_local! {
+    static ACTION_RECORD_CLAIMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome> {
     let mut objects = walk_files(&store.join(CAS_DIR))?;
     let results = walk_files(&store.join(ACTION_RESULTS_DIR))?;
@@ -1779,15 +1784,39 @@ fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome
     // store that is over budget on results alone still needs the sweep.
     let cas = LocalCas::new(store);
     for entry in &results {
-        let removal = if dry_run {
-            if !action_result_is_dangling(&cas, &entry.path, &virtually_removed)? {
+        match action_result_is_dangling(&cas, &entry.path, &virtually_removed) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            // Windows readers can encounter another repair's mandatory lock.
+            Err(error)
+                if error
+                    .downcast_ref::<std::io::Error>()
+                    .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied) =>
+            {
+                log::debug!(
+                    "could not inspect {} for eviction: {error}",
+                    entry.path.display()
+                );
                 continue;
             }
+            Err(error) => return Err(error),
+        }
+        let removal = if dry_run {
             Removal::Removed
         } else {
-            match ActionSlot::try_claim(&entry.path)? {
-                None => Removal::Blocked,
-                Some(slot) => match slot.read()? {
+            #[cfg(test)]
+            ACTION_RECORD_CLAIMS.with(|count| count.set(count.get() + 1));
+            match ActionSlot::try_claim(&entry.path) {
+                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                    log::debug!(
+                        "could not claim {} for eviction: {error}",
+                        entry.path.display()
+                    );
+                    Removal::Blocked
+                }
+                Err(error) => return Err(error.into()),
+                Ok(None) => Removal::Blocked,
+                Ok(Some(slot)) => match slot.read()? {
                     None => Removal::Missing,
                     Some(bytes) => {
                         if !action_result_bytes_are_dangling(&cas, &bytes, &virtually_removed)? {
