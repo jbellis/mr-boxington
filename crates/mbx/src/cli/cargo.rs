@@ -1126,9 +1126,16 @@ fn selected_compiler(cargo: &std::ffi::OsStr, arguments: &[String]) -> Option<Pa
     (!build_rustc_configured(&std::env::current_dir().ok()?, arguments)).then_some(rustc)
 }
 
-/// Whether Cargo's configuration names a compiler: a `--config` that mentions
-/// it or names a file that could, or `build.rustc` in a configuration file.
+/// Whether Cargo's configuration names a compiler: `build.rustc` set by a
+/// `--config` value, in a file a `--config` names, or in a configuration file.
+/// Other settings, `build.rustc-wrapper` included, do not choose a compiler.
 pub(super) fn build_rustc_configured(working_dir: &Path, arguments: &[String]) -> bool {
+    let sets_rustc = |table: &toml::Table| {
+        table
+            .get("build")
+            .and_then(toml::Value::as_table)
+            .is_some_and(|build| build.contains_key("rustc"))
+    };
     let mut remaining = arguments.iter().take_while(|argument| *argument != "--");
     while let Some(argument) = remaining.next() {
         let value = match argument.strip_prefix("--config=") {
@@ -1139,7 +1146,15 @@ pub(super) fn build_rustc_configured(working_dir: &Path, arguments: &[String]) -
             },
             None => continue,
         };
-        if value.contains("rustc") || !value.contains('=') {
+        // Cargo reads a value with `=` as TOML and anything else as a file.
+        let table = if value.contains('=') {
+            value.parse::<toml::Table>().ok()
+        } else {
+            std::fs::read_to_string(working_dir.join(value))
+                .ok()
+                .and_then(|text| text.parse::<toml::Table>().ok())
+        };
+        if table.as_ref().is_some_and(sets_rustc) {
             return true;
         }
     }
