@@ -88,6 +88,28 @@ fn inherited_toolchain_cargo_uses_its_absolute_rustc() {
         }),
         "Cargo did not pass its toolchain's absolute rustc: {stderr}"
     );
+
+    // `mbx run --config ...` launches Cargo plainly, without a session, and
+    // must still give it the same compiler.
+    std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+    let output = mbx_command()
+        .current_dir(&project)
+        .env("CARGO", &cargo)
+        .env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTC")
+        .env("MBX_CACHE_DIR", directory.path().join("cache"))
+        .env("MBX_TARGET_ROOT", directory.path().join("targets"))
+        .args(["run", "--offline", "-v", "--config", "build.jobs=1"])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "{stderr}");
+    assert!(
+        stderr.lines().any(|line| {
+            line.contains("--crate-name fixture") && line.contains(rustc.to_string_lossy().as_ref())
+        }),
+        "a plain launch did not pass Cargo's toolchain rustc: {stderr}"
+    );
 }
 
 fn write_project(directory: &Path) {

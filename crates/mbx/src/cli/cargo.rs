@@ -89,7 +89,7 @@ fn cargo_with_settings_bypass_log_and_roots(
         .then(|| toolchain_rustc(Path::new(&cargo)))
         .flatten();
     if super::launch::needs_plain_launch(arguments) {
-        return super::launch::plain_launch(&cargo, arguments);
+        return super::launch::plain_launch(&cargo, arguments, rustc.as_deref());
     }
     let os_arguments = arguments
         .iter()
