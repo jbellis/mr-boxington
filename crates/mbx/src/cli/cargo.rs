@@ -86,7 +86,7 @@ fn cargo_with_settings_bypass_log_and_roots(
     // it. An explicit RUSTC wins, as it does for rustup, and so does
     // RUSTUP_TOOLCHAIN: with it set, rustup sends every compiler invocation to
     // that one toolchain, so nothing can mix.
-    let rustc = compiler_for_cargo(Path::new(&cargo), |name| std::env::var_os(name));
+    let rustc = selected_compiler(&cargo, arguments);
     if super::launch::needs_plain_launch(arguments) {
         return super::launch::plain_launch(&cargo, arguments, rustc.as_deref());
     }
@@ -1105,10 +1105,49 @@ pub(super) fn compiler_for_cargo(
     cargo: &Path,
     get_env: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Option<PathBuf> {
-    if get_env("RUSTC").is_some() || get_env("RUSTUP_TOOLCHAIN").is_some() {
+    if ["RUSTC", "CARGO_BUILD_RUSTC", "RUSTUP_TOOLCHAIN"]
+        .iter()
+        .any(|name| get_env(name).is_some())
+    {
         return None;
     }
     toolchain_rustc(cargo)
+}
+
+/// [`compiler_for_cargo`] for this invocation, which also leaves the choice to
+/// a `+toolchain` argument and to a compiler Cargo's configuration names
+/// (`build.rustc`): the injected RUSTC would override either.
+fn selected_compiler(cargo: &std::ffi::OsStr, arguments: &[String]) -> Option<PathBuf> {
+    let before_program = || arguments.iter().take_while(|argument| *argument != "--");
+    if before_program().any(|argument| argument.starts_with('+')) {
+        return None;
+    }
+    let rustc = compiler_for_cargo(Path::new(cargo), |name| std::env::var_os(name))?;
+    (!build_rustc_configured(&std::env::current_dir().ok()?, arguments)).then_some(rustc)
+}
+
+/// Whether Cargo's configuration names a compiler: a `--config` that mentions
+/// it or names a file that could, or `build.rustc` in a configuration file.
+pub(super) fn build_rustc_configured(working_dir: &Path, arguments: &[String]) -> bool {
+    let mut remaining = arguments.iter().take_while(|argument| *argument != "--");
+    while let Some(argument) = remaining.next() {
+        let value = match argument.strip_prefix("--config=") {
+            Some(value) => value,
+            None if argument == "--config" => match remaining.next() {
+                Some(value) => value,
+                None => return false,
+            },
+            None => continue,
+        };
+        if value.contains("rustc") || !value.contains('=') {
+            return true;
+        }
+    }
+    match cargo_config2::Config::load_with_cwd(invocation_dir(working_dir, arguments)) {
+        Ok(config) => config.build.rustc.is_some(),
+        // Cargo will not run with configuration it cannot read either.
+        Err(_) => true,
+    }
 }
 
 /// Recognize rustup's toolchain layout without guessing what a Cargo wrapper

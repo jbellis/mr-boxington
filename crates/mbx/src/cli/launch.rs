@@ -66,12 +66,14 @@ pub(super) fn plain_launch(
         .iter()
         .take_while(|argument| argument.as_str() != "--")
         .any(|argument| argument.starts_with('+'));
-    let caller_chose = ["RUSTC", "RUSTUP_TOOLCHAIN"].iter().any(|name| {
-        CALLER.get().map_or_else(
-            || std::env::var_os(name).is_some(),
-            |caller| caller.contains_key(OsStr::new(name)),
-        )
-    });
+    let caller_chose = ["RUSTC", "CARGO_BUILD_RUSTC", "RUSTUP_TOOLCHAIN"]
+        .iter()
+        .any(|name| {
+            CALLER.get().map_or_else(
+                || std::env::var_os(name).is_some(),
+                |caller| caller.contains_key(OsStr::new(name)),
+            )
+        });
     if let Some(rustc) = rustc
         && !toolchain_argument
         && !caller_chose
