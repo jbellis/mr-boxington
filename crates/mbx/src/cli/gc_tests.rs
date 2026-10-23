@@ -957,13 +957,38 @@ impl TestCollector {
         Self(command.spawn().unwrap())
     }
 
+    /// Wait, at most a minute, for the collector to reach its sweep body.
+    ///
+    /// Bounded so that a collector which deadlocks before the body fails the
+    /// test instead of hanging the suite.
     fn entered(&mut self) {
         use std::io::BufRead as _;
-        let mut line = String::new();
-        std::io::BufReader::new(self.0.stderr.as_mut().unwrap())
-            .read_line(&mut line)
-            .unwrap();
+        let stderr = self.0.stderr.take().unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let mut line = String::new();
+            let _ = std::io::BufReader::new(stderr).read_line(&mut line);
+            let _ = sender.send(line);
+        });
+        let line = receiver
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the collector should reach its sweep body");
         assert_eq!(line.trim(), "sweep body entered");
+    }
+
+    /// Wait, at most a minute, for the collector to exit.
+    fn wait(&mut self) -> std::process::ExitStatus {
+        let deadline = std::time::Instant::now() + Duration::from_secs(60);
+        loop {
+            if let Some(status) = self.0.try_wait().unwrap() {
+                return status;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the collector should exit"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
 
     fn release(&mut self, command: &[u8]) {
@@ -1000,7 +1025,7 @@ fn a_killed_automatic_collector_leaves_the_sweep_due() {
     collector.entered();
     assert!(store::sweep_is_due(&store, Duration::from_secs(3600)));
     collector.0.kill().unwrap();
-    assert!(!collector.0.wait().unwrap().success());
+    assert!(!collector.wait().success());
     assert!(store::sweep_is_due(&store, Duration::from_secs(3600)));
     assert_eq!(
         std::fs::metadata(store.join("gc/v1/last-sweep"))
@@ -1019,7 +1044,7 @@ fn a_completed_automatic_collector_records_completion() {
     collector.entered();
     assert!(store::sweep_is_due(&store, Duration::from_secs(3600)));
     collector.release(b"finish\n");
-    assert!(collector.0.wait().unwrap().success());
+    assert!(collector.wait().success());
     assert!(!store::sweep_is_due(&store, Duration::from_secs(3600)));
 }
 
@@ -1030,7 +1055,7 @@ fn competing_automatic_collectors_leave_the_stamp_to_the_winner() {
     let mut first = TestCollector::start(root.path(), false);
     first.entered();
     let mut second = TestCollector::start(root.path(), false);
-    assert!(second.0.wait().unwrap().success());
+    assert!(second.wait().success());
     use std::io::Read as _;
     let mut output = String::new();
     second
@@ -1046,7 +1071,7 @@ fn competing_automatic_collectors_leave_the_stamp_to_the_winner() {
     );
     assert!(store::sweep_is_due(&store, Duration::from_secs(3600)));
     first.release(b"finish\n");
-    assert!(first.0.wait().unwrap().success());
+    assert!(first.wait().success());
     assert!(!store::sweep_is_due(&store, Duration::from_secs(3600)));
 }
 
@@ -1057,7 +1082,7 @@ fn a_panicking_automatic_collector_records_before_the_previous_hook_aborts() {
     let mut collector = TestCollector::start(root.path(), true);
     collector.entered();
     collector.release(b"panic\n");
-    assert!(!collector.0.wait().unwrap().success());
+    assert!(!collector.wait().success());
     assert!(!store::sweep_is_due(&store, Duration::from_secs(3600)));
     assert_eq!(
         std::fs::read(store.join("panic-hook-chained")).unwrap(),
