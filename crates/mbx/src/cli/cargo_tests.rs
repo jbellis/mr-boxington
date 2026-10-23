@@ -1026,3 +1026,39 @@ fn target_placement_without_a_lease_leaves_cargos_directory_alone() {
     assert!(std::fs::symlink_metadata(&roots.target_dir).is_err());
     assert!(!config.target.root.exists());
 }
+
+#[test]
+fn resolves_only_a_rustup_toolchain_cargos_sibling_compiler() {
+    let directory = tempfile::tempdir().unwrap();
+    let bin = directory.path().join("toolchains/custom-toolchain/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
+    let rustc = bin.join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    assert_eq!(toolchain_rustc(&cargo), None);
+    std::fs::write(&rustc, "").unwrap();
+    assert_eq!(toolchain_rustc(&cargo), Some(rustc));
+    assert_eq!(toolchain_rustc(&bin.join("wrapper")), None);
+    assert_eq!(toolchain_rustc(Path::new("cargo")), None);
+    assert_eq!(toolchain_rustc(&directory.path().join("bin/cargo")), None);
+}
+
+#[test]
+fn an_explicit_compiler_or_toolchain_wins_over_cargos_own() {
+    let directory = tempfile::tempdir().unwrap();
+    let bin = directory.path().join("toolchains/custom-toolchain/bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let cargo = bin.join(format!("cargo{}", std::env::consts::EXE_SUFFIX));
+    let rustc = bin.join(format!("rustc{}", std::env::consts::EXE_SUFFIX));
+    std::fs::write(&rustc, "").unwrap();
+    let set = |names: &'static [&'static str]| {
+        move |name: &str| {
+            names
+                .contains(&name)
+                .then(|| std::ffi::OsString::from("set"))
+        }
+    };
+    assert_eq!(compiler_for_cargo(&cargo, set(&[])), Some(rustc));
+    assert_eq!(compiler_for_cargo(&cargo, set(&["RUSTC"])), None);
+    assert_eq!(compiler_for_cargo(&cargo, set(&["RUSTUP_TOOLCHAIN"])), None);
+    assert_eq!(compiler_for_cargo(&bin.join("wrapper"), set(&[])), None);
+}
