@@ -232,7 +232,7 @@ pub(crate) fn touch(root: &Path, workspace_root: &Path) -> Result<Checkout> {
 /// Inspect all traceable learned incremental checkout state.
 pub(crate) fn stats(root: &Path) -> Result<Stats> {
     let mut stats = Stats::default();
-    let snapshot = entries(root)?;
+    let snapshot = entries(root, true)?;
     stats.bytes = snapshot.inodes.bytes;
     for entry in snapshot.entries {
         stats.directories += 1;
@@ -293,10 +293,12 @@ pub(crate) fn collect(
 ) -> Result<PruneOutcome> {
     let swept_bytes = sweep_retired(root, dry_run);
     let now = now_secs();
+    // A preview's retired sweep is projected separately; real sweeps leave
+    // any survivors in the snapshot so their bytes stay against the budget.
     let Snapshot {
         entries,
         mut inodes,
-    } = entries(root)?;
+    } = entries(root, !dry_run)?;
     let mut remaining = entries
         .iter()
         .map(|entry| entry.units.len())
@@ -579,27 +581,16 @@ pub(crate) fn collect(
     Ok(outcome)
 }
 
-/// Remove a tree or a single file, one file at a time. A file whose last
-/// link goes is forgotten in the ledger whichever owners still reference it:
-/// the data is gone. Other files are released by their owners as before.
 /// Delete retired trees a crash or an upgrade left behind, returning the bytes
 /// freed. A preview deletes nothing and returns what deleting would free.
 ///
-/// They are outside the sweep's snapshot, so they get an accounting of their
-/// own under the same rule unit removal follows: all of them are measured
-/// together and a file is credited only when its last link goes. A file
-/// linked from two retired trees counts once, and one still linked from a
-/// live checkout frees nothing.
+/// Before the live-state snapshot, all retired trees are measured together
+/// and a file is credited only when its last link goes. A file linked from
+/// two retired trees counts once, and one still linked from a live checkout
+/// frees nothing. Survivors are then measured alongside live state so they
+/// remain visible to the budget.
 fn sweep_retired(root: &Path, dry_run: bool) -> u64 {
-    let mut trees = retired_children(root);
-    for entry in nested_entries(root) {
-        if entry.file_type().is_ok_and(|kind| kind.is_dir())
-            && entry.file_name() != LOCKS_DIR
-            && !retired::is_retired_name(&entry.file_name())
-        {
-            trees.extend(retired_children(&entry.path().join("blake3")));
-        }
-    }
+    let trees = retired_trees(root);
     if dry_run {
         return reclaimable(&trees);
     }
@@ -612,6 +603,19 @@ fn sweep_retired(root: &Path, dry_run: bool) -> u64 {
         remove_tree(tree, false, &mut inodes);
     }
     measured.saturating_sub(inodes.bytes)
+}
+
+fn retired_trees(root: &Path) -> Vec<PathBuf> {
+    let mut trees = retired_children(root);
+    for entry in nested_entries(root) {
+        if entry.file_type().is_ok_and(|kind| kind.is_dir())
+            && entry.file_name() != LOCKS_DIR
+            && !retired::is_retired_name(&entry.file_name())
+        {
+            trees.extend(retired_children(&entry.path().join("blake3")));
+        }
+    }
+    trees
 }
 
 /// What deleting `trees` would free: each file once, and only when every link
@@ -1213,16 +1217,16 @@ fn unlink_retired_checkout_record(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error),
     };
+    let (key, links) = file_identity(&path, &metadata);
     match std::fs::remove_file(&path) {
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(error) => return Err(error),
     }
-    if let Some(inodes) = inodes {
-        let (key, links) = file_identity(&path, &metadata);
-        if links == Some(1) {
-            inodes.forget(&key);
-        }
+    if let Some(inodes) = inodes
+        && links == Some(1)
+    {
+        inodes.forget(&key);
     }
     Ok(metadata.len())
 }
@@ -1241,7 +1245,7 @@ struct Snapshot {
     inodes: Inodes,
 }
 
-fn entries(root: &Path) -> Result<Snapshot> {
+fn entries(root: &Path, include_retired: bool) -> Result<Snapshot> {
     let mut snapshot = Snapshot {
         entries: Vec::new(),
         inodes: Inodes::default(),
@@ -1289,6 +1293,13 @@ fn entries(root: &Path) -> Result<Snapshot> {
             orphan_stamps,
             directory,
         });
+    }
+    if include_retired {
+        // Retired state occupies space without being a usable checkout or
+        // unit. Use the live ledger to count cross-boundary hard links once.
+        for tree in retired_trees(root) {
+            snapshot.inodes.measure(&tree, &HashSet::new());
+        }
     }
     Ok(snapshot)
 }
@@ -3085,6 +3096,84 @@ mod tests {
         assert!(outcome.removed_bytes >= bytes);
         assert!(!retired.exists());
         assert!(!nested.exists());
+    }
+
+    #[test]
+    fn retired_bytes_share_stats_ledger_with_live_state() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = touch(cache.path(), workspace.path()).unwrap();
+        let before = stats(cache.path()).unwrap().bytes;
+        let retired = cache.path().join("donor.retired-123-leftover");
+        std::fs::create_dir_all(&retired).unwrap();
+        std::fs::write(retired.join("shared"), b"leftover").unwrap();
+        std::fs::hard_link(retired.join("shared"), state.directory.join("shared")).unwrap();
+        let nested = state.directory.join("blake3/unit.retired-123-leftover");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("state"), b"unit").unwrap();
+        std::fs::write(cache.path().join("stamp.retired-123-leftover"), b"use").unwrap();
+        let measured = stats(cache.path()).unwrap();
+        assert_eq!(measured.bytes, before + 8 + 4 + 3);
+        assert_eq!(measured.directories, 1);
+        assert_eq!(measured.units, 0);
+        let preview = collect(cache.path(), None, None, true, false, None).unwrap();
+        assert_eq!(
+            preview.removed_bytes, 7,
+            "the live hard link keeps eight bytes"
+        );
+        assert_eq!(preview.remaining_bytes, before + 8);
+        let outcome = collect(cache.path(), None, None, false, false, None).unwrap();
+        assert_eq!(outcome.removed_bytes, preview.removed_bytes);
+        assert_eq!(outcome.remaining_bytes, preview.remaining_bytes);
+        assert_eq!(stats(cache.path()).unwrap().bytes, before + 8);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failed_retired_incremental_deletion_stays_counted_until_retry() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // Root can bypass the directory permissions used to force failure.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let _state = touch(cache.path(), workspace.path()).unwrap();
+        let before = stats(cache.path()).unwrap().bytes;
+        let retired = cache.path().join("stamp.retired-123-leftover");
+        std::fs::write(&retired, b"leftover").unwrap();
+        let permissions = std::fs::metadata(cache.path()).unwrap().permissions();
+        std::fs::set_permissions(cache.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let outcome = collect(cache.path(), None, None, false, false, None);
+        std::fs::set_permissions(cache.path(), permissions).unwrap();
+        let outcome = outcome.unwrap();
+        assert_eq!(outcome.removed_bytes, 0);
+        assert_eq!(outcome.remaining_bytes, before + 8);
+        assert_eq!(stats(cache.path()).unwrap().bytes, before + 8);
+        assert!(retired.exists());
+        let outcome = collect(cache.path(), None, None, false, false, None).unwrap();
+        assert_eq!(outcome.removed_bytes, 8);
+        assert_eq!(outcome.remaining_bytes, before);
+        assert!(!retired.exists());
+    }
+
+    #[cfg(any(unix, windows))]
+    #[test]
+    fn unlinking_checkout_record_forgets_its_measured_identity() {
+        let cache = tempfile::tempdir().unwrap();
+        let directory = cache.path().join("checkout");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(RECORD_FILE), b"record").unwrap();
+        let tree = RetiredTree::retire(&directory).unwrap().unwrap();
+        let mut inodes = Inodes::default();
+        inodes.measure(tree.path(), &HashSet::new());
+        assert_eq!(inodes.bytes, 6);
+        assert_eq!(
+            unlink_retired_checkout_record(&tree, Some(&mut inodes)).unwrap(),
+            6
+        );
+        assert_eq!(inodes.bytes, 0);
+        assert!(!tree.path().join(RECORD_FILE).exists());
     }
 
     #[test]

@@ -536,7 +536,7 @@ pub(crate) fn collect(
     max_age: Option<Duration>,
     dry_run: bool,
 ) -> Result<PruneOutcome> {
-    collect_with(root, max_bytes, max_age, dry_run, || {})
+    collect_with(root, max_bytes, max_age, dry_run, retired::sweep, || {})
 }
 
 fn collect_with(
@@ -544,11 +544,12 @@ fn collect_with(
     max_bytes: Option<u64>,
     max_age: Option<Duration>,
     dry_run: bool,
+    sweep_retired: impl FnOnce(&Path) -> retired::SweepOutcome,
     mut on_retired: impl FnMut(),
 ) -> Result<PruneOutcome> {
     let mut outcome = PruneOutcome::default();
     if !dry_run {
-        let swept = retired::sweep(root);
+        let swept = sweep_retired(root);
         outcome.removed_directories += swept.removed as u64;
         outcome.removed_bytes += swept.bytes;
     }
@@ -575,6 +576,7 @@ fn collect_with(
         let name = entry.file_name().to_string_lossy().into_owned();
         let path = entry.path();
         if retired::is_retired_name(&entry.file_name()) {
+            staging_bytes = staging_bytes.saturating_add(tree_bytes(&path));
             continue;
         }
         let is_dir = match entry.file_type() {

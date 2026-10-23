@@ -84,9 +84,17 @@ pub(crate) struct SweepOutcome {
     pub(crate) bytes: u64,
 }
 
-/// Retired names have no live users. Concurrent sweeps may remove the same
-/// name; a missing tree is already finished.
+/// Retired names have no live users. Callers must serialize sweeps with the
+/// collector lock: concurrent sweeps could credit the same tree twice.
 pub(crate) fn sweep(parent: &Path) -> SweepOutcome {
+    sweep_with(parent, RetiredTree::remove)
+}
+
+/// The removal callback allows tests to inject a failed deletion.
+pub(crate) fn sweep_with(
+    parent: &Path,
+    mut remove: impl FnMut(RetiredTree) -> io::Result<()>,
+) -> SweepOutcome {
     let mut outcome = SweepOutcome::default();
     let Ok(entries) = std::fs::read_dir(parent) else {
         return outcome;
@@ -97,7 +105,7 @@ pub(crate) fn sweep(parent: &Path) -> SweepOutcome {
         }
         let tree = RetiredTree(entry.path());
         let bytes = tree.bytes();
-        if tree.remove().is_ok() {
+        if remove(tree).is_ok() {
             outcome.removed += 1;
             outcome.bytes = outcome.bytes.saturating_add(bytes);
         }

@@ -587,7 +587,7 @@ fn collection_releases_registrar_before_deleting_retired_sources() {
     assert!(!probe.try_lock().unwrap());
     drop(held);
     let mut retired = None;
-    let outcome = collect_with(&root, Some(0), None, false, || {
+    let outcome = collect_with(&root, Some(0), None, false, retired::sweep, || {
         assert!(
             probe.try_lock().unwrap(),
             "deletion must not hold the registrar"
@@ -622,10 +622,41 @@ fn retired_sources_are_hidden_and_swept_even_without_limits() {
     write_tree(&retired, &[("sub/generated.rs", b"leftover")]);
     make_directory_read_only(&retired.join("sub")).unwrap();
     make_directory_read_only(&retired).unwrap();
-    assert_eq!(stats(&root).unwrap().remaining_directories, 0);
+    let measured = stats(&root).unwrap();
+    assert_eq!(measured.remaining_directories, 0);
+    assert_eq!(measured.remaining_bytes, 8);
     assert!(retired.exists());
     let outcome = collect(&root, None, None, false).unwrap();
     assert_eq!(outcome.removed_bytes, 8);
     assert_eq!(outcome.removed_directories, 1);
+    assert!(!retired.exists());
+}
+
+#[test]
+fn failed_retired_source_deletion_stays_counted_until_retry() {
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("out-dirs");
+    let retired = root.join(format!("{}.retired-123-leftover", "a".repeat(64)));
+    write_tree(&retired, &[("sub/generated.rs", b"leftover")]);
+    let outcome = collect_with(
+        &root,
+        Some(0),
+        None,
+        false,
+        |root| {
+            retired::sweep_with(root, |_| {
+                Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+            })
+        },
+        || panic!("retired trees must not enter normal collection"),
+    )
+    .unwrap();
+    assert_eq!(outcome.remaining_directories, 0);
+    assert_eq!(outcome.remaining_bytes, 8);
+    assert_eq!(outcome.removed_bytes, 0);
+    assert_eq!(stats(&root).unwrap().remaining_bytes, 8);
+    let outcome = collect(&root, None, None, false).unwrap();
+    assert_eq!(outcome.removed_bytes, 8);
+    assert_eq!(outcome.remaining_bytes, 0);
     assert!(!retired.exists());
 }
