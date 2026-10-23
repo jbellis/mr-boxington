@@ -57,50 +57,59 @@ mod support;
 /// open, so the readers may never see end of file.
 fn output_within(command: &mut Command, limit: std::time::Duration) -> std::process::Output {
     use std::io::BufRead as _;
+    use std::time::{Duration, Instant};
     let mut child = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
-    let (sender, receiver) = std::sync::mpsc::channel::<(bool, String)>();
+    // `None` marks a reader reaching end of file.
+    let (sender, receiver) = std::sync::mpsc::channel::<Option<(bool, String)>>();
     let stdout = child.stdout.take().unwrap();
     let stderr = child.stderr.take().unwrap();
-    let out_sender = sender.clone();
-    std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stdout)
-            .lines()
-            .map_while(Result::ok)
-        {
-            let _ = out_sender.send((false, line));
-        }
-    });
-    let readers = std::thread::spawn(move || {
-        for line in std::io::BufReader::new(stderr)
-            .lines()
-            .map_while(Result::ok)
-        {
-            let _ = sender.send((true, line));
-        }
-    });
-    let deadline = std::time::Instant::now() + limit;
+    for (is_err, stream) in [
+        (false, Box::new(stdout) as Box<dyn std::io::Read + Send>),
+        (true, Box::new(stderr)),
+    ] {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stream)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let _ = sender.send(Some((is_err, line)));
+            }
+            let _ = sender.send(None);
+        });
+    }
+    drop(sender);
     let (mut out, mut err) = (String::new(), String::new());
-    let mut collect = |receiver: &std::sync::mpsc::Receiver<(bool, String)>| {
-        while let Ok((is_err, line)) = receiver.try_recv() {
-            let buffer = if is_err { &mut err } else { &mut out };
-            buffer.push_str(&line);
-            buffer.push('\n');
-        }
+    let mut finished = 0;
+    let mut take = |message: Option<(bool, String)>| -> bool {
+        let Some((is_err, line)) = message else {
+            return true;
+        };
+        let buffer = if is_err { &mut err } else { &mut out };
+        buffer.push_str(&line);
+        buffer.push('\n');
+        false
     };
+    let deadline = Instant::now() + limit;
     let status = loop {
-        collect(&receiver);
+        while let Ok(message) = receiver.try_recv() {
+            if take(message) {
+                finished += 1;
+            }
+        }
         if let Some(status) = child.try_wait().unwrap() {
             break status;
         }
-        if std::time::Instant::now() >= deadline {
+        if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            std::thread::sleep(std::time::Duration::from_millis(200));
-            collect(&receiver);
+            while let Ok(message) = receiver.recv_timeout(Duration::from_millis(200)) {
+                let _ = take(message);
+            }
             let tail: Vec<&str> = err.lines().rev().take(200).collect();
             let tail: Vec<&str> = tail.into_iter().rev().collect();
             panic!(
@@ -108,13 +117,21 @@ fn output_within(command: &mut Command, limit: std::time::Duration) -> std::proc
                 tail.join("\n")
             );
         }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        std::thread::sleep(Duration::from_millis(50));
     };
-    // The process exited; give the readers a moment to drain, without
-    // waiting on pipes a grandchild might still hold.
-    let _ = readers;
-    std::thread::sleep(std::time::Duration::from_millis(100));
-    collect(&receiver);
+    // Wait for both readers to reach end of file, with a deadline in case a
+    // grandchild still holds the pipes open.
+    let drained = Instant::now() + Duration::from_secs(10);
+    while finished < 2 {
+        match receiver.recv_timeout(drained.saturating_duration_since(Instant::now())) {
+            Ok(message) => {
+                if take(message) {
+                    finished += 1;
+                }
+            }
+            Err(_) => break,
+        }
+    }
     std::process::Output {
         status,
         stdout: out.into_bytes(),
