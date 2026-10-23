@@ -423,11 +423,16 @@ fn collect_with_unlink(
             }
             continue;
         }
-        let Some(_locks) = unit_locks(&unit.directory, dry_run)? else {
+        let Some(locks) = unit_locks(&unit.directory, dry_run)? else {
             active.insert(index);
             outcome.skipped_active_units += 1;
             continue;
         };
+        // The session locks proved no compiler is using the unit. Close them
+        // before the rename: Windows cannot rename a directory while a file
+        // inside it is open, and these lock files are inside. The registrar is
+        // still held, so no mbx compile can start in the unit meanwhile.
+        drop(locks);
         // Detach the unit and its stamps before another lease can recreate
         // either name. The recursive walk runs without the registrar.
         let mut retired_records = Vec::new();
