@@ -280,9 +280,13 @@ impl ViewLease {
 
     /// Take a shared lock on `<root>/v1/<digest>.lock`, waiting for it.
     ///
-    /// Commands on one view share it, so they never wait for each other. They
-    /// wait only while a collector holds it exclusively, which lasts as long as
-    /// one rename and the removal of the view's record.
+    /// Commands using a view share this lock. They wait while collection holds
+    /// it exclusively to rename the view and remove its record, or for a whole
+    /// prune pass over a live view. They also wait for `mbx cache import` to
+    /// finish restoring workspace state or standalone `mbx adopt` to finish
+    /// adopting outputs: each holds it exclusively for its whole operation.
+    /// These reservations keep commands from using outputs while they are
+    /// being moved, restored, or removed.
     pub(crate) fn acquire(root: &Path, workspace_root: &Path) -> Result<Self> {
         let path = view_lock_path(&view_dir(root, workspace_root));
         let file =

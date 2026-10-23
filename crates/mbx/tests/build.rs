@@ -7958,8 +7958,19 @@ fn a_compilation_removes_the_object_files_its_predecessors_left() {
     );
 }
 
+struct TargetLease(std::fs::File);
+
+impl Drop for TargetLease {
+    fn drop(&mut self) {
+        // A concurrently forked child can retain the open file description
+        // until it execs. Explicitly unlock so dropping this guard releases
+        // the lease even while that child still has the descriptor.
+        let _ = self.0.unlock();
+    }
+}
+
 /// Hold the existing sibling lock while a CLI process tries to reserve it.
-fn hold_target_lease(root: &Path, workspace: &Path) -> std::fs::File {
+fn hold_target_lease(root: &Path, workspace: &Path) -> TargetLease {
     let workspace = workspace.canonicalize().unwrap();
     let key = mbx_cache_core::CacheDigest::blake3(workspace.to_string_lossy().as_bytes()).hash;
     std::fs::create_dir_all(root.join("v1")).unwrap();
@@ -7971,7 +7982,7 @@ fn hold_target_lease(root: &Path, workspace: &Path) -> std::fs::File {
         .open(root.join("v1").join(format!("{key}.lock")))
         .unwrap();
     file.lock_shared().unwrap();
-    file
+    TargetLease(file)
 }
 
 #[test]
