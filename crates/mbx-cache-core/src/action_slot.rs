@@ -121,10 +121,16 @@ impl ActionSlot {
         // POSIX rename semantics where the system supports them; tempfile's
         // `persist` uses MoveFileExW, which refuses to replace an open file.
         // A failure is reported to the caller rather than retried.
-        let staged = temporary.into_temp_path();
-        std::fs::rename(&staged, &self.path)?;
-        // The staged name is gone now; keep its guard from deleting anything.
-        let _ = staged.keep();
+        // `keep` first: on Windows it clears the temporary-file attribute by
+        // path, which only works while the staged name still exists.
+        let staged = temporary
+            .into_temp_path()
+            .keep()
+            .map_err(|error| error.error)?;
+        if let Err(error) = std::fs::rename(&staged, &self.path) {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
         Ok(())
     }
 
