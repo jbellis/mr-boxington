@@ -51,6 +51,94 @@ impl Drop for BuildChildGuard {
 mod semantic_oracle;
 mod support;
 
+/// Run `command`, failing with the last lines it printed if it has not finished
+/// within `limit` instead of hanging the suite. Output is read line by line
+/// over a channel: a killed mbx can leave a Cargo it started holding the pipes
+/// open, so the readers may never see end of file.
+fn output_within(command: &mut Command, limit: std::time::Duration) -> std::process::Output {
+    use std::io::BufRead as _;
+    use std::time::{Duration, Instant};
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    // `None` marks a reader reaching end of file.
+    let (sender, receiver) = std::sync::mpsc::channel::<Option<(bool, String)>>();
+    let stdout = child.stdout.take().unwrap();
+    let stderr = child.stderr.take().unwrap();
+    for (is_err, stream) in [
+        (false, Box::new(stdout) as Box<dyn std::io::Read + Send>),
+        (true, Box::new(stderr)),
+    ] {
+        let sender = sender.clone();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stream)
+                .lines()
+                .map_while(Result::ok)
+            {
+                let _ = sender.send(Some((is_err, line)));
+            }
+            let _ = sender.send(None);
+        });
+    }
+    drop(sender);
+    let (mut out, mut err) = (String::new(), String::new());
+    let mut finished = 0;
+    let mut take = |message: Option<(bool, String)>| -> bool {
+        let Some((is_err, line)) = message else {
+            return true;
+        };
+        let buffer = if is_err { &mut err } else { &mut out };
+        buffer.push_str(&line);
+        buffer.push('\n');
+        false
+    };
+    let deadline = Instant::now() + limit;
+    let status = loop {
+        while let Ok(message) = receiver.try_recv() {
+            if take(message) {
+                finished += 1;
+            }
+        }
+        if let Some(status) = child.try_wait().unwrap() {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            while let Ok(message) = receiver.recv_timeout(Duration::from_millis(200)) {
+                let _ = take(message);
+            }
+            let tail: Vec<&str> = err.lines().rev().take(200).collect();
+            let tail: Vec<&str> = tail.into_iter().rev().collect();
+            panic!(
+                "command did not finish within {limit:?}; last stderr lines:\n{}",
+                tail.join("\n")
+            );
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
+    // Wait for both readers to reach end of file, with a deadline in case a
+    // grandchild still holds the pipes open.
+    let drained = Instant::now() + Duration::from_secs(10);
+    while finished < 2 {
+        match receiver.recv_timeout(drained.saturating_duration_since(Instant::now())) {
+            Ok(message) => {
+                if take(message) {
+                    finished += 1;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    std::process::Output {
+        status,
+        stdout: out.into_bytes(),
+        stderr: err.into_bytes(),
+    }
+}
+
 /// A Cargo subcommand can inherit toolchain Cargo without rustup's environment.
 /// Cargo must still pass that toolchain's compiler to every wrapper invocation.
 #[test]
@@ -68,16 +156,21 @@ fn inherited_toolchain_cargo_uses_its_absolute_rustc() {
     let cargo = PathBuf::from(String::from_utf8(cargo.stdout).unwrap().trim());
     let rustc = cargo.with_file_name(if cfg!(windows) { "rustc.exe" } else { "rustc" });
     assert!(rustc.is_absolute() && rustc.is_file());
-    let output = mbx_command()
+    let mut command = mbx_command();
+    command
         .current_dir(&project)
         .env("CARGO", &cargo)
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("RUSTC")
+        // A suite run under mbx hands its own wrapper to every child. Here it
+        // would compile through the outer session's scheduler instead of the
+        // one under test, and a plain launch keeps the caller's environment.
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env("MBX_CACHE_DIR", directory.path().join("cache"))
         .env("MBX_TARGET_ROOT", directory.path().join("targets"))
-        .args(["build", "--offline", "-v"])
-        .output()
-        .unwrap();
+        .args(["build", "--offline", "-v"]);
+    let output = output_within(&mut command, std::time::Duration::from_secs(180));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(
@@ -92,16 +185,21 @@ fn inherited_toolchain_cargo_uses_its_absolute_rustc() {
     // `mbx run --config ...` launches Cargo plainly, without a session, and
     // must still give it the same compiler.
     std::fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
-    let output = mbx_command()
+    let mut command = mbx_command();
+    command
         .current_dir(&project)
         .env("CARGO", &cargo)
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("RUSTC")
+        // A suite run under mbx hands its own wrapper to every child. Here it
+        // would compile through the outer session's scheduler instead of the
+        // one under test, and a plain launch keeps the caller's environment.
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env("MBX_CACHE_DIR", directory.path().join("cache"))
         .env("MBX_TARGET_ROOT", directory.path().join("targets"))
-        .args(["run", "--offline", "-v", "--config", "build.jobs=1"])
-        .output()
-        .unwrap();
+        .args(["run", "--offline", "-v", "--config", "build.jobs=1"]);
+    let output = output_within(&mut command, std::time::Duration::from_secs(180));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(output.status.success(), "{stderr}");
     assert!(
