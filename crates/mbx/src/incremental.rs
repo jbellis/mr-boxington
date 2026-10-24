@@ -309,7 +309,38 @@ fn collect_with_unlink(
     dry_run: bool,
     hot_floor: bool,
     backstop_budget: Option<u64>,
-    mut unlink: impl FnMut(&RetiredTree, Option<&mut Inodes>) -> std::io::Result<u64>,
+    unlink: impl FnMut(&RetiredTree, Option<&mut Inodes>) -> std::io::Result<u64>,
+) -> Result<PruneOutcome> {
+    collect_with_retire_and_unlink(
+        root,
+        max_bytes,
+        max_age,
+        dry_run,
+        hot_floor,
+        backstop_budget,
+        CollectHooks {
+            retire: RetiredTree::retire,
+            unlink,
+        },
+    )
+}
+
+struct CollectHooks<R, U> {
+    retire: R,
+    unlink: U,
+}
+
+fn collect_with_retire_and_unlink(
+    root: &Path,
+    max_bytes: Option<u64>,
+    max_age: Option<Duration>,
+    dry_run: bool,
+    hot_floor: bool,
+    backstop_budget: Option<u64>,
+    mut hooks: CollectHooks<
+        impl FnMut(&Path) -> std::io::Result<Option<RetiredTree>>,
+        impl FnMut(&RetiredTree, Option<&mut Inodes>) -> std::io::Result<u64>,
+    >,
 ) -> Result<PruneOutcome> {
     let swept_bytes = sweep_retired(root, dry_run);
     let now = now_secs();
@@ -423,41 +454,54 @@ fn collect_with_unlink(
             }
             continue;
         }
-        let Some(_locks) = unit_locks(&unit.directory, dry_run)? else {
+        let Some(locks) = unit_locks(&unit.directory, dry_run)? else {
             active.insert(index);
             outcome.skipped_active_units += 1;
             continue;
         };
+        // The session locks proved no compiler is using the unit. Close them
+        // before the rename: Windows cannot rename a directory while a file
+        // inside it is open, and these lock files are inside. The registrar is
+        // still held, so no mbx compile can start in the unit meanwhile.
+        drop(locks);
         // Detach the unit and its stamps before another lease can recreate
         // either name. The recursive walk runs without the registrar.
         let mut retired_records = Vec::new();
         let retired_unit = if dry_run {
             None
         } else {
-            let tree = match RetiredTree::retire(&unit.directory) {
+            let mut record_failure = None;
+            for record in &unit.records {
+                match (hooks.retire)(record) {
+                    Ok(Some(tree)) => retired_records.push((record.clone(), tree)),
+                    Ok(None) => {}
+                    Err(error) => {
+                        record_failure = Some((record, error));
+                        break;
+                    }
+                }
+            }
+            if let Some((record, error)) = record_failure {
+                log::warn!(
+                    "could not retire incremental record {}: {error}",
+                    record.display()
+                );
+                restore_unit_records(&retired_records, &error);
+                kept_records.insert(index);
+                continue;
+            }
+            match (hooks.retire)(&unit.directory) {
                 Ok(tree) => tree,
                 Err(error) => {
                     log::warn!(
                         "could not retire incremental unit {}: {error}",
                         unit.directory.display()
                     );
+                    restore_unit_records(&retired_records, &error);
+                    kept_records.insert(index);
                     continue;
                 }
-            };
-            for record in &unit.records {
-                match RetiredTree::retire(record) {
-                    Ok(Some(record)) => retired_records.push(record),
-                    Ok(None) => {}
-                    Err(error) => {
-                        log::warn!(
-                            "could not retire incremental record {}: {error}",
-                            record.display()
-                        );
-                        kept_records.insert(index);
-                    }
-                }
             }
-            tree
         };
         drop(guard);
         let unit_removed = dry_run
@@ -474,7 +518,7 @@ fn collect_with_unlink(
                 // Try every stamp even if an earlier deletion failed.
                 retired_records
                     .iter()
-                    .filter(|record| !remove_tree(record.path(), false, &mut inodes))
+                    .filter(|(_, record)| !remove_tree(record.path(), false, &mut inodes))
                     .count()
                     == 0
             };
@@ -562,7 +606,7 @@ fn collect_with_unlink(
                 }
             };
             if let Some(tree) = &tree
-                && let Err(error) = unlink(tree, Some(&mut inodes))
+                && let Err(error) = (hooks.unlink)(tree, Some(&mut inodes))
             {
                 restore_retired_checkout(tree, &entry.directory, &error)?;
                 log::warn!(
@@ -606,6 +650,18 @@ fn collect_with_unlink(
         );
     }
     Ok(outcome)
+}
+
+fn restore_unit_records(records: &[(PathBuf, RetiredTree)], cause: &std::io::Error) {
+    for (live, retired) in records {
+        if let Err(restore_error) = std::fs::rename(retired.path(), live) {
+            log::warn!(
+                "could not restore incremental record {} from {} after retirement failed ({cause}): {restore_error}",
+                live.display(),
+                retired.path().display()
+            );
+        }
+    }
 }
 
 /// Delete retired trees a crash or an upgrade left behind, returning the bytes
@@ -2136,6 +2192,51 @@ mod tests {
         assert!(!directory.exists());
         assert!(state.directory.join("private/marker").exists());
         assert!(state.directory.join("blake3/orphan.json").exists());
+    }
+
+    #[test]
+    fn failed_record_retirement_keeps_unit_and_all_records_live() {
+        let cache = tempfile::tempdir().unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        let state = touch(cache.path(), workspace.path()).unwrap();
+        let directory = unit(&state.directory, "unit", 0);
+        let churn_record = directory.with_extension("json");
+        let stamp_record = use_stamp_path(&directory);
+        std::fs::write(&churn_record, b"churn").unwrap();
+        std::fs::write(&stamp_record, b"stamp").unwrap();
+        drop(state.lease);
+
+        let mut attempts = 0;
+        let outcome = collect_with_retire_and_unlink(
+            cache.path(),
+            Some(0),
+            None,
+            false,
+            false,
+            None,
+            CollectHooks {
+                retire: |path: &Path| {
+                    attempts += 1;
+                    if attempts == 2 {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::PermissionDenied,
+                            "injected record retirement failure",
+                        ));
+                    }
+                    RetiredTree::retire(path)
+                },
+                unlink: unlink_retired_checkout_record,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(attempts, 2);
+        assert_eq!(outcome.removed_units, 0);
+        assert_eq!(outcome.remaining_units, 1);
+        assert!(directory.is_dir());
+        assert!(churn_record.is_file());
+        assert!(stamp_record.is_file());
+        assert!(retired_trees(cache.path()).is_empty());
     }
 
     #[test]
