@@ -1150,7 +1150,8 @@ pub(super) fn build_rustc_configured(working_dir: &Path, arguments: &[String]) -
         let table = if value.contains('=') {
             value.parse::<toml::Table>().ok()
         } else {
-            std::fs::read_to_string(working_dir.join(value))
+            // Relative to where Cargo runs, which `-C` moves.
+            std::fs::read_to_string(invocation_dir(working_dir, arguments).join(value))
                 .ok()
                 .and_then(|text| text.parse::<toml::Table>().ok())
         };
