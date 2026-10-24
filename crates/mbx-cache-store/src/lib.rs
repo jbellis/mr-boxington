@@ -1796,8 +1796,9 @@ fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome
             // Windows readers can encounter another repair's mandatory lock.
             Err(error)
                 if error
-                    .downcast_ref::<std::io::Error>()
-                    .is_some_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied) =>
+                    .chain()
+                    .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .any(held_by_another_process) =>
             {
                 log::debug!(
                     "could not inspect {} for eviction: {error}",
@@ -1819,7 +1820,7 @@ fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome
             #[cfg(test)]
             ACTION_RECORD_CLAIMS.with(|count| count.set(count.get() + 1));
             match ActionSlot::try_claim(&entry.path) {
-                Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                Err(error) if held_by_another_process(&error) => {
                     log::debug!(
                         "could not claim {} for eviction: {error}",
                         entry.path.display()
@@ -1839,7 +1840,7 @@ fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome
                             Ok(false) => Removal::Missing,
                             // Open files may prevent deletion on Windows, just
                             // as they do in the other eviction paths.
-                            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                            Err(error) if held_by_another_process(&error) => {
                                 log::debug!("could not evict {}: {error}", entry.path.display());
                                 Removal::Blocked
                             }
@@ -2493,6 +2494,17 @@ fn action_result_is_dangling(
         }
     };
     action_result_bytes_are_dangling(cas, &bytes, virtually_removed)
+}
+
+/// Whether an I/O error means another process holds the file.
+///
+/// Windows reports a read of a range another process has locked as
+/// ERROR_LOCK_VIOLATION (33), and an open the other handle's sharing mode
+/// refuses as ERROR_SHARING_VIOLATION (32); neither maps to a portable error
+/// kind. Elsewhere this is a permission error.
+fn held_by_another_process(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        || (cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)))
 }
 
 fn action_result_bytes_are_dangling(
