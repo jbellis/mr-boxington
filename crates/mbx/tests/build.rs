@@ -162,9 +162,13 @@ fn inherited_toolchain_cargo_uses_its_absolute_rustc() {
         .env("CARGO", &cargo)
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("RUSTC")
+        // A suite run under mbx hands its own wrapper to every child. Here it
+        // would compile through the outer session's scheduler instead of the
+        // one under test, and a plain launch keeps the caller's environment.
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env("MBX_CACHE_DIR", directory.path().join("cache"))
         .env("MBX_TARGET_ROOT", directory.path().join("targets"))
-        .env("MBX_LOG", "mbx=debug")
         .args(["build", "--offline", "-v"]);
     let output = output_within(&mut command, std::time::Duration::from_secs(180));
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -187,6 +191,11 @@ fn inherited_toolchain_cargo_uses_its_absolute_rustc() {
         .env("CARGO", &cargo)
         .env_remove("RUSTUP_TOOLCHAIN")
         .env_remove("RUSTC")
+        // A suite run under mbx hands its own wrapper to every child. Here it
+        // would compile through the outer session's scheduler instead of the
+        // one under test, and a plain launch keeps the caller's environment.
+        .env_remove("RUSTC_WRAPPER")
+        .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env("MBX_CACHE_DIR", directory.path().join("cache"))
         .env("MBX_TARGET_ROOT", directory.path().join("targets"))
         .args(["run", "--offline", "-v", "--config", "build.jobs=1"]);
