@@ -1077,6 +1077,15 @@ fn a_compiler_named_in_cargo_configuration_is_left_to_cargo() {
         directory.path(),
         &arguments(&["--config=compiler.toml", "build"])
     ));
+    std::fs::write(
+        directory.path().join("includes.toml"),
+        "include = [\"compiler.toml\"]\n",
+    )
+    .unwrap();
+    assert!(build_rustc_configured(
+        directory.path(),
+        &arguments(&["--config=includes.toml", "build"])
+    ));
     std::fs::create_dir_all(directory.path().join("project")).unwrap();
     std::fs::rename(
         directory.path().join("compiler.toml"),

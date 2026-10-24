@@ -1130,11 +1130,13 @@ fn selected_compiler(cargo: &std::ffi::OsStr, arguments: &[String]) -> Option<Pa
 /// `--config` value, in a file a `--config` names, or in a configuration file.
 /// Other settings, `build.rustc-wrapper` included, do not choose a compiler.
 pub(super) fn build_rustc_configured(working_dir: &Path, arguments: &[String]) -> bool {
+    // An `include` can pull in a file that sets it, so count one as setting it.
     let sets_rustc = |table: &toml::Table| {
-        table
-            .get("build")
-            .and_then(toml::Value::as_table)
-            .is_some_and(|build| build.contains_key("rustc"))
+        table.contains_key("include")
+            || table
+                .get("build")
+                .and_then(toml::Value::as_table)
+                .is_some_and(|build| build.contains_key("rustc"))
     };
     let mut remaining = arguments.iter().take_while(|argument| *argument != "--");
     while let Some(argument) = remaining.next() {
