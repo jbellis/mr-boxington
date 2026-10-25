@@ -303,7 +303,9 @@ the foreground instead.
 
 The automatic collection interval starts when a sweep finishes. If a sandbox
 kills the background collector when its build exits, the next build can retry
-immediately. A collector that panics still waits the full interval before retrying.
+immediately. A collector that panics still counts as a finished sweep, so the
+next one waits the usual interval: `gc.interval`, or at most five minutes while
+[the disk runs low](#when-the-disk-runs-low).
 
 Set `gc.interval` to change how often collection runs. To turn automatic
 collection off, including the collection described in
