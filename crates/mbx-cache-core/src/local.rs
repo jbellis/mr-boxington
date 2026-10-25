@@ -4,6 +4,9 @@ use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
+/// Why [`LocalActionCache::store`] refuses to replace an intact result.
+pub const ACTION_CONFLICT_MESSAGE: &str = "local action key already has a different result";
+
 /// A validated, content-addressed store on the local filesystem.
 #[derive(Debug, Clone)]
 pub struct LocalCas {
@@ -398,7 +401,7 @@ impl LocalActionCache {
             // the caller establishes that it cannot be restored.
             if self.is_intact(existing) {
                 if !keep_existing {
-                    bail!("local action key already has a different result");
+                    bail!("{ACTION_CONFLICT_MESSAGE}");
                 }
                 if is_restorable(existing) {
                     return Ok(Some(ActionStoreOutcome::KeptExisting));
@@ -850,7 +853,7 @@ mod tests {
             ActionStoreOutcome::KeptExisting
         );
         let error = actions.store(&second).unwrap_err();
-        assert!(error.to_string().contains("different result"));
+        assert_eq!(error.to_string(), ACTION_CONFLICT_MESSAGE);
         assert_eq!(actions.find(&action).unwrap(), Some(first));
 
         fs::remove_file(cas.path_for(&file).unwrap()).unwrap();

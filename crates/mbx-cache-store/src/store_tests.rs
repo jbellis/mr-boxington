@@ -2702,6 +2702,38 @@ mod action_record_locking {
     }
 
     #[test]
+    fn gc_keeps_a_record_whose_missing_tree_file_was_restored_after_the_filter() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = directory.path();
+        let contents = [7_u8; 4096];
+        let file = store_object(store, &contents);
+        let action = store_result(store, "repaired tree", std::slice::from_ref(&file));
+        age(store, &file, Duration::from_secs(3600));
+        let cache = LocalActionCache::new(store);
+        let record = cache.path_for(&action).unwrap();
+        let before = stats(store).unwrap();
+        let cas = LocalCas::new(store);
+        let missing_path = cas.path_for(&file).unwrap();
+        let repaired = std::rc::Rc::new(std::cell::Cell::new(false));
+        let repaired_in_hook = repaired.clone();
+        AFTER_DANGLING_READ.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |found: &Path| {
+                assert_eq!(found, record);
+                assert!(!missing_path.exists());
+                cas.store_bytes(&file, &contents).unwrap();
+                repaired_in_hook.set(true);
+            }));
+        });
+        let swept = gc(store, before.total_bytes() - 4096);
+        AFTER_DANGLING_READ.with(|hook| *hook.borrow_mut() = None);
+        assert!(repaired.get());
+        let swept = swept.unwrap();
+        assert_eq!(swept.removed_objects, 1);
+        assert_eq!(swept.removed_action_results, 0);
+        assert!(cache.find(&action).unwrap().is_some());
+    }
+
+    #[test]
     fn gc_skips_a_record_under_repair_and_keeps_its_replacement() {
         let directory = tempfile::tempdir().unwrap();
         let store = directory.path();
@@ -2760,4 +2792,67 @@ mod action_record_locking {
         assert_eq!(swept.removed_action_results, 1);
         assert!(!path.exists());
     }
+}
+
+#[test]
+fn drops_an_action_result_whose_output_tree_lost_a_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path();
+    let big = store_object(store, &[7_u8; 4096]);
+    let small = store_object(store, b"small output");
+    let broken = store_result(store, "broken", &[big.clone(), small.clone()]);
+    let kept = store_result(store, "kept", std::slice::from_ref(&small));
+    age(store, &big, Duration::from_secs(3600));
+    let cache = LocalActionCache::new(store);
+    let before = stats(store).unwrap();
+
+    // The budget forces out the oldest object, one file inside `broken`'s tree.
+    // The tree object itself survives, so only walking the tree can notice.
+    let outcome = gc(store, before.total_bytes() - 4096).unwrap();
+
+    assert_eq!(outcome.removed_objects, 1);
+    assert_eq!(outcome.removed_action_results, 1);
+    assert!(cache.find(&broken).unwrap().is_none());
+    assert!(cache.find(&kept).unwrap().is_some());
+}
+
+#[test]
+fn drops_an_action_result_whose_nested_file_was_evicted() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path();
+    let shared = store_object(store, b"shared output");
+    let deep = store_object(store, &[9_u8; 4096]);
+    let action = store_nested_result(store, &shared, &deep);
+    age(store, &deep, Duration::from_secs(3600));
+    let before = stats(store).unwrap();
+
+    let outcome = gc(store, before.total_bytes() - 4096).unwrap();
+
+    assert_eq!(outcome.removed_action_results, 1);
+    assert!(
+        LocalActionCache::new(store)
+            .find(&action)
+            .unwrap()
+            .is_none()
+    );
+}
+
+#[test]
+fn a_dry_run_counts_results_whose_output_tree_would_lose_a_file() {
+    let directory = tempfile::tempdir().unwrap();
+    let store = directory.path();
+    let big = store_object(store, &[7_u8; 4096]);
+    let broken = store_result(store, "broken", std::slice::from_ref(&big));
+    age(store, &big, Duration::from_secs(3600));
+    let before = stats(store).unwrap();
+
+    let outcome = gc_dry_run(store, before.total_bytes() - 4096).unwrap();
+
+    assert_eq!(outcome.removed_action_results, 1);
+    assert!(
+        LocalActionCache::new(store)
+            .find(&broken)
+            .unwrap()
+            .is_some()
+    );
 }
