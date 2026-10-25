@@ -844,6 +844,7 @@ fn isolated_cargo_command(
         .env_remove("MBX_SOCKET")
         .env_remove("RUSTC_WRAPPER")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
+        .env_remove("CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER")
         .env_remove("CLIPPY_CONF_DIR");
     for (name, value) in settings {
         command.env(name, value);
@@ -2509,6 +2510,162 @@ fn eager_incremental_is_opt_in_and_yields_to_verification() {
     }
 }
 
+/// A binary crate that prints `FINGERPRINT`, which its build script sets with
+/// `cargo:rustc-env` from `fingerprint.txt`. `extra` is one more statement for
+/// the build script.
+fn write_fingerprinted_project(directory: &Path, extra: &str) {
+    std::fs::create_dir_all(directory.join("src")).unwrap();
+    std::fs::write(
+        directory.join("Cargo.toml"),
+        "[package]\nname = \"fingerprinted\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    std::fs::write(
+        directory.join("build.rs"),
+        format!(
+            "fn main() {{\n    println!(\"cargo:rerun-if-changed=fingerprint.txt\");\n    \
+             {extra}\n    \
+             let value = std::fs::read_to_string(\"fingerprint.txt\").unwrap();\n    \
+             println!(\"cargo:rustc-env=FINGERPRINT={{}}\", value.trim());\n}}\n"
+        ),
+    )
+    .unwrap();
+    std::fs::write(
+        directory.join("src/main.rs"),
+        "fn main() {\n    println!(\"{}\", env!(\"FINGERPRINT\"));\n}\n",
+    )
+    .unwrap();
+    std::fs::write(directory.join("fingerprint.txt"), "0\n").unwrap();
+    generate_lockfile(directory);
+}
+
+/// The lookup a changed environment value gets first can have nothing to look
+/// up: no prediction survives to key the compilation. The change still counts
+/// as an edit, and the active crate keeps private state.
+#[test]
+fn a_changed_environment_value_keeps_private_state_without_a_prediction() {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_fingerprinted_project(project.path(), "");
+    build(
+        project.path(),
+        store.path(),
+        &reports.path().join("cold.json"),
+    );
+    for revision in 1..=2 {
+        std::fs::write(
+            project.path().join("fingerprint.txt"),
+            format!("{revision}\n"),
+        )
+        .unwrap();
+        build(
+            project.path(),
+            store.path(),
+            &reports.path().join(format!("{revision}.json")),
+        );
+    }
+
+    // The churn records stay; the predictions go, including those finished
+    // flights leave behind.
+    std::fs::remove_dir_all(store.path().join("actions/task-manifests/v1")).unwrap();
+    let flights = find_files(store.path(), |path| {
+        path.extension()
+            .is_some_and(|extension| extension == "prediction")
+    });
+    assert!(!flights.is_empty());
+    for flight in flights {
+        std::fs::remove_file(flight).unwrap();
+    }
+    std::fs::write(project.path().join("fingerprint.txt"), "3\n").unwrap();
+    let (stats, stderr) = build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("3.json"),
+        &[],
+    );
+    assert!(
+        compiled_incrementally(&stats) > 0,
+        "the change should have kept private state: {stats}\n{stderr}"
+    );
+    let binary = project.path().join(format!(
+        "target/debug/fingerprinted{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    let run = Command::new(&binary).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "3\n");
+}
+
+/// A build script that hands its crate a value through `cargo:rustc-env`
+/// changes what the crate compiles whenever the value changes, as an edit to
+/// its sources would. The crate keeps its private incremental state across
+/// such a change instead of compiling from scratch, and a value the cache
+/// already holds restores.
+#[test]
+fn a_changed_build_script_environment_value_counts_as_an_edit() {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    write_fingerprinted_project(project.path(), "");
+
+    let cold = build(
+        project.path(),
+        store.path(),
+        &reports.path().join("cold.json"),
+    );
+    assert_eq!(compiled_incrementally(&cold), 0, "{cold}");
+
+    let binary = project.path().join(format!(
+        "target/debug/fingerprinted{}",
+        std::env::consts::EXE_SUFFIX
+    ));
+    for revision in 1..=2 {
+        std::fs::write(
+            project.path().join("fingerprint.txt"),
+            format!("{revision}\n"),
+        )
+        .unwrap();
+        let (stats, stderr) = build_with(
+            project.path(),
+            store.path(),
+            &reports.path().join(format!("{revision}.json")),
+            &[],
+        );
+        assert!(
+            compiled_incrementally(&stats) > 0,
+            "revision {revision} should have kept private state: {stats}\n{stderr}"
+        );
+        assert!(
+            !stderr.contains("incremental state was not reused"),
+            "revision {revision}: {stderr}"
+        );
+        let run = Command::new(&binary).output().unwrap();
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            format!("{revision}\n")
+        );
+    }
+
+    // Back to the value the cold build published: the crate is active, but a
+    // changed value is still looked up, and this one restores.
+    std::fs::write(project.path().join("fingerprint.txt"), "0\n").unwrap();
+    let (returned, stderr) = build_with(
+        project.path(),
+        store.path(),
+        &reports.path().join("returned.json"),
+        &[],
+    );
+    assert_eq!(compiled_incrementally(&returned), 0, "{returned}\n{stderr}");
+    assert!(
+        returned["compiler"]
+            .as_object()
+            .is_none_or(|compiled| compiled.is_empty()),
+        "{returned}\n{stderr}"
+    );
+    let run = Command::new(&binary).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout), "0\n");
+}
+
 /// A workspace crate somebody is editing misses on every build no matter what
 /// the cache does. On its first edit, it gets its own incremental
 /// state -- which never reaches the store, because it describes one checkout's
@@ -2755,6 +2912,54 @@ fn a_dangling_link_in_a_native_search_path_does_not_stop_the_first_edit_going_in
     assert_incremental_on_first_edit_despite_native_dir(|native, elsewhere| {
         std::os::unix::fs::symlink(elsewhere.join("missing"), native.join("libgone.so")).unwrap();
     });
+}
+
+/// An uncacheable crate whose build script hands it a changed value through
+/// `cargo:rustc-env` counts as edited too, and keeps private state.
+#[cfg(unix)]
+#[test]
+fn a_crate_with_an_unshareable_native_search_path_keeps_state_across_environment_changes() {
+    let store = tempfile::tempdir().unwrap();
+    let project = tempfile::tempdir().unwrap();
+    let reports = tempfile::tempdir().unwrap();
+    let native = tempfile::tempdir().unwrap();
+    let elsewhere = tempfile::tempdir().unwrap();
+    std::fs::write(elsewhere.path().join("libextra.so.1"), b"not a library").unwrap();
+    std::os::unix::fs::symlink(
+        elsewhere.path().join("libextra.so.1"),
+        native.path().join("libextra.so"),
+    )
+    .unwrap();
+    write_fingerprinted_project(
+        project.path(),
+        &format!(
+            "println!(\"cargo:rustc-link-search=native={}\");",
+            native.path().display()
+        ),
+    );
+
+    build(
+        project.path(),
+        store.path(),
+        &reports.path().join("cold.json"),
+    );
+    for revision in 1..=2 {
+        std::fs::write(
+            project.path().join("fingerprint.txt"),
+            format!("{revision}\n"),
+        )
+        .unwrap();
+        let (stats, stderr) = build_with(
+            project.path(),
+            store.path(),
+            &reports.path().join(format!("{revision}.json")),
+            &[],
+        );
+        assert!(
+            compiled_incrementally(&stats) > 0,
+            "revision {revision} should have kept private state: {stats}\n{stderr}"
+        );
+    }
 }
 
 /// The same evidence that turns it on turns it off: once the content stops
@@ -8228,4 +8433,75 @@ fn standalone_adopt_refuses_a_busy_target() {
     );
     assert!(std::fs::read_link(&target).is_ok());
     assert_eq!(std::fs::read(target.join("artifact")).unwrap(), b"outputs");
+}
+
+/// Exercise Cargo's late workspace-wrapper selection while mbx owns the outer
+/// rustc wrapper, including the config-only path Cargo does not export.
+#[cfg(target_os = "macos")]
+#[test]
+fn late_workspace_wrappers_keep_objects_when_they_skip_rustc() {
+    for mode in ["environment", "config"] {
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_object_project(project.path(), 1);
+        generate_lockfile(project.path());
+        build_with(
+            project.path(),
+            store.path(),
+            &reports.path().join("seed.json"),
+            &[("MBX_INCREMENTAL", "1")],
+        );
+        let old_objects = object_files(project.path());
+        assert!(!old_objects.is_empty(), "the seed build left debug objects");
+
+        let wrapper = project.path().join("workspace-wrapper");
+        let wrapper_log = project.path().join("workspace-wrapper.log");
+        std::fs::write(
+            &wrapper,
+            "#!/bin/sh\nfor arg do\n  case \"$arg\" in\n    -vV|--print|--print=*) exec \"$@\" ;;\n  esac\ndone\nprintf 'called\\n' >> \"$MBX_TEST_WRAPPER_LOG\"\nexit 0\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let cargo_shim = project.path().join("cargo-shim");
+        std::fs::write(
+            &cargo_shim,
+            "#!/bin/sh\ncase \"$MBX_TEST_WORKSPACE_MODE\" in\n  environment)\n    export RUSTC_WORKSPACE_WRAPPER=\"$MBX_TEST_WORKSPACE_WRAPPER\"\n    unset CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER\n    ;;\n  config)\n    unset RUSTC_WORKSPACE_WRAPPER CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER\n    set -- \"$@\" --config \"build.rustc-workspace-wrapper=\\\"$MBX_TEST_WORKSPACE_WRAPPER\\\"\"\n    ;;\nesac\nexec \"$MBX_TEST_REAL_CARGO\" \"$@\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&cargo_shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(2_100));
+        write_object_project(project.path(), 2);
+        let cargo_path = cargo();
+        let settings = [
+            ("CARGO", cargo_shim.to_str().unwrap()),
+            ("MBX_TEST_REAL_CARGO", cargo_path.to_str().unwrap()),
+            ("MBX_TEST_WORKSPACE_WRAPPER", wrapper.to_str().unwrap()),
+            ("MBX_TEST_WRAPPER_LOG", wrapper_log.to_str().unwrap()),
+            ("MBX_TEST_WORKSPACE_MODE", mode),
+            ("MBX_INCREMENTAL", "1"),
+        ];
+        cargo_with(
+            project.path(),
+            store.path(),
+            &reports.path().join(format!("{mode}.json")),
+            &["build", "--offline"],
+            &settings,
+        );
+
+        assert!(
+            std::fs::read_to_string(&wrapper_log).is_ok_and(|log| log.contains("called")),
+            "Cargo did not call the workspace wrapper selected by {mode}"
+        );
+        let after = object_files(project.path());
+        for (name, inode) in old_objects {
+            assert_eq!(
+                after.get(&name),
+                Some(&inode),
+                "the no-op workspace wrapper must not remove {name} ({mode})"
+            );
+        }
+    }
 }

@@ -13,8 +13,9 @@ mod events;
 
 use eyre::{Context, Result};
 use mbx_cache_core::{
-    ActionPrediction, CacheDigest, CacheDirectory, LocalCas, RemoteActionResult, RustcMetadata,
-    TaskActionManifest, is_task_identity, merge_task_action_predictions, task_manifest_actions,
+    ActionPrediction, ActionSlot, CacheDigest, CacheDirectory, LocalCas, RemoteActionResult,
+    RustcMetadata, TaskActionManifest, is_task_identity, merge_task_action_predictions,
+    task_manifest_actions,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -1715,6 +1716,17 @@ pub fn gc_dry_run(store: &Path, max_bytes: u64) -> Result<GcOutcome> {
     gc_with_mode(store, max_bytes, true)
 }
 
+#[cfg(test)]
+type DanglingReadHook = Box<dyn FnMut(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static ACTION_RECORD_CLAIMS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    /// Runs after collection finds a record dangling and before it claims it.
+    static AFTER_DANGLING_READ: std::cell::RefCell<Option<DanglingReadHook>> =
+        const { std::cell::RefCell::new(None) };
+}
+
 fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome> {
     let mut objects = walk_files(&store.join(CAS_DIR))?;
     let results = walk_files(&store.join(ACTION_RESULTS_DIR))?;
@@ -1785,26 +1797,92 @@ fn gc_with_mode(store: &Path, max_bytes: u64, dry_run: bool) -> Result<GcOutcome
     let cas = LocalCas::new(store);
     let mut trees = HashMap::new();
     for entry in &results {
-        if action_result_is_dangling(
+        match action_result_is_dangling(
             &cas,
             &entry.path,
             &virtually_removed,
             walk_trees,
             &mut trees,
-        )? {
-            match if dry_run {
-                Removal::Removed
-            } else {
-                remove(&entry.path)?
-            } {
-                Removal::Removed => {
-                    live_bytes = live_bytes.saturating_sub(entry.size);
-                    outcome.removed_action_results += 1;
-                    outcome.removed_bytes += entry.size;
-                }
-                Removal::Missing => live_bytes = live_bytes.saturating_sub(entry.size),
-                Removal::Blocked => {}
+        ) {
+            Ok(false) => continue,
+            Ok(true) => {}
+            // Windows readers can encounter another repair's mandatory lock.
+            Err(error)
+                if error
+                    .chain()
+                    .filter_map(|cause| cause.downcast_ref::<std::io::Error>())
+                    .any(held_by_another_process) =>
+            {
+                log::debug!(
+                    "could not inspect {} for eviction: {error}",
+                    entry.path.display()
+                );
+                continue;
             }
+            Err(error) => return Err(error),
+        }
+        let removal = if dry_run {
+            Removal::Removed
+        } else {
+            #[cfg(test)]
+            AFTER_DANGLING_READ.with(|hook| {
+                if let Some(hook) = hook.borrow_mut().as_mut() {
+                    hook(&entry.path);
+                }
+            });
+            #[cfg(test)]
+            ACTION_RECORD_CLAIMS.with(|count| count.set(count.get() + 1));
+            match ActionSlot::try_claim(&entry.path) {
+                Err(error) if held_by_another_process(&error) => {
+                    log::debug!(
+                        "could not claim {} for eviction: {error}",
+                        entry.path.display()
+                    );
+                    Removal::Blocked
+                }
+                Err(error) => return Err(error.into()),
+                Ok(None) => Removal::Blocked,
+                Ok(Some(slot)) => match slot.read()? {
+                    None => Removal::Missing,
+                    Some(bytes) => {
+                        // A repair may have restored a missing blob since the filter
+                        // ran, so do not reuse its cached tree verdicts.
+                        if !action_result_bytes_are_dangling(
+                            &cas,
+                            &bytes,
+                            &virtually_removed,
+                            walk_trees,
+                            &mut HashMap::new(),
+                        )? {
+                            continue;
+                        }
+                        match slot.remove() {
+                            Ok(true) => Removal::Removed,
+                            Ok(false) => Removal::Missing,
+                            // Open files may prevent deletion on Windows, just
+                            // as they do in the other eviction paths.
+                            Err(error) if held_by_another_process(&error) => {
+                                log::debug!("could not evict {}: {error}", entry.path.display());
+                                Removal::Blocked
+                            }
+                            Err(error) => {
+                                return Err(error).wrap_err_with(|| {
+                                    format!("failed to evict {}", entry.path.display())
+                                });
+                            }
+                        }
+                    }
+                },
+            }
+        };
+        match removal {
+            Removal::Removed => {
+                live_bytes = live_bytes.saturating_sub(entry.size);
+                outcome.removed_action_results += 1;
+                outcome.removed_bytes += entry.size;
+            }
+            Removal::Missing => live_bytes = live_bytes.saturating_sub(entry.size),
+            Removal::Blocked => {}
         }
     }
 
@@ -1979,9 +2057,10 @@ fn prune_sessions(store: &Path, dry_run: bool) -> Result<SessionPrune> {
 
 /// Sweep the store if `interval` has passed since the last attempt.
 ///
-/// The stamp is written before the sweep, not after. Two builds finishing
-/// together should cost one sweep between them, and a sweep that dies partway
-/// should wait its turn like any other rather than retry on every build.
+/// This convenience API claims the interval before running GC, so an
+/// interrupted attempt waits a full interval. The CLI uses its collector lock
+/// and [`record_sweep`] after completion instead: collectors killed when a
+/// sandboxed build exits must leave the next build free to retry.
 pub fn sweep_if_due(store: &Path, max_bytes: u64, interval: Duration) -> Result<Option<GcOutcome>> {
     if !claim_sweep(store, interval)? {
         return Ok(None);
@@ -1989,7 +2068,10 @@ pub fn sweep_if_due(store: &Path, max_bytes: u64, interval: Duration) -> Result<
     gc(store, max_bytes).map(Some)
 }
 
-/// Stamp a due sweep before its callers perform coordinated GC.
+/// Claim a due sweep before doing work, including interrupted attempts.
+///
+/// Callers that hold a collector lock and need to retry killed collectors can
+/// instead check [`sweep_is_due`] under that lock and [`record_sweep`] afterwards.
 ///
 /// The sweep lock serializes claims, so updating the existing marker in place
 /// is enough. In particular, it does not need a temporary file and rename:
@@ -2004,22 +2086,33 @@ pub fn claim_sweep(store: &Path, interval: Duration) -> Result<bool> {
     if sweep_stamp_is_fresh(&stamp, interval) {
         return Ok(false);
     }
+    record_sweep(store)?;
+    Ok(true)
+}
+
+/// Record a finished sweep at the current time.
+///
+/// The caller must serialize collectors and re-check [`sweep_is_due`] under
+/// its lock. Update the marker in place, without truncation or a temporary
+/// file, so an existing marker can still be refreshed on a full disk.
+pub fn record_sweep(store: &Path) -> Result<()> {
+    let path = store.join(SWEEP_STAMP);
+    std::fs::create_dir_all(path.parent().expect("the sweep stamp has a parent"))?;
     let stamp = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(false)
-        .open(&stamp)?;
+        .open(path)?;
     stamp.set_modified(SystemTime::now())?;
-    Ok(true)
+    Ok(())
 }
 
-/// Whether [`claim_sweep`] would stamp a sweep now.
+/// Whether the interval since the last recorded sweep has passed.
 ///
 /// A read of the stamp, no lock and no write: this answers a build that only
 /// wants to know whether to start a collector, and may be answered yes to two
-/// builds at once. The claim itself stays inside the collector, which is where
-/// the lock and the stamp are, so of two collectors started together, one
-/// sweeps and the other finds the stamp fresh and exits.
+/// builds at once. A collector must re-check this under its collector lock
+/// and record completion with [`record_sweep`] before releasing the lock.
 pub fn sweep_is_due(store: &Path, interval: Duration) -> bool {
     !sweep_stamp_is_fresh(&store.join(SWEEP_STAMP), interval)
 }
@@ -2442,8 +2535,29 @@ fn action_result_is_dangling(
             return Err(error).wrap_err_with(|| format!("failed to read {}", path.display()));
         }
     };
+    action_result_bytes_are_dangling(cas, &bytes, virtually_removed, walk_tree, trees)
+}
+
+/// Whether an I/O error means another process holds the file.
+///
+/// Windows reports a read of a range another process has locked as
+/// ERROR_LOCK_VIOLATION (33), and an open the other handle's sharing mode
+/// refuses as ERROR_SHARING_VIOLATION (32); neither maps to a portable error
+/// kind. Elsewhere this is a permission error.
+fn held_by_another_process(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::PermissionDenied
+        || (cfg!(windows) && matches!(error.raw_os_error(), Some(32 | 33)))
+}
+
+fn action_result_bytes_are_dangling(
+    cas: &LocalCas,
+    bytes: &[u8],
+    virtually_removed: &HashSet<PathBuf>,
+    walk_tree: bool,
+    trees: &mut HashMap<CacheDigest, bool>,
+) -> Result<bool> {
     // An unparseable result is already useless; the cache rejects it on read.
-    let Ok(result) = serde_json::from_slice::<RemoteActionResult>(&bytes) else {
+    let Ok(result) = serde_json::from_slice::<RemoteActionResult>(bytes) else {
         return Ok(false);
     };
     let missing = |digest: &CacheDigest| match cas.path_for(digest) {
