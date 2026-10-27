@@ -377,6 +377,17 @@ fn the_reserve_never_swallows_the_whole_pool() {
 }
 
 #[test]
+fn a_prediction_that_exactly_fits_available_memory_is_admitted() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut pool = pool_at(directory.path(), 8, 1024);
+    pool.available_memory = || Some(1024);
+    let running = pool.try_admit(1, None).unwrap().expect("first permit");
+    let fitting = pool.try_admit(1, Some(1024)).unwrap();
+    assert!(fitting.is_some(), "all predicted bytes are available");
+    drop(running);
+}
+
+#[test]
 fn the_memory_gate_defers_predicted_heavy_work() {
     let directory = tempfile::tempdir().unwrap();
     let mut pool = pool_at(directory.path(), 8, 0);
@@ -1765,6 +1776,18 @@ fn a_waiter_removed_after_its_lock_check_has_left_the_queue() {
         read_waiter(&path).is_err(),
         "a record that is present but unreadable must not be skipped"
     );
+}
+
+#[test]
+fn an_unlocked_malformed_waiter_is_reclaimed_before_parsing() {
+    let directory = tempfile::tempdir().unwrap();
+    let waiters = directory.path().join(WAITERS_DIR);
+    std::fs::create_dir_all(&waiters).unwrap();
+    let path = waiters.join("abandoned");
+    std::fs::write(&path, b"{").unwrap();
+
+    assert!(scan_waiters(&waiters).unwrap().is_empty());
+    assert!(!path.exists());
 }
 
 #[test]
@@ -4712,6 +4735,100 @@ fn ledger_cache_bounds_staleness_when_file_metadata_does_not_change() {
     assert_eq!(cache.read(&path).crates["crate"], 100);
     cache.loaded_at = Some(Instant::now() - LEDGER_CACHE_MAX_AGE);
     assert_eq!(cache.read(&path).crates["crate"], 200);
+}
+
+#[test]
+fn a_waiting_admission_plan_refreshes_when_history_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 10, 100);
+    let demand = compile_demand("crate", &[]);
+    let key = demand.compile_mode.as_ref().unwrap();
+    let mut ledger = MemoryLedger::default();
+    ledger.memory_windows.insert(key.clone(), vec![500; 4]);
+    crate::util::write_advisory(&pool.ledger_path(), &serde_json::to_vec(&ledger).unwrap())
+        .unwrap();
+    let mut cache = None;
+    let first = pool.admission_plan(&demand, &mut cache);
+    let held = pool.try_admit(9, None).unwrap().unwrap();
+    let mut state = AdmissionState::new(100);
+    assert!(
+        pool.try_admit_state(
+            first.resources,
+            first.weight,
+            first.predicted,
+            &mut state,
+            Some(&demand)
+        )
+        .unwrap()
+        .is_none()
+    );
+
+    ledger.memory_windows.insert(key.clone(), vec![10; 4]);
+    crate::util::write_advisory(&pool.ledger_path(), &serde_json::to_vec(&ledger).unwrap())
+        .unwrap();
+    let changed = pool.admission_plan(&demand, &mut cache);
+    assert!(changed.resources.memory_bytes < first.resources.memory_bytes);
+    assert_eq!(demand.memory_features.get().unwrap().mean, 10.0_f64.ln());
+    assert!(
+        pool.try_admit_state(
+            changed.resources,
+            changed.weight,
+            changed.predicted,
+            &mut state,
+            Some(&demand)
+        )
+        .unwrap()
+        .is_some()
+    );
+    drop(held);
+}
+
+#[test]
+fn a_waiting_compile_refreshes_its_plan_before_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 10, 100);
+    let demand = compile_demand("crate", &[]);
+    let key = demand.compile_mode.as_ref().unwrap().clone();
+    let mut ledger = MemoryLedger::default();
+    ledger.memory_windows.insert(key.clone(), vec![500; 4]);
+    crate::util::write_advisory(&pool.ledger_path(), &serde_json::to_vec(&ledger).unwrap())
+        .unwrap();
+    let held = pool.try_admit(9, None).unwrap().unwrap();
+    let ledger_path = pool.ledger_path();
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _permit = pool.admit(&demand).unwrap();
+        let admission = demand.observation.get().unwrap();
+        send.send((
+            admission.resources.memory_bytes,
+            demand.memory_features.get().unwrap().mean,
+        ))
+        .unwrap();
+    });
+    wait_until("the compile to queue", || {
+        directory.path().join(PRIORITY_WAIT_STAMP).exists()
+    });
+    ledger.memory_windows.insert(key, vec![10; 4]);
+    // Windows refuses to replace a file the waiting compile has open while it
+    // rereads history; production drops such a write, the test retries it.
+    let contents = serde_json::to_vec(&ledger).unwrap();
+    let mut written = crate::util::write_advisory(&ledger_path, &contents);
+    for _ in 0..500 {
+        if written.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        written = crate::util::write_advisory(&ledger_path, &contents);
+    }
+    written.unwrap();
+
+    let admitted = receive.recv_timeout(Duration::from_secs(30));
+    // Always release the blocker so a stale plan fails without stranding a worker.
+    drop(held);
+    worker.join().unwrap();
+    let (memory, mean) = admitted.expect("the refreshed compile fits beside the held permit");
+    assert!(memory <= 100);
+    assert_eq!(mean, 10.0_f64.ln());
 }
 
 #[test]

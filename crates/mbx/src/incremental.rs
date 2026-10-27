@@ -2392,6 +2392,10 @@ mod tests {
         set_mtime(&stamp, recent);
         stamp_use(&directory, None);
         assert_eq!(mtime(&stamp), recent as i64, "throttled");
+        set_mtime(&stamp, now_secs() - 120);
+        let expired = mtime(&stamp);
+        stamp_use(&directory, None);
+        assert!(mtime(&stamp) > expired, "refresh after a minute");
         set_mtime(&stamp, 1000);
         stamp_use(&directory, None);
         assert!(mtime(&stamp) >= now_secs() as i64 - 5);
@@ -3027,6 +3031,24 @@ mod tests {
         .unwrap();
         assert_eq!(within_budget.removed_units, 0);
         assert_eq!(within_budget.remaining_bytes, before.bytes);
+
+        let preview = collect(
+            cache.path(),
+            None,
+            Some(Duration::from_secs(60)),
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(preview.removed_units, 1);
+        assert_eq!(
+            preview.removed_bytes, 0,
+            "the other unit still owns the inode"
+        );
+        assert_eq!(preview.remaining_bytes, before.bytes);
+        assert!(old.exists());
+        assert!(linked.exists());
 
         let one_removed = collect(
             cache.path(),

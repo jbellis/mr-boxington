@@ -1106,3 +1106,51 @@ fn a_panicking_automatic_collector_records_before_the_previous_hook_aborts() {
         b"stamped"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_short_disk_retries_targets_after_sparse_files_release_little_space() {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let directory = tempfile::tempdir().unwrap();
+    // Probe with a small file before creating the large logical fixtures.
+    let probe_path = directory.path().join("sparse-probe");
+    let probe = std::fs::File::create(&probe_path).unwrap();
+    probe.set_len(1024 * 1024).unwrap();
+    if probe.metadata().unwrap().blocks() * 512 >= 1024 * 1024 {
+        eprintln!("skipping: the test filesystem does not create sparse files with set_len");
+        return;
+    }
+    drop(probe);
+    std::fs::remove_file(probe_path).unwrap();
+    let config = super::cargo_tests::managed_target_config(directory.path());
+    let mut views = Vec::new();
+    for (name, updated_secs) in [("older", 1), ("newer", 2)] {
+        let view = low_disk_view(&config, directory.path(), name, updated_secs, &[], false);
+        // Logical eviction exceeds the shortfall, but releases almost no blocks.
+        let sparse = std::fs::File::create(view.join("sparse")).unwrap();
+        if let Err(error) = sparse.set_len(128 * 1024 * 1024 * 1024) {
+            eprintln!("skipping: the test filesystem cannot hold a 128 GiB file: {error}");
+            return;
+        }
+        views.push(view);
+    }
+    let available = crate::util::disk_space(&config.target.root)
+        .unwrap()
+        .available;
+    let retention = RetentionSettings {
+        min_free: Some(crate::config::MinFree::Bytes(
+            available + 64 * 1024 * 1024 * 1024,
+        )),
+        ..always_short()
+    };
+
+    let collection = collect_low_disk(&config, &retention);
+
+    assert!(!views[0].exists(), "the first logical eviction ran");
+    assert!(
+        !views[1].exists(),
+        "the disk is still short after the first eviction, so collection must retry"
+    );
+    assert_eq!(collection.targets.unwrap().removed_views, 2);
+}

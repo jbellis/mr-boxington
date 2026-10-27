@@ -558,3 +558,93 @@ fn the_platform_gate_does_not_depend_on_who_set_the_variable() {
         assert!(!crate::session::cache_links_requested());
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn relative_linker_searches_key_the_identity_by_working_directory() {
+    use std::io::{BufRead as _, Write as _};
+    use std::os::unix::net::UnixListener;
+
+    const CHILD: &str = "MBX_TEST_LINKER_DIRECTORY_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        assert!(identity_for(None, None).is_err());
+        return;
+    }
+    if which::which("cc").is_err() {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("agent.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let agent = std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(30),
+                        "the child did not connect to the identity agent"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("accepting the identity request: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .unwrap();
+        let mut stream = std::io::BufReader::new(stream);
+        let mut line = String::new();
+        stream.read_line(&mut line).unwrap();
+        let hello: AgentRequest = serde_json::from_str(&line).unwrap();
+        assert!(matches!(hello, AgentRequest::Hello { .. }));
+        let response = AgentResponse::Hello {
+            protocol: mbx_cache_core::AGENT_PROTOCOL_VERSION,
+            agent_version: env!("CARGO_PKG_VERSION").into(),
+        };
+        writeln!(
+            stream.get_mut(),
+            "{}",
+            serde_json::to_string(&response).unwrap()
+        )
+        .unwrap();
+        line.clear();
+        stream.read_line(&mut line).unwrap();
+        let request: AgentRequest = serde_json::from_str(&line).unwrap();
+        let response = AgentResponse::Error {
+            message: "identity captured".into(),
+        };
+        writeln!(
+            stream.get_mut(),
+            "{}",
+            serde_json::to_string(&response).unwrap()
+        )
+        .unwrap();
+        request
+    });
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "linker::tests::relative_linker_searches_key_the_identity_by_working_directory",
+            "--nocapture",
+        ])
+        .current_dir(directory.path())
+        .env(CHILD, "1")
+        .env("MBX_SOCKET", &socket)
+        .env("LIBRARY_PATH", "/usr/lib/wsl/lib:")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let AgentRequest::FindExecutableIdentity { environment, .. } = agent.join().unwrap() else {
+        panic!("expected an executable identity lookup");
+    };
+    assert_eq!(
+        environment.get("MBX_WORKING_DIRECTORY"),
+        Some(&Some(working_directory_key(
+            &directory.path().canonicalize().unwrap()
+        )))
+    );
+}

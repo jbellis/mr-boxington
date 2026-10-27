@@ -235,6 +235,48 @@ fn only_an_unrequested_real_default_target_can_be_removed() {
 }
 
 #[test]
+fn restoring_an_explicit_default_target_keeps_it_in_the_checkout() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = test_config(directory.path(), true);
+    let workspace = checkout(directory.path(), "project");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("artifact"), b"restored output").unwrap();
+    let store = config.store_dir();
+    std::fs::create_dir_all(&store).unwrap();
+    let additions = crate::workspace_state::capture(
+        &store,
+        &[mbx_cache_store::WorkspaceTarget {
+            workspace_root: workspace.clone(),
+            target_dir: target.clone(),
+        }],
+    )
+    .unwrap();
+    std::fs::remove_dir_all(&target).unwrap();
+    let lease = ViewLease::acquire(&config.target.root, &workspace).unwrap();
+
+    let restored = crate::workspace_state::restore(
+        &config,
+        &store,
+        &additions.attachments[crate::workspace_state::ATTACHMENT],
+        &workspace,
+        &target,
+        true,
+        &lease,
+    )
+    .unwrap();
+
+    assert!(restored.is_some());
+    assert_eq!(
+        std::fs::read(target.join("artifact")).unwrap(),
+        b"restored output"
+    );
+    assert!(std::fs::symlink_metadata(&target).unwrap().is_dir());
+    assert!(!view_dir(&config.target.root, &workspace).exists());
+    assert!(!view_record_path(&config.target.root, &workspace).exists());
+}
+
+#[test]
 fn a_failed_migration_restores_existing_outputs() {
     let directory = tempfile::tempdir().unwrap();
     let config = test_config(directory.path(), true);
@@ -250,6 +292,63 @@ fn a_failed_migration_restores_existing_outputs() {
         std::fs::read(target.join("artifact")).unwrap(),
         b"old output"
     );
+}
+
+#[test]
+fn restoring_workspace_state_refreshes_the_managed_view_record() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = test_config(directory.path(), true);
+    let workspace = checkout(directory.path(), "project");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("artifact"), b"restored output").unwrap();
+    let store = config.store_dir();
+    std::fs::create_dir_all(&store).unwrap();
+    let additions = crate::workspace_state::capture(
+        &store,
+        &[mbx_cache_store::WorkspaceTarget {
+            workspace_root: workspace.clone(),
+            target_dir: target.clone(),
+        }],
+    )
+    .unwrap();
+    std::fs::remove_dir_all(&target).unwrap();
+    let lease = ViewLease::acquire(&config.target.root, &workspace).unwrap();
+    let record_path = view_record_path(&config.target.root, &workspace);
+    let before_restore = now_secs();
+
+    let restored = crate::workspace_state::restore_with(
+        &config,
+        &store,
+        &additions.attachments[crate::workspace_state::ATTACHMENT],
+        &workspace,
+        &target,
+        false,
+        &lease,
+        || {
+            let mut record = read_view_record(&record_path).unwrap();
+            record.updated_secs = 1;
+            std::fs::write(&record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        },
+    )
+    .unwrap();
+
+    assert!(restored.is_some());
+    assert_eq!(
+        std::fs::read(target.join("artifact")).unwrap(),
+        b"restored output"
+    );
+    assert!(read_view_record(&record_path).unwrap().updated_secs >= before_restore);
+    drop(lease);
+    let outcome = collect(
+        &config.target.root,
+        None,
+        Some(Duration::from_secs(3600)),
+        false,
+    )
+    .unwrap();
+    assert_eq!(outcome.removed_views, 0);
+    assert!(target.join("artifact").is_file());
 }
 
 #[test]

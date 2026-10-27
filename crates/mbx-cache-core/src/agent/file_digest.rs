@@ -797,6 +797,41 @@ impl FileDigestCache for NoFileDigestCache {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_nfs_snapshot_consults_the_session_digest_ledger() {
+        struct CountingCache(std::sync::atomic::AtomicUsize);
+        impl FileDigestCache for CountingCache {
+            fn find(
+                &self,
+                scope: FileDigestScope,
+                files: &[FileIdentity],
+            ) -> Vec<Option<CacheDigest>> {
+                assert_eq!(scope, FileDigestScope::Content);
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].changed, None);
+                assert!(files[0].object.is_some());
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                vec![None]
+            }
+            fn record(&self, _scope: FileDigestScope, _entries: Vec<RecordedFileDigest>) {}
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.rlib");
+        std::fs::write(&path, b"nfs bytes").unwrap();
+        if nfs_file_identity(&path).unwrap().is_none() {
+            eprintln!("skipping: statx cannot supply the NFS ledger identity");
+            return;
+        }
+        let cache = CountingCache(std::sync::atomic::AtomicUsize::new(0));
+        let snapshot =
+            capture_file_snapshot(&path, &cache, true, true, std::fs::metadata(&path).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(snapshot.content, Some(CacheDigest::blake3(b"nfs bytes")));
+        assert_eq!(cache.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn timestamp_macros_are_detected_at_every_chunk_boundary_split() {
         let directory = tempfile::tempdir().unwrap();
@@ -1084,6 +1119,28 @@ mod tests {
     }
 
     #[test]
+    fn an_nfs_object_identity_can_skip_a_second_content_read() {
+        let identity = FileIdentity {
+            path: PathBuf::from("/nfs/input.rlib"),
+            len: 9,
+            modified: SystemTime::UNIX_EPOCH,
+            changed: None,
+            object: Some(FileObjectIdentity {
+                device_major: 0,
+                device_minor: 42,
+                mount_id: 7,
+                inode: 99,
+            }),
+        };
+        assert!(identity.can_skip_content_verification());
+        let without_object = FileIdentity {
+            object: None,
+            ..identity
+        };
+        assert!(!without_object.can_skip_content_verification());
+    }
+
+    #[test]
     fn reliable_metadata_keeps_the_native_identity() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("input.rs");
@@ -1230,10 +1287,17 @@ mod tests {
         // A ctime newer than the mtime counts even when the mtime is old.
         let touched = identity(at(10, 7), Some((1_000, 499_000_000)));
         assert!(identity_is_racy(&touched, now));
-        // Whole-second stamps are withheld for two seconds.
-        let coarse = |age: u64| identity(at(1_000 - age, 0), Some((1_000 - age as i64, 0)));
-        assert!(identity_is_racy(&coarse(1), at(1_000, 0)));
-        assert!(!identity_is_racy(&coarse(3), at(1_000, 0)));
+        // Whole-second stamps are withheld for two seconds, even without ctime.
+        for with_ctime in [false, true] {
+            let coarse = |age: u64| {
+                identity(
+                    at(1_000 - age, 0),
+                    with_ctime.then_some((1_000 - age as i64, 0)),
+                )
+            };
+            assert!(identity_is_racy(&coarse(1), at(1_000, 0)));
+            assert!(!identity_is_racy(&coarse(3), at(1_000, 0)));
+        }
         // A timestamp in the future is racy.
         assert!(identity_is_racy(&identity(at(2_000, 1), None), now));
     }
