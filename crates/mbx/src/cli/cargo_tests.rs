@@ -1083,10 +1083,11 @@ fn a_compiler_named_in_cargo_configuration_is_left_to_cargo() {
             .env_remove("CARGO_BUILD_RUSTC")
             .output()
             .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // An exact filter that matches nothing also exits successfully.
         assert!(
-            output.status.success(),
-            "isolated test process failed:\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
+            output.status.success() && stdout.contains("1 passed"),
+            "isolated test process failed:\n{stdout}\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
         return;
