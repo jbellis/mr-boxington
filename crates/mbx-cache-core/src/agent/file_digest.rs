@@ -156,9 +156,11 @@ impl FileIdentity {
 /// A pre-operation snapshot that can prove whether a file's contents changed.
 ///
 /// Most filesystems provide a stable metadata-change token, so the inexpensive
-/// identity is sufficient. Linux NFS can reconcile client and server timestamps
-/// after a writer has closed the file, making two metadata reads disagree
-/// without any intervening write. Those files carry a content digest instead,
+/// identity is sufficient once its timestamp tick has settled. Recently written
+/// files carry a content digest to detect another write within that tick.
+/// Linux NFS can reconcile client and server timestamps after a writer has
+/// closed the file, making two metadata reads disagree without any intervening
+/// write. Those files carry a content digest instead,
 /// while retaining length and file identity to detect replacement. Callers use
 /// the same comparison either way and do not need to know which filesystem
 /// supplied the file.
@@ -171,20 +173,19 @@ pub struct FileSnapshot {
 impl FileSnapshot {
     /// Capture the strongest comparison the file's filesystem can support.
     pub fn capture(path: &Path) -> io::Result<Option<Self>> {
-        let metadata = std::fs::metadata(path)?;
-        let unreliable = metadata_identity_is_unreliable(path, &metadata)?;
-        capture_file_snapshot(path, &NoFileDigestCache, unreliable, unreliable, metadata)
+        Self::capture_with_cache(path, &NoFileDigestCache)
     }
 
     /// Capture a snapshot while reusing or publishing a content digest through
-    /// the session ledger when the filesystem requires one.
+    /// the session ledger when the filesystem or a recent write requires one.
     pub fn capture_with_cache(
         path: &Path,
         digests: &dyn FileDigestCache,
     ) -> io::Result<Option<Self>> {
+        let observed_at = SystemTime::now();
         let metadata = std::fs::metadata(path)?;
         let unreliable = metadata_identity_is_unreliable(path, &metadata)?;
-        capture_file_snapshot(path, digests, unreliable, unreliable, metadata)
+        capture_file_snapshot(path, digests, unreliable, unreliable, metadata, observed_at)
     }
 
     /// Capture a content-backed snapshot whatever the filesystem, for a file
@@ -199,12 +200,13 @@ impl FileSnapshot {
         path: &Path,
         digests: &dyn FileDigestCache,
     ) -> io::Result<Option<Self>> {
+        let observed_at = SystemTime::now();
         let metadata = std::fs::metadata(path)?;
         // The ledger identity still follows the filesystem: recording under
         // the ordinary identity and looking up under the NFS one would miss
         // every time, and every dependent would re-hash the artifact.
         let unreliable = metadata_identity_is_unreliable(path, &metadata)?;
-        capture_file_snapshot(path, digests, unreliable, true, metadata)
+        capture_file_snapshot(path, digests, unreliable, true, metadata, observed_at)
     }
 
     /// Whether `identity` and `content` still describe this snapshot.
@@ -292,6 +294,7 @@ fn capture_file_snapshot(
     unreliable: bool,
     content_identity: bool,
     metadata: std::fs::Metadata,
+    observed_at: SystemTime,
 ) -> io::Result<Option<FileSnapshot>> {
     let cache_identity = digest_cache_identity(path, &metadata, unreliable)?;
     let Some(identity) = cache_identity
@@ -300,7 +303,12 @@ fn capture_file_snapshot(
     else {
         return Ok(None);
     };
-    let (identity, content) = if content_identity {
+    // Equal metadata cannot vouch for bytes written within the same timestamp
+    // tick. Such snapshots need content, and a ledger hit under that identity
+    // could describe bytes from an earlier write in the tick.
+    let racy = identity_is_racy(&identity, observed_at);
+    let cache_identity = cache_identity.filter(|_| !racy);
+    let (identity, content) = if content_identity || racy {
         let resolved = cache_identity
             .as_ref()
             .and_then(|identity| {
@@ -885,7 +893,18 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("libdep.rmeta");
         std::fs::write(&path, b"metadata").unwrap();
-        let by_metadata = FileSnapshot::capture(&path).unwrap().unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let observed_at = metadata.modified().unwrap() + std::time::Duration::from_secs(3);
+        let by_metadata = capture_file_snapshot(
+            &path,
+            &NoFileDigestCache,
+            false,
+            false,
+            metadata,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
         let by_content = FileSnapshot::capture_content_with_cache(&path, &NoFileDigestCache)
             .unwrap()
             .unwrap();
@@ -959,7 +978,7 @@ mod tests {
         };
 
         settle_past_timestamp_race();
-        let snapshot = capture_file_snapshot(&path, &cache, true, true, before)
+        let snapshot = capture_file_snapshot(&path, &cache, true, true, before, SystemTime::now())
             .unwrap()
             .unwrap();
         let current = FileIdentity::for_digest_cache(&path, &std::fs::metadata(&path).unwrap())
@@ -1006,7 +1025,7 @@ mod tests {
         };
 
         settle_past_timestamp_race();
-        let snapshot = capture_file_snapshot(&path, &cache, true, true, before)
+        let snapshot = capture_file_snapshot(&path, &cache, true, true, before, SystemTime::now())
             .unwrap()
             .unwrap();
         let current = FileIdentity::for_digest_cache(&path, &std::fs::metadata(&path).unwrap())
@@ -1059,16 +1078,100 @@ mod tests {
     }
 
     #[test]
-    fn a_metadata_snapshot_detects_a_metadata_change() {
+    fn a_racy_snapshot_rejects_a_same_length_rewrite_with_identical_metadata() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("input.rs");
         std::fs::write(&path, b"fn main() {}").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let observed_at = metadata.modified().unwrap();
         let snapshot = capture_file_snapshot(
             &path,
             &NoFileDigestCache,
             false,
             false,
-            std::fs::metadata(&path).unwrap(),
+            metadata,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let identity = snapshot.identity.clone();
+        let original = CacheDigest::blake3_file(&path).unwrap();
+        assert!(snapshot.matches(Some(&identity), &original));
+
+        std::fs::write(&path, b"fn main(){ }").unwrap();
+        let rewritten = CacheDigest::blake3_file(&path).unwrap();
+        assert_eq!(original.size, rewritten.size);
+        assert_ne!(original, rewritten);
+        // Model a filesystem tick collision independently of the host's
+        // actual timestamp resolution: every metadata field is unchanged.
+        assert!(!snapshot.matches(Some(&identity), &rewritten));
+        assert!(snapshot.proves_content_change());
+    }
+
+    #[test]
+    fn a_settled_snapshot_keeps_the_metadata_only_path() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.rs");
+        std::fs::write(&path, b"fn main() {}").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let observed_at = metadata.modified().unwrap() + std::time::Duration::from_secs(3);
+        // Once metadata has been read, this path must not open the file or
+        // consult the content ledger just to capture a settled snapshot.
+        std::fs::remove_file(&path).unwrap();
+        let snapshot = capture_file_snapshot(
+            &path,
+            &NoFileDigestCache,
+            false,
+            false,
+            metadata,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(snapshot.content.is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_racy_snapshot_does_not_reuse_a_digest_with_identical_metadata() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.rs");
+        std::fs::write(&path, b"fn main() {}").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let observed_at = metadata.modified().unwrap();
+        let cache = RecordingDigestCache {
+            answer: Some(CacheDigest::blake3(b"fn main(){ }")),
+            recorded: std::sync::Mutex::new(Vec::new()),
+        };
+        for content_identity in [false, true] {
+            let snapshot = capture_file_snapshot(
+                &path,
+                &cache,
+                false,
+                content_identity,
+                metadata.clone(),
+                observed_at,
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(snapshot.content, Some(CacheDigest::blake3(b"fn main() {}")));
+        }
+    }
+
+    #[test]
+    fn a_metadata_snapshot_detects_a_metadata_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.rs");
+        std::fs::write(&path, b"fn main() {}").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let observed_at = metadata.modified().unwrap() + std::time::Duration::from_secs(3);
+        let snapshot = capture_file_snapshot(
+            &path,
+            &NoFileDigestCache,
+            false,
+            false,
+            metadata,
+            observed_at,
         )
         .unwrap()
         .unwrap();
@@ -1097,6 +1200,7 @@ mod tests {
             true,
             true,
             std::fs::metadata(&path).unwrap(),
+            SystemTime::now(),
         )
         .unwrap()
         .unwrap();

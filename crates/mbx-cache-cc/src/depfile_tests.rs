@@ -440,6 +440,13 @@ fn precompile_snapshot_does_not_depend_on_the_host_clock() {
     // Let the coarse ZFS timestamp tick advance before this same-length rewrite.
     std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(&source, "int a(void) { return 1; }\n").expect("rewrite");
+    let discovered = CcDiscoveredInputs::collect(
+        root,
+        BTreeSet::from([source.clone()]),
+        BTreeSet::new(),
+        &NoFileDigestCache,
+    )
+    .expect("discovery after compilation");
     assert_eq!(
         discovered
             .verify_not_modified_since_with_snapshots(
