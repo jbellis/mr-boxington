@@ -162,7 +162,7 @@ async fn check(config: &Config, toolchain: Option<&str>) -> Vec<Check> {
     ];
     checks.push(cache_check(&config.cache_dir));
     checks.push(atime_check(
-        &config.cache_dir,
+        &config.store_dir(),
         "cache eviction cannot tell recently read objects from unused ones",
     ));
     if config.target.views {
