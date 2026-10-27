@@ -996,6 +996,8 @@ mod materialization_tests {
         let source = blob(root.path(), "blob", b"rlib", 0o644);
         let before = std::fs::metadata(&source).unwrap();
 
+        // Let the coarse ZFS timestamp tick advance before the restore stamps it.
+        std::thread::sleep(std::time::Duration::from_millis(20));
         let (staged, materialization) = stage_verified_cached_output_with(
             root.path(),
             0,

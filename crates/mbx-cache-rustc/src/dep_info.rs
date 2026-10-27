@@ -1104,6 +1104,8 @@ mod tests {
             .unwrap();
 
         // Conversely, a filesystem clock far behind must not conceal a write.
+        // Let the coarse ZFS timestamp tick advance before this same-length rewrite.
+        std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&source, "pub fn library() {1}\n").unwrap();
         assert_eq!(
             discovered.verify_not_modified_since_with_snapshots(

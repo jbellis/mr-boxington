@@ -414,6 +414,8 @@ fn precompile_snapshot_does_not_depend_on_the_host_clock() {
         .verify_not_modified_since_with_snapshots(SystemTime::UNIX_EPOCH, &before)
         .expect("an unchanged identity is independent of clock offset");
 
+    // Let the coarse ZFS timestamp tick advance before this same-length rewrite.
+    std::thread::sleep(std::time::Duration::from_millis(20));
     std::fs::write(&source, "int a(void) { return 1; }\n").expect("rewrite");
     assert_eq!(
         discovered
