@@ -120,7 +120,7 @@ How mbx displays Cargo's output.
 
 Keep private workspace incremental state from the first compilation.
 
-It applies in CI too, and it overrides `incremental` and learned incremental reuse. Workspace crates then compile with that state instead of restoring or publishing shared results, and crates that link them stay private as well. The first build can be slower. Ignored for compilations selected for verification by `MBX_VERIFY` or `verify_sample_rate`. This may also be set in workspace `.mbx.toml`; the environment variable wins.
+It applies in CI too, and it overrides `incremental` and learned incremental reuse. Workspace crates then compile with that state instead of restoring or publishing shared results, and crates that link them stay private as well. mbx skips compiles that request LTO. It also skips opt-level 2 or higher (including `s` and `z`) when `lto` is unset and `codegen-units` is not 1. With unset `lto`, rustc runs local ThinLTO above opt-level 0 when there are multiple codegen units. Incremental ThinLTO can produce codegen units that do not link. For compiles without LTO, `lto=n`, `no`, `off`, or `false`, and `codegen-units=1` avoid this restriction. Opt-level 0 and 1 stay eligible unless LTO is requested. The first build can be slower. Ignored for compilations selected for verification by `MBX_VERIFY` or `verify_sample_rate`. This may also be set in workspace `.mbx.toml`; the environment variable wins.
 
 ### `events`
 
@@ -287,7 +287,7 @@ mbx stops forcing `CARGO_INCREMENTAL=0`, so Cargo's profiles decide: by default,
 
 Use private incremental state for crates whose sources keep changing.
 
-A workspace crate qualifies on its first source edit; any other crate after three consecutive misses with changed sources. A qualifying crate's outputs, and those of crates that link them, stay out of the shared cache. Off in CI (`CI` set to `1`, `true`, or `yes`), while `incremental` or `eager_incremental` is in effect, and for compilations selected for verification by `MBX_VERIFY` or `verify_sample_rate`.
+A workspace crate qualifies on its first source edit; any other crate after three consecutive misses with changed sources. A qualifying crate's outputs, and those of crates that link them, stay out of the shared cache. Off in CI (`CI` set to `1`, `true`, or `yes`), while `incremental` or `eager_incremental` is in effect, and for compilations selected for verification by `MBX_VERIFY` or `verify_sample_rate`. mbx skips compiles that request LTO. It also skips opt-level 2 or higher (including `s` and `z`) when `lto` is unset and `codegen-units` is not 1. With unset `lto`, rustc runs local ThinLTO above opt-level 0 when there are multiple codegen units. Incremental ThinLTO can produce units that do not link. For compiles without LTO, `lto=n`, `no`, `off`, or `false`, and `codegen-units=1` avoid this restriction. Opt-level 0 and 1 stay eligible unless LTO is requested.
 
 ### `linker.default`
 
