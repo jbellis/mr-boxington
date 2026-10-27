@@ -576,20 +576,18 @@ fn mascot_keeps_progress_readable_and_leaves_successful_builds() {
     }
     // A compiler error shows the failure pose, and its monocle chain, before
     // Cargo reports the build.
-    let chain = "189;125;35";
-    assert!(
-        !view::render(&mut model, None, 110, 27)
-            .to_string()
-            .contains(chain)
-    );
+    // Inspect styles directly: NO_COLOR can suppress ANSI in Display output.
+    let chain = norimel::Color::Rgb(189, 125, 35);
+    let has_chain = |block: norimel::Block| {
+        block
+            .runs()
+            .any(|(_, _, _, style)| style.fg == chain || style.bg == chain)
+    };
+    assert!(!has_chain(view::render(&mut model, None, 110, 27)));
     model
         .errors
         .push("error[E0425]: cannot find value `x` in this scope".into());
-    assert!(
-        view::render(&mut model, None, 110, 27)
-            .to_string()
-            .contains(chain)
-    );
+    assert!(has_chain(view::render(&mut model, None, 110, 27)));
     // A failed build keeps the knocked-over box beside its summary.
     model.finished = Some((false, Duration::from_secs(1)));
     let failed = view::render(&mut model, None, 110, 27);

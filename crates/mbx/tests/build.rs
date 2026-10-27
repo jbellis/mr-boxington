@@ -8622,6 +8622,8 @@ fn standalone_adopt_refuses_a_busy_target() {
     let output = mbx_command()
         .current_dir(project.path())
         .arg("adopt")
+        // The caller's target choice would let adopt skip before it checks the lease.
+        .env_remove("CARGO_TARGET_DIR")
         .env("MBX_CACHE_DIR", store.path())
         .env("MBX_TARGET_ROOT", targets.path())
         .output()
@@ -8645,6 +8647,8 @@ fn standalone_adopt_refuses_a_busy_target() {
     let output = mbx_command()
         .current_dir(project.path())
         .arg("adopt")
+        // The caller's target choice would let adopt skip before it checks the lease.
+        .env_remove("CARGO_TARGET_DIR")
         .env("MBX_CACHE_DIR", store.path())
         .env("MBX_TARGET_ROOT", targets.path())
         .output()
