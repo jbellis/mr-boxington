@@ -23,6 +23,14 @@ consecutive misses with changed sources. The result never enters the shared
 cache; [the build summary](#incremental-counts-in-the-build-summary) counts the
 compilation as `incremental`.
 
+mbx skips compiles that request LTO. It also skips opt-level 2 or higher
+(including `s` and `z`) when `lto` is unset and `codegen-units` is not `1`.
+With unset `lto`, rustc runs local ThinLTO above opt-level 0 when there are
+multiple codegen units. Incremental ThinLTO can produce codegen units that do
+not link. For compiles without LTO, `lto=n`, `lto=no`, `lto=off`, `lto=false`,
+and `codegen-units=1` avoid this restriction. Opt-level 0 and 1 stay eligible
+unless LTO is requested.
+
 The trigger is a source change, or a changed value of an environment variable
 the crate reads with `env!` or `option_env!`, such as one its build script sets
 with `cargo:rustc-env`. An unchanged crate in a fresh target or a new checkout
@@ -210,8 +218,9 @@ Measure the initial cost and later edits on your workload before you enable it:
 
 The state uses the same [storage limits and cleanup](#storage-and-collection) as
 learned incremental reuse. For useful reuse, keep the same checkout and target
-paths, toolchain, and build flags. Eager incremental reuse also interacts with
-other features:
+paths, toolchain, and build flags. Eager incremental reuse follows the same
+optimization and LTO limits as learned incremental reuse. It also interacts
+with other features:
 
 - mbx keeps private state out of remote caches and cache exports.
 - Verification disables incremental compilation for the units it selects, but
