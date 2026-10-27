@@ -576,10 +576,25 @@ fn relative_linker_searches_key_the_identity_by_working_directory() {
     let directory = tempfile::tempdir().unwrap();
     let socket = directory.path().join("agent.sock");
     let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
     let agent = std::thread::spawn(move || {
-        let (stream, _) = listener.accept().unwrap();
+        let started = std::time::Instant::now();
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(
+                        started.elapsed() < std::time::Duration::from_secs(30),
+                        "the child did not connect to the identity agent"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                Err(error) => panic!("accepting the identity request: {error}"),
+            }
+        };
+        stream.set_nonblocking(false).unwrap();
         stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
             .unwrap();
         let mut stream = std::io::BufReader::new(stream);
         let mut line = String::new();

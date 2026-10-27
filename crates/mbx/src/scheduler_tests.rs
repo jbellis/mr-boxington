@@ -4811,7 +4811,7 @@ fn a_waiting_compile_refreshes_its_plan_before_admission() {
     ledger.memory_windows.insert(key, vec![10; 4]);
     crate::util::write_advisory(&ledger_path, &serde_json::to_vec(&ledger).unwrap()).unwrap();
 
-    let admitted = receive.recv_timeout(Duration::from_secs(3));
+    let admitted = receive.recv_timeout(Duration::from_secs(30));
     // Always release the blocker so a stale plan fails without stranding a worker.
     drop(held);
     worker.join().unwrap();

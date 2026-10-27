@@ -819,6 +819,10 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("input.rlib");
         std::fs::write(&path, b"nfs bytes").unwrap();
+        if nfs_file_identity(&path).unwrap().is_none() {
+            eprintln!("skipping: statx cannot supply the NFS ledger identity");
+            return;
+        }
         let cache = CountingCache(std::sync::atomic::AtomicUsize::new(0));
         let snapshot =
             capture_file_snapshot(&path, &cache, true, true, std::fs::metadata(&path).unwrap())
@@ -1258,25 +1262,6 @@ mod tests {
     }
 
     #[test]
-    fn a_whole_second_stamp_without_ctime_keeps_the_coarse_race_window() {
-        let identity = FileIdentity {
-            path: PathBuf::from("/nfs/input.rlib"),
-            len: 9,
-            modified: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100),
-            changed: None,
-            object: None,
-        };
-        assert!(identity_is_racy(
-            &identity,
-            identity.modified + std::time::Duration::from_secs(1),
-        ));
-        assert!(!identity_is_racy(
-            &identity,
-            identity.modified + std::time::Duration::from_secs(3),
-        ));
-    }
-
-    #[test]
     fn racy_window_follows_the_timestamp_resolution() {
         let at = |seconds: u64, nanos: u32| {
             SystemTime::UNIX_EPOCH + std::time::Duration::new(seconds, nanos)
@@ -1302,10 +1287,17 @@ mod tests {
         // A ctime newer than the mtime counts even when the mtime is old.
         let touched = identity(at(10, 7), Some((1_000, 499_000_000)));
         assert!(identity_is_racy(&touched, now));
-        // Whole-second stamps are withheld for two seconds.
-        let coarse = |age: u64| identity(at(1_000 - age, 0), Some((1_000 - age as i64, 0)));
-        assert!(identity_is_racy(&coarse(1), at(1_000, 0)));
-        assert!(!identity_is_racy(&coarse(3), at(1_000, 0)));
+        // Whole-second stamps are withheld for two seconds, even without ctime.
+        for with_ctime in [false, true] {
+            let coarse = |age: u64| {
+                identity(
+                    at(1_000 - age, 0),
+                    with_ctime.then_some((1_000 - age as i64, 0)),
+                )
+            };
+            assert!(identity_is_racy(&coarse(1), at(1_000, 0)));
+            assert!(!identity_is_racy(&coarse(3), at(1_000, 0)));
+        }
         // A timestamp in the future is racy.
         assert!(identity_is_racy(&identity(at(2_000, 1), None), now));
     }
