@@ -40,6 +40,7 @@ fn mbx(root: &Path) -> Command {
         "HOME",
         "RUSTUP_HOME",
         "CARGO_HOME",
+        "CARGO",
         "RUSTUP_TOOLCHAIN",
         "SystemRoot",
         "TEMP",
@@ -312,6 +313,68 @@ fn main() {
     .unwrap();
     let output = mbx(root.path())
         .env("RUSTC_WRAPPER", wrapper)
+        .args(["run", "--offline"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn cargo_run_through_a_cargo_shim_keeps_the_build_session() {
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    project(
+        root.path(),
+        r#"
+fn main() {
+    assert!(std::env::var_os("MBX_SOCKET").is_none());
+    assert!(std::env::var_os("MBX_SESSION_RESTORE").is_none());
+    assert!(std::env::var_os("MBX_SESSION_LEASE").is_none());
+    let path: Vec<_> = std::env::split_paths(&std::env::var_os("PATH").unwrap()).collect();
+    let expected: Vec<_> = std::env::split_paths(&std::env::var_os("EXPECTED_PATH").unwrap()).collect();
+    assert!(path.ends_with(&expected), "{path:?} does not end with {expected:?}");
+}
+"#,
+    );
+    std::fs::write(
+        root.path().join("build.rs"),
+        r#"
+fn main() {
+    assert_eq!(std::env::var("MBX_SOCKET").unwrap(), std::env::var("EXPECTED_SOCKET").unwrap());
+    assert_eq!(std::env::var("MBX_SESSION_LEASE").unwrap(), std::env::var("EXPECTED_LEASE").unwrap());
+    assert!(std::env::var_os("MBX_SESSION_RESTORE").is_some());
+}
+"#,
+    )
+    .unwrap();
+    let bin = root.path().join("bin");
+    std::fs::create_dir(&bin).unwrap();
+    let shim = bin.join("cargo");
+    std::fs::write(
+        &shim,
+        "#!/bin/sh\nexport EXPECTED_SOCKET=\"$MBX_SOCKET\" EXPECTED_LEASE=\"$MBX_SESSION_LEASE\"\nexport MBX_CARGO_SHIM_MODE=1 MBX_CARGO_SHIM_PATH=\"$0\"\nexec \"$TEST_MBX\" \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    // Put the real toolchain after our shim, keeping any host shim out of
+    // Cargo selection while still retaining the tools needed by the linker.
+    let cargo = std::path::PathBuf::from(std::env::var_os("CARGO").unwrap());
+    let path = std::env::join_paths(
+        [bin, cargo.parent().unwrap().to_path_buf()]
+            .into_iter()
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let output = mbx(root.path())
+        .env_remove("CARGO")
+        .env("PATH", &path)
+        .env("EXPECTED_PATH", &path)
+        .env("TEST_MBX", env!("CARGO_BIN_EXE_mbx"))
         .args(["run", "--offline"])
         .output()
         .unwrap();

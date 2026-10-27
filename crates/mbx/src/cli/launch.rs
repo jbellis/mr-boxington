@@ -95,7 +95,9 @@ pub fn recover_cli() -> Result<Option<ExitCode>> {
     let live = std::env::var_os(LEASE)
         .and_then(|path| std::fs::File::open(path).ok())
         .is_some_and(|file| matches!(file.try_lock(), Err(std::fs::TryLockError::WouldBlock)));
-    if live && !launching {
+    // A Cargo shim forwards the current build, including its launch runner.
+    // Only an explicit nested mbx run needs a fresh application scope.
+    if live && (!launching || super::is_cargo_shim()) {
         return Ok(None);
     }
     let mut command = Command::new(std::env::current_exe()?);
@@ -528,6 +530,19 @@ pub(super) fn record_overlay(environment: &mut BTreeMap<String, String>) -> Resu
         RESTORE.into(),
         serde_json::to_string(&Restore(restore.into_iter().collect()))?,
     );
+    Ok(())
+}
+
+/// A forwarding Cargo shim removes its directory from PATH. Track that new
+/// inherited suffix so application launch can still restore the caller's PATH
+/// while keeping any runtime library paths Cargo adds ahead of it.
+pub(super) fn forward_build_path(command: &mut Command) -> Result<()> {
+    if std::env::var_os(BUILD_PATH).is_some() {
+        command.env(
+            BUILD_PATH,
+            serde_json::to_string(&std::env::var_os("PATH"))?,
+        );
+    }
     Ok(())
 }
 
