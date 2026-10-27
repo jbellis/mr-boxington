@@ -212,18 +212,19 @@ Concurrent builds also stop repeating each other. Separate CI jobs with fresh
 targets can otherwise repeat the same dependency compilations. With mbx, a
 compilation identical to one already running against the same cache directory
 waits for that one to finish and tries to restore its result from the cache.
-If the holder publishes a changed prediction while a build waits, but the
-result does not match that build's inputs, the waiting build releases the
-flight and compiles through the permit pool. Other waiting builds can then
-check the result without waiting for that compile. If the holder publishes
-nothing, the next build keeps the flight while compiling, so later builds
-can reuse its result.
 
-After 60 seconds, mbx prints a warning naming the crate or C/C++ compilation
-it is waiting for. A build stops waiting after 10 minutes, or four times the
-compile duration in the previous prediction, whichever is longer. If there
-is no recorded duration, the limit is 10 minutes. At the limit, mbx prints a
-warning and compiles through the permit pool without holding a flight.
+Compilations with the same arguments can still read different source files,
+for example in two checkouts with different edits. When the finished result
+does not match a waiting build's files, that build compiles at once through
+the permit pool, and the builds waiting behind it do not wait for its compile.
+When the first compilation fails or stores nothing, the next waiting build
+compiles while the others keep waiting, so they can reuse its result.
+
+After a build has waited 60 seconds, mbx prints a warning that names the crate
+or C/C++ compilation it is waiting for. A build stops waiting after 10 minutes,
+or after four times the last recorded compile time of that compilation if that
+is longer. It then prints a warning and compiles on its own through the permit
+pool.
 
 The finished compilation also leaves its input list behind, so a job arriving
 after it is already done can build the cache key it would otherwise lack and
