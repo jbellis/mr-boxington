@@ -490,6 +490,10 @@ pub(crate) fn compile(
         // Incremental artifacts are deliberately never published, so they
         // must not acquire a fleet lease whose promise they cannot fulfill.
         && !learned.engaged()
+        // A released flight just learned that builds with this key differ in
+        // their inputs. Waiting on a fleet promise could queue behind another
+        // compile it cannot use, so it compiles now.
+        && !flight.flight.released()
     {
         match session::request_agent(&[AgentRequest::JoinActionPromise {
             adapter: "rustc".into(),

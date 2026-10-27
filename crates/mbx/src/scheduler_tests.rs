@@ -4938,7 +4938,33 @@ fn an_unpublished_holder_does_not_release_its_waiter_on_a_miss() {
 }
 
 #[test]
-fn a_flight_wait_warns_once_and_times_out_without_a_phantom_holder() {
+fn a_flight_wait_warns_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let holder = flight_at(dir.path(), "rustc", "notice").unwrap();
+    let mut messages = Vec::new();
+    // The notice is checked before each lock attempt, so a zero threshold
+    // fires on the first pass whatever the scheduling, and the holder is gone
+    // by then so the wait ends there.
+    let waiter = flight_at_inner(
+        dir.path(),
+        "rustc",
+        "notice",
+        "example_crate",
+        FlightWait {
+            notice: Duration::ZERO,
+            limit: None,
+        },
+        || drop(holder),
+        |message| messages.push(message.to_owned()),
+    )
+    .unwrap();
+    assert!(waiter.waited());
+    assert_eq!(messages.len(), 1, "one notice: {messages:?}");
+    assert!(messages[0].contains("example_crate"));
+}
+
+#[test]
+fn a_flight_wait_times_out_without_a_phantom_holder() {
     let dir = tempfile::tempdir().unwrap();
     let holder = flight_at(dir.path(), "rustc", "timeout").unwrap();
     let mut messages = Vec::new();
@@ -4948,20 +4974,16 @@ fn a_flight_wait_warns_once_and_times_out_without_a_phantom_holder() {
         "timeout",
         "example_crate",
         FlightWait {
-            notice: Duration::ZERO,
+            notice: Duration::MAX,
             limit: Some(Duration::from_millis(35)),
         },
         || {},
         |message| messages.push(message.to_owned()),
     );
     assert!(result.is_err());
-    assert_eq!(
-        messages.len(),
-        2,
-        "one notice and one timeout: {messages:?}"
-    );
+    assert_eq!(messages.len(), 1, "one timeout warning: {messages:?}");
+    assert!(messages[0].contains("stopped waiting"));
     assert!(messages[0].contains("example_crate"));
-    assert!(messages[1].contains("stopped waiting"));
     drop(holder);
     let next = flight_at(dir.path(), "rustc", "timeout").unwrap();
     assert!(!next.waited());
