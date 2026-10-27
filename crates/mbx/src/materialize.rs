@@ -396,31 +396,151 @@ fn readable_by_owner(mode: u32) -> bool {
 
 /// Give a file the modification time a compiler writing it now would.
 ///
-/// On Unix, sample an ordinary write on the same filesystem. `UTIME_NOW` can
-/// use a different clock: on Linux the VFS includes the multigrain timestamp floor,
-/// while ZFS writes use the coarse clock without that floor. The VFS stamp
-/// can then be newer than Cargo's subsequent `invoked.timestamp` write.
+/// Linux's VFS includes the multigrain timestamp floor in `UTIME_NOW`, but
+/// ZFS writes use the coarse clock without that floor. Only there, sample an
+/// ordinary write so Cargo's later writes do not look older. Other
+/// filesystems keep the kernel-selected timestamp.
 pub(crate) fn set_modified_now(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        set_modified_from_clock(path, || {
-            use std::io::Write as _;
-            let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
-            let mut clock = tempfile::tempfile_in(parent.unwrap_or_else(|| Path::new(".")))?;
-            clock.write_all(b"x")?;
-            Ok(clock.metadata()?.modified()?)
-        })
+        let file = std::fs::OpenOptions::new().read(true).open(path)?;
+        #[cfg(target_os = "linux")]
+        if let Some(device) = zfs_write_clock_device(&file) {
+            return set_modified_from_clock(&file, || filesystem_write_time(path, device));
+        }
+        set_modified_now_unix(&file)
     }
     #[cfg(not(unix))]
     set_modified(path, std::time::SystemTime::now())
 }
 
 #[cfg(unix)]
+fn set_modified_now_unix(file: &std::fs::File) -> Result<()> {
+    use std::os::unix::io::AsRawFd as _;
+    let omit = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: libc::UTIME_OMIT,
+    };
+    let now = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: libc::UTIME_NOW,
+    };
+    let times = [omit, now];
+    // SAFETY: `file` is an open descriptor and `times` holds the two
+    // timespecs futimens reads (access, then modification).
+    if unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn zfs_write_clock_device(file: &std::fs::File) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt as _;
+    use std::os::unix::io::AsRawFd as _;
+    use std::sync::{Mutex, OnceLock};
+    static FILESYSTEMS: OnceLock<Mutex<std::collections::HashMap<u64, bool>>> = OnceLock::new();
+    let device = file.metadata().ok()?.dev();
+    cached_write_clock(FILESYSTEMS.get_or_init(Mutex::default), device, || {
+        // SAFETY: the descriptor stays open and fstatfs initializes stats
+        // before it is read. No paths are resolved a second time.
+        let mut stats = unsafe { std::mem::zeroed::<libc::statfs>() };
+        if unsafe { libc::fstatfs(file.as_raw_fd(), &mut stats) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(stats)
+    })
+    .then_some(device)
+}
+
+#[cfg(target_os = "linux")]
+fn cached_write_clock(
+    filesystems: &std::sync::Mutex<std::collections::HashMap<u64, bool>>,
+    device: u64,
+    detect: impl FnOnce() -> std::io::Result<libc::statfs>,
+) -> bool {
+    let mut filesystems = filesystems
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    if let Some(&sample) = filesystems.get(&device) {
+        return sample;
+    }
+    // Cache query failures too: use the legacy clock for this process rather
+    // than retrying an unavailable statfs for every output.
+    let sample = detect().is_ok_and(|stats| stats.f_type == 0x2fc12fc1); // ZFS_SUPER_MAGIC
+    filesystems.insert(device, sample);
+    sample
+}
+
+#[cfg(target_os = "linux")]
+fn open_write_clock(directory: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt as _;
+    // No named fallback: O_TMPFILE is anonymous from creation, including if
+    // this process crashes before writing or closing it. Older filesystems
+    // without support fall back to UTIME_NOW instead of leaving probe files.
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_TMPFILE)
+        .mode(0o600)
+        .open(directory)
+}
+
+#[cfg(target_os = "linux")]
+fn filesystem_write_time(path: &Path, device: u64) -> std::io::Result<std::time::SystemTime> {
+    use std::sync::{Mutex, OnceLock};
+    static CLOCKS: OnceLock<Mutex<std::collections::HashMap<u64, std::fs::File>>> = OnceLock::new();
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+    cached_write_time(
+        CLOCKS.get_or_init(Mutex::default),
+        parent.unwrap_or_else(|| Path::new(".")),
+        device,
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn cached_write_time(
+    clocks: &std::sync::Mutex<std::collections::HashMap<u64, std::fs::File>>,
+    directory: &Path,
+    device: u64,
+) -> std::io::Result<std::time::SystemTime> {
+    use std::collections::hash_map::Entry;
+    use std::os::unix::fs::{FileExt as _, MetadataExt as _};
+    let mut clocks = clocks.lock().unwrap_or_else(|error| error.into_inner());
+    let clock = match clocks.entry(device) {
+        Entry::Occupied(entry) => entry.into_mut(),
+        Entry::Vacant(entry) => {
+            let clock = open_write_clock(directory)?;
+            // A symlink can reach a different filesystem than its parent.
+            // Do not cache a probe from that parent under the output's device.
+            if clock.metadata()?.dev() != device {
+                return Err(std::io::Error::other(
+                    "clock sample is on another filesystem",
+                ));
+            }
+            entry.insert(clock)
+        }
+    };
+    // Reuse the anonymous inode, never its timestamp. Serializing the write
+    // and stat gives each stamp a fresh sample and bounds the file to one byte.
+    clock.write_all_at(b"x", 0)?;
+    clock.metadata()?.modified()
+}
+
+#[cfg(target_os = "linux")]
 fn set_modified_from_clock(
-    path: &Path,
-    clock: impl FnOnce() -> Result<std::time::SystemTime>,
+    file: &std::fs::File,
+    clock: impl FnOnce() -> std::io::Result<std::time::SystemTime>,
 ) -> Result<()> {
-    set_modified(path, clock()?)
+    if let Ok(modified) = clock()
+        && file
+            .set_times(std::fs::FileTimes::new().set_modified(modified))
+            .is_ok()
+    {
+        return Ok(());
+    }
+    // The workaround must never turn a cache hit into a failed restore.
+    set_modified_now_unix(file)
 }
 
 /// Stamp a file with a modification time.
@@ -1290,7 +1410,7 @@ mod materialization_tests {
         }
     }
 
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_restore_uses_the_write_clock_even_when_the_wall_clock_is_ahead() {
         let root = tempfile::tempdir().unwrap();
@@ -1299,11 +1419,104 @@ mod materialization_tests {
         // Model a filesystem write clock behind the VFS clock, without
         // depending on another filesystem advancing Linux's global floor.
         let write_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
-        set_modified_from_clock(&restored, || Ok(write_time)).unwrap();
+        let file = std::fs::File::open(&restored).unwrap();
+        set_modified_from_clock(&file, || Ok(write_time)).unwrap();
         assert_eq!(
             std::fs::metadata(&restored).unwrap().modified().unwrap(),
             write_time
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_write_clock_decision_is_cached_for_each_filesystem() {
+        let filesystems = std::sync::Mutex::new(std::collections::HashMap::new());
+        let filesystem = |kind| {
+            // SAFETY: statfs contains integer fields and arrays, all valid
+            // when zeroed. Only the filesystem type matters to this policy.
+            let mut stats = unsafe { std::mem::zeroed::<libc::statfs>() };
+            stats.f_type = kind;
+            Ok(stats)
+        };
+        assert!(cached_write_clock(&filesystems, 1, || filesystem(
+            0x2fc12fc1
+        )));
+        assert!(!cached_write_clock(&filesystems, 2, || filesystem(0xef53)));
+        assert!(!cached_write_clock(&filesystems, 3, || filesystem(
+            0x01021994
+        )));
+        assert!(cached_write_clock(&filesystems, 1, || panic!("cached ZFS")));
+        assert!(!cached_write_clock(&filesystems, 2, || panic!(
+            "cached ext4"
+        )));
+        assert!(!cached_write_clock(&filesystems, 3, || panic!(
+            "cached tmpfs"
+        )));
+        assert!(!cached_write_clock(&filesystems, 4, || {
+            Err(std::io::Error::other("statfs failed"))
+        }));
+        assert!(!cached_write_clock(&filesystems, 4, || panic!(
+            "cached failure"
+        )));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cached_write_clock_samples_a_new_write_each_time() {
+        let root = tempfile::tempdir().unwrap();
+        let device = std::fs::metadata(root.path()).unwrap().dev();
+        let clocks = std::sync::Mutex::new(std::collections::HashMap::new());
+        // An unsupported O_TMPFILE is covered by the fallback path instead.
+        if cached_write_time(&clocks, root.path(), device).is_err() {
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+            return;
+        }
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        let inode = {
+            let clocks = clocks.lock().unwrap();
+            let clock = &clocks[&device];
+            clock
+                .set_times(std::fs::FileTimes::new().set_modified(old))
+                .unwrap();
+            clock.metadata().unwrap().ino()
+        };
+        assert_ne!(
+            cached_write_time(&clocks, root.path(), device).unwrap(),
+            old
+        );
+        let clocks = clocks.lock().unwrap();
+        assert_eq!(clocks.len(), 1);
+        let clock = &clocks[&device];
+        let metadata = clock.metadata().unwrap();
+        assert_eq!(metadata.ino(), inode);
+        assert_eq!(metadata.len(), 1);
+        assert_eq!(metadata.nlink(), 0);
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_failed_write_clock_falls_back_to_the_kernel_stamp() {
+        let root = tempfile::tempdir().unwrap();
+        let restored = root.path().join("restored");
+        std::fs::write(&restored, b"bin").unwrap();
+        let old = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        set_modified(&restored, old).unwrap();
+        let file = std::fs::File::open(&restored).unwrap();
+        set_modified_from_clock(&file, || Err(std::io::Error::other("probe failed"))).unwrap();
+        assert_ne!(file.metadata().unwrap().modified().unwrap(), old);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_write_clock_never_has_a_directory_entry() {
+        let root = tempfile::tempdir().unwrap();
+        if let Ok(mut clock) = open_write_clock(root.path()) {
+            clock.write_all(b"x").unwrap();
+            assert_eq!(clock.metadata().unwrap().nlink(), 0);
+            assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
+        }
+        assert_eq!(std::fs::read_dir(root.path()).unwrap().count(), 0);
     }
 
     #[test]
