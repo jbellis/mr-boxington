@@ -1071,6 +1071,27 @@ fn an_explicit_compiler_or_toolchain_wins_over_cargos_own() {
 
 #[test]
 fn a_compiler_named_in_cargo_configuration_is_left_to_cargo() {
+    const ISOLATED_ENV: &str = "MBX_TEST_ISOLATED_CARGO_CONFIG_ENV";
+    if std::env::var_os(ISOLATED_ENV).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::cargo_tests::a_compiler_named_in_cargo_configuration_is_left_to_cargo",
+            ])
+            .env(ISOLATED_ENV, "1")
+            .env_remove("RUSTC")
+            .env_remove("CARGO_BUILD_RUSTC")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated test process failed:\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
     let directory = tempfile::tempdir().unwrap();
     let arguments = |values: &[&str]| {
         values
