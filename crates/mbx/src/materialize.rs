@@ -396,34 +396,31 @@ fn readable_by_owner(mode: u32) -> bool {
 
 /// Give a file the modification time a compiler writing it now would.
 ///
-/// On Unix the kernel picks the time (`UTIME_NOW`), so the stamp comes from the
-/// same coarse clock that stamps every later write. An explicit
-/// `SystemTime::now()` reads a finer clock and can land up to one tick ahead of
-/// a write Cargo makes right after the restore, which leaves that newer file
-/// looking older than the restored one and reruns the build script.
+/// On Unix, sample an ordinary write on the same filesystem. `UTIME_NOW` can
+/// use a different clock: on Linux the VFS includes the multigrain timestamp floor,
+/// while ZFS writes use the coarse clock without that floor. The VFS stamp
+/// can then be newer than Cargo's subsequent `invoked.timestamp` write.
 pub(crate) fn set_modified_now(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::io::AsRawFd as _;
-        let file = std::fs::OpenOptions::new().read(true).open(path)?;
-        let omit = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_OMIT,
-        };
-        let now = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: libc::UTIME_NOW,
-        };
-        let times = [omit, now];
-        // SAFETY: `file` is an open descriptor and `times` holds the two
-        // timespecs futimens reads (access, then modification).
-        if unsafe { libc::futimens(file.as_raw_fd(), times.as_ptr()) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(())
+        set_modified_from_clock(path, || {
+            use std::io::Write as _;
+            let parent = path.parent().filter(|p| !p.as_os_str().is_empty());
+            let mut clock = tempfile::tempfile_in(parent.unwrap_or_else(|| Path::new(".")))?;
+            clock.write_all(b"x")?;
+            Ok(clock.metadata()?.modified()?)
+        })
     }
     #[cfg(not(unix))]
     set_modified(path, std::time::SystemTime::now())
+}
+
+#[cfg(unix)]
+fn set_modified_from_clock(
+    path: &Path,
+    clock: impl FnOnce() -> Result<std::time::SystemTime>,
+) -> Result<()> {
+    set_modified(path, clock()?)
 }
 
 /// Stamp a file with a modification time.
@@ -994,6 +991,12 @@ mod materialization_tests {
     fn a_filesystem_without_clones_links_the_object_instead_of_copying_it() {
         let root = tempfile::tempdir().unwrap();
         let source = blob(root.path(), "blob", b"rlib", 0o644);
+        // A restore within the same coarse tick may keep the original mtime.
+        set_modified(
+            &source,
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+        )
+        .unwrap();
         let before = std::fs::metadata(&source).unwrap();
 
         let (staged, materialization) = stage_verified_cached_output_with(
@@ -1285,6 +1288,22 @@ mod materialization_tests {
                 "iteration {i}: the restore stamp is ahead of a later write"
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_restore_uses_the_write_clock_even_when_the_wall_clock_is_ahead() {
+        let root = tempfile::tempdir().unwrap();
+        let restored = root.path().join("restored");
+        std::fs::write(&restored, b"bin").unwrap();
+        // Model a filesystem write clock behind the VFS clock, without
+        // depending on another filesystem advancing Linux's global floor.
+        let write_time = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000);
+        set_modified_from_clock(&restored, || Ok(write_time)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&restored).unwrap().modified().unwrap(),
+            write_time
+        );
     }
 
     #[test]
