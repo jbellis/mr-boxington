@@ -1779,6 +1779,18 @@ fn a_waiter_removed_after_its_lock_check_has_left_the_queue() {
 }
 
 #[test]
+fn an_unlocked_malformed_waiter_is_reclaimed_before_parsing() {
+    let directory = tempfile::tempdir().unwrap();
+    let waiters = directory.path().join(WAITERS_DIR);
+    std::fs::create_dir_all(&waiters).unwrap();
+    let path = waiters.join("abandoned");
+    std::fs::write(&path, b"{").unwrap();
+
+    assert!(scan_waiters(&waiters).unwrap().is_empty());
+    assert!(!path.exists());
+}
+
+#[test]
 fn a_locked_empty_waiter_has_left_the_queue() {
     let directory = tempfile::tempdir().unwrap();
     let waiters = directory.path().join(WAITERS_DIR);
@@ -4769,6 +4781,43 @@ fn a_waiting_admission_plan_refreshes_when_history_changes() {
         .is_some()
     );
     drop(held);
+}
+
+#[test]
+fn a_waiting_compile_refreshes_its_plan_before_admission() {
+    let directory = tempfile::tempdir().unwrap();
+    let pool = pool_at(directory.path(), 10, 100);
+    let demand = compile_demand("crate", &[]);
+    let key = demand.compile_mode.as_ref().unwrap().clone();
+    let mut ledger = MemoryLedger::default();
+    ledger.memory_windows.insert(key.clone(), vec![500; 4]);
+    crate::util::write_advisory(&pool.ledger_path(), &serde_json::to_vec(&ledger).unwrap())
+        .unwrap();
+    let held = pool.try_admit(9, None).unwrap().unwrap();
+    let ledger_path = pool.ledger_path();
+    let (send, receive) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _permit = pool.admit(&demand).unwrap();
+        let admission = demand.observation.get().unwrap();
+        send.send((
+            admission.resources.memory_bytes,
+            demand.memory_features.get().unwrap().mean,
+        ))
+        .unwrap();
+    });
+    wait_until("the compile to queue", || {
+        directory.path().join(PRIORITY_WAIT_STAMP).exists()
+    });
+    ledger.memory_windows.insert(key, vec![10; 4]);
+    crate::util::write_advisory(&ledger_path, &serde_json::to_vec(&ledger).unwrap()).unwrap();
+
+    let admitted = receive.recv_timeout(Duration::from_secs(3));
+    // Always release the blocker so a stale plan fails without stranding a worker.
+    drop(held);
+    worker.join().unwrap();
+    let (memory, mean) = admitted.expect("the refreshed compile fits beside the held permit");
+    assert!(memory <= 100);
+    assert_eq!(mean, 10.0_f64.ln());
 }
 
 #[test]

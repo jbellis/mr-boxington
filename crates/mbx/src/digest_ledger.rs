@@ -265,6 +265,30 @@ mod tests {
     }
 
     #[test]
+    fn saving_a_loaded_ledger_keeps_another_sessions_new_entries() {
+        let state = tempfile::tempdir().unwrap();
+        let files = tempfile::tempdir().unwrap();
+        let first = files.path().join("libfirst.rlib");
+        let second = files.path().join("libsecond.rlib");
+        std::fs::write(&first, b"first").unwrap();
+        std::fs::write(&second, b"second").unwrap();
+        let first = (FileDigestScope::Content, record(&first));
+        let second = (FileDigestScope::Content, record(&second));
+        save(state.path(), vec![first.clone()], None).unwrap();
+        let entries = load(state.path());
+        let loaded = stamp(state.path());
+        assert!(loaded.is_some());
+
+        save(state.path(), vec![second.clone()], None).unwrap();
+        // The added entry changes length even within a filesystem timestamp tick.
+        assert_ne!(loaded, stamp(state.path()));
+        assert_eq!(save(state.path(), entries, loaded).unwrap(), 2);
+        let merged = load(state.path());
+        assert!(merged.contains(&first));
+        assert!(merged.contains(&second));
+    }
+
+    #[test]
     fn an_unreadable_or_foreign_ledger_is_an_empty_one() {
         let state = tempfile::tempdir().unwrap();
         assert!(load(state.path()).is_empty());
