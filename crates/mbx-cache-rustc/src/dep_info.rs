@@ -1597,7 +1597,9 @@ mod tests {
         let identity = FileIdentity::describe(&path, &before).unwrap();
 
         // Same length, modification time put back: only the change token can
-        // tell this file has new contents.
+        // tell this file has new contents. Filesystems such as ZFS stamp
+        // files from a 1 ms tick, so wait for the change token to move.
+        std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&path, b"fn lib() -> u8 { 2 }").unwrap();
         let file = std::fs::File::options().write(true).open(&path).unwrap();
         file.set_times(std::fs::FileTimes::new().set_modified(before.modified().unwrap()))
