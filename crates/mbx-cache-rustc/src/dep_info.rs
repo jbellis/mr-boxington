@@ -1105,6 +1105,9 @@ mod tests {
 
         // Conversely, a filesystem clock far behind must not conceal a write.
         std::fs::write(&source, "pub fn library() {1}\n").unwrap();
+        let discovered = invocation
+            .discover_inputs(&dep_info, directory.path())
+            .unwrap();
         assert_eq!(
             discovered.verify_not_modified_since_with_snapshots(
                 SystemTime::now() + std::time::Duration::from_secs(60),

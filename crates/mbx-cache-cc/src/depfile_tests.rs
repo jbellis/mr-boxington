@@ -415,6 +415,13 @@ fn precompile_snapshot_does_not_depend_on_the_host_clock() {
         .expect("an unchanged identity is independent of clock offset");
 
     std::fs::write(&source, "int a(void) { return 1; }\n").expect("rewrite");
+    let discovered = CcDiscoveredInputs::collect(
+        root,
+        BTreeSet::from([source.clone()]),
+        BTreeSet::new(),
+        &NoFileDigestCache,
+    )
+    .expect("discovery after compilation");
     assert_eq!(
         discovered
             .verify_not_modified_since_with_snapshots(
