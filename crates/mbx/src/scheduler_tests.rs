@@ -4809,7 +4809,18 @@ fn a_waiting_compile_refreshes_its_plan_before_admission() {
         directory.path().join(PRIORITY_WAIT_STAMP).exists()
     });
     ledger.memory_windows.insert(key, vec![10; 4]);
-    crate::util::write_advisory(&ledger_path, &serde_json::to_vec(&ledger).unwrap()).unwrap();
+    // Windows refuses to replace a file the waiting compile has open while it
+    // rereads history; production drops such a write, the test retries it.
+    let contents = serde_json::to_vec(&ledger).unwrap();
+    let mut written = crate::util::write_advisory(&ledger_path, &contents);
+    for _ in 0..500 {
+        if written.is_ok() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+        written = crate::util::write_advisory(&ledger_path, &contents);
+    }
+    written.unwrap();
 
     let admitted = receive.recv_timeout(Duration::from_secs(30));
     // Always release the blocker so a stale plan fails without stranding a worker.
