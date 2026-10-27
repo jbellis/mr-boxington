@@ -797,6 +797,37 @@ impl FileDigestCache for NoFileDigestCache {
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_nfs_snapshot_consults_the_session_digest_ledger() {
+        struct CountingCache(std::sync::atomic::AtomicUsize);
+        impl FileDigestCache for CountingCache {
+            fn find(
+                &self,
+                scope: FileDigestScope,
+                files: &[FileIdentity],
+            ) -> Vec<Option<CacheDigest>> {
+                assert_eq!(scope, FileDigestScope::Content);
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].changed, None);
+                assert!(files[0].object.is_some());
+                self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                vec![None]
+            }
+            fn record(&self, _scope: FileDigestScope, _entries: Vec<RecordedFileDigest>) {}
+        }
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.rlib");
+        std::fs::write(&path, b"nfs bytes").unwrap();
+        let cache = CountingCache(std::sync::atomic::AtomicUsize::new(0));
+        let snapshot =
+            capture_file_snapshot(&path, &cache, true, true, std::fs::metadata(&path).unwrap())
+                .unwrap()
+                .unwrap();
+        assert_eq!(snapshot.content, Some(CacheDigest::blake3(b"nfs bytes")));
+        assert_eq!(cache.0.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
     #[test]
     fn timestamp_macros_are_detected_at_every_chunk_boundary_split() {
         let directory = tempfile::tempdir().unwrap();
@@ -1084,6 +1115,28 @@ mod tests {
     }
 
     #[test]
+    fn an_nfs_object_identity_can_skip_a_second_content_read() {
+        let identity = FileIdentity {
+            path: PathBuf::from("/nfs/input.rlib"),
+            len: 9,
+            modified: SystemTime::UNIX_EPOCH,
+            changed: None,
+            object: Some(FileObjectIdentity {
+                device_major: 0,
+                device_minor: 42,
+                mount_id: 7,
+                inode: 99,
+            }),
+        };
+        assert!(identity.can_skip_content_verification());
+        let without_object = FileIdentity {
+            object: None,
+            ..identity
+        };
+        assert!(!without_object.can_skip_content_verification());
+    }
+
+    #[test]
     fn reliable_metadata_keeps_the_native_identity() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("input.rs");
@@ -1202,6 +1255,25 @@ mod tests {
             .unwrap();
         assert!(!settled.racy);
         assert!(settled.cache_identity.is_some());
+    }
+
+    #[test]
+    fn a_whole_second_stamp_without_ctime_keeps_the_coarse_race_window() {
+        let identity = FileIdentity {
+            path: PathBuf::from("/nfs/input.rlib"),
+            len: 9,
+            modified: SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(100),
+            changed: None,
+            object: None,
+        };
+        assert!(identity_is_racy(
+            &identity,
+            identity.modified + std::time::Duration::from_secs(1),
+        ));
+        assert!(!identity_is_racy(
+            &identity,
+            identity.modified + std::time::Duration::from_secs(3),
+        ));
     }
 
     #[test]

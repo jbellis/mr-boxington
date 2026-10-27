@@ -204,3 +204,37 @@ mod tests {
         assert_eq!(std::fs::read(&outside).unwrap(), b"keep");
     }
 }
+
+#[cfg(test)]
+mod retirement_tests {
+    use super::*;
+
+    #[test]
+    fn a_recreated_live_tree_can_retire_before_its_previous_deletion() {
+        let directory = tempfile::tempdir().unwrap();
+        let live = directory.path().join("tree");
+        std::fs::create_dir(&live).unwrap();
+        std::fs::write(live.join("state"), b"first").unwrap();
+        let first = RetiredTree::retire(&live).unwrap().unwrap();
+
+        std::fs::create_dir(&live).unwrap();
+        std::fs::write(live.join("state"), b"second").unwrap();
+        let second = RetiredTree::retire(&live).unwrap().unwrap();
+        assert_ne!(first.path(), second.path());
+        assert_eq!(std::fs::read(first.path().join("state")).unwrap(), b"first");
+        assert_eq!(
+            std::fs::read(second.path().join("state")).unwrap(),
+            b"second"
+        );
+
+        std::fs::create_dir(&live).unwrap();
+        std::fs::write(live.join("state"), b"current").unwrap();
+        first.remove().unwrap();
+        assert_eq!(
+            std::fs::read(second.path().join("state")).unwrap(),
+            b"second"
+        );
+        second.remove().unwrap();
+        assert_eq!(std::fs::read(live.join("state")).unwrap(), b"current");
+    }
+}

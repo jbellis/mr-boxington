@@ -6793,6 +6793,57 @@ async fn file_digest_ledger_answers_only_matching_identities() {
 }
 
 #[tokio::test]
+async fn file_digest_ledger_rejects_replaced_file_objects() {
+    let directory = tempfile::tempdir().unwrap();
+    let agent = CacheAgent::new(directory.path(), "test-version");
+    let mut file = ledger_identity("work/target/libserde.rlib", 7, 21);
+    file.object = Some(FileObjectIdentity {
+        device_major: 1,
+        device_minor: 2,
+        mount_id: 3,
+        inode: 4,
+    });
+    let response = agent
+        .respond(AgentRequest::RecordFileDigests {
+            scope: FileDigestScope::Content,
+            entries: vec![RecordedFileDigest {
+                file: file.clone(),
+                digest: ledger_digest(7),
+            }],
+        })
+        .await;
+    assert!(matches!(response, AgentResponse::FileDigestsRecorded));
+
+    // Same-tick replacements can keep every timestamp and the length.
+    let mut replacements = Vec::new();
+    for component in 0..4 {
+        let mut replacement = file.clone();
+        let object = replacement.object.as_mut().unwrap();
+        match component {
+            0 => object.inode += 1,
+            1 => object.device_major += 1,
+            2 => object.device_minor += 1,
+            _ => object.mount_id += 1,
+        }
+        replacements.push(replacement);
+    }
+    replacements.push(file);
+    let response = agent
+        .respond(AgentRequest::FindFileDigests {
+            scope: FileDigestScope::Content,
+            files: replacements,
+        })
+        .await;
+    let AgentResponse::FileDigests { digests } = response else {
+        panic!("expected file digests");
+    };
+    assert_eq!(
+        digests,
+        vec![None, None, None, None, Some(ledger_digest(7))]
+    );
+}
+
+#[tokio::test]
 async fn file_digest_ledger_scopes_do_not_answer_for_each_other() {
     let directory = tempfile::tempdir().unwrap();
     let agent = CacheAgent::new(directory.path(), "test-version");
@@ -7317,4 +7368,42 @@ async fn a_racy_file_digest_is_returned_but_neither_recorded_nor_shared() {
 
     assert!(matches!(resolution, FileDigestResolution::Digest(_)));
     assert!(agent.file_digests.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn waiting_callers_read_a_racy_file_digest_independently() {
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("input.rs");
+    std::fs::write(&path, b"pub const VAL: &str = \"v1\";").unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(&path)
+        .unwrap()
+        .set_times(
+            std::fs::FileTimes::new().set_modified(SystemTime::now() + Duration::from_secs(3600)),
+        )
+        .unwrap();
+    let identity = FileIdentity::for_digest_cache(&path, &std::fs::metadata(&path).unwrap())
+        .unwrap()
+        .unwrap();
+    let agent = CacheAgent::new(directory.path().join("cache"), "test-version");
+    // Keep the flight alive as a queued caller would, independently of scheduling.
+    let flight = Arc::new(FileDigestFlight {
+        lock: tokio::sync::Mutex::new(()),
+        resolution: Mutex::new(None),
+    });
+    agent.file_digest_locks.lock().unwrap().insert(
+        (FileDigestScope::Content, identity.clone()),
+        Arc::downgrade(&flight),
+    );
+    let (first, second) = tokio::join!(
+        agent.resolve_file_digest(FileDigestScope::Content, identity.clone()),
+        agent.resolve_file_digest(FileDigestScope::Content, identity),
+    );
+    let expected = FileDigestResolution::Digest(CacheDigest::blake3_file(&path).unwrap());
+    assert_eq!(first, expected);
+    assert_eq!(second, expected);
+    assert_eq!(agent.file_digest_reads.load(Ordering::Relaxed), 2);
+    assert!(agent.file_digests.lock().unwrap().is_empty());
+    assert!(flight.resolution.lock().unwrap().is_none());
 }

@@ -390,6 +390,29 @@ fn discovery_rejects_inputs_modified_during_compilation() {
     assert_eq!(discovered.verify().unwrap_err().kind(), "input-changed");
 }
 
+#[test]
+fn discovery_rejects_an_input_at_the_compilation_barrier() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let root = directory.path();
+    let source = write(root, "a.c", "int a(void) { return 0; }\n");
+    let started_at = std::fs::metadata(&source).unwrap().modified().unwrap();
+    let discovered = CcDiscoveredInputs::collect(
+        root,
+        BTreeSet::from([source]),
+        BTreeSet::new(),
+        &NoFileDigestCache,
+    )
+    .expect("discovery");
+
+    assert_eq!(
+        discovered
+            .verify_not_modified_since_with_snapshots(started_at, &BTreeMap::new())
+            .unwrap_err()
+            .kind(),
+        "input-modified-during-compilation"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn precompile_snapshot_does_not_depend_on_the_host_clock() {

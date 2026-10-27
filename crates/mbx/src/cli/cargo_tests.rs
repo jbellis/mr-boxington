@@ -1134,3 +1134,42 @@ fn a_compiler_named_in_cargo_configuration_is_left_to_cargo() {
         &arguments(&["build"])
     ));
 }
+
+#[test]
+fn aliases_cannot_introduce_a_compiler_argument_separator() {
+    const CHILD: &str = "MBX_TEST_ALIAS_SEPARATOR_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        let cargo = std::ffi::OsStr::new("cargo");
+        assert_eq!(
+            super::cargo_invocation::expanded_arguments(cargo, &arguments(&["compile"])),
+            None,
+        );
+        assert_eq!(
+            super::cargo_invocation::expanded_arguments(
+                cargo,
+                &arguments(&["compile", "--", "--cfg=caller"]),
+            ),
+            Some(arguments(&["rustc", "--", "--", "--cfg=caller"])),
+        );
+        return;
+    }
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join(".cargo")).unwrap();
+    std::fs::write(
+        root.path().join(".cargo/config.toml"),
+        "[alias]\ncompile=['rustc','--']\n",
+    )
+    .unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "cli::cargo_tests::aliases_cannot_introduce_a_compiler_argument_separator",
+            "--nocapture",
+        ])
+        .current_dir(root.path())
+        .env(CHILD, "1")
+        .env_remove("CARGO_ALIAS_COMPILE")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+}

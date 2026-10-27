@@ -1106,3 +1106,37 @@ fn a_panicking_automatic_collector_records_before_the_previous_hook_aborts() {
         b"stamped"
     );
 }
+
+#[cfg(unix)]
+#[test]
+fn a_short_disk_retries_targets_after_sparse_files_release_little_space() {
+    let directory = tempfile::tempdir().unwrap();
+    let config = super::cargo_tests::managed_target_config(directory.path());
+    let views = [("older", 1), ("newer", 2)].map(|(name, updated_secs)| {
+        let view = low_disk_view(&config, directory.path(), name, updated_secs, &[], false);
+        // Logical eviction exceeds the shortfall, but releases almost no blocks.
+        std::fs::File::create(view.join("sparse"))
+            .unwrap()
+            .set_len(128 * 1024 * 1024 * 1024)
+            .unwrap();
+        view
+    });
+    let available = crate::util::disk_space(&config.target.root)
+        .unwrap()
+        .available;
+    let retention = RetentionSettings {
+        min_free: Some(crate::config::MinFree::Bytes(
+            available + 64 * 1024 * 1024 * 1024,
+        )),
+        ..always_short()
+    };
+
+    let collection = collect_low_disk(&config, &retention);
+
+    assert!(!views[0].exists(), "the first logical eviction ran");
+    assert!(
+        !views[1].exists(),
+        "the disk is still short after the first eviction, so collection must retry"
+    );
+    assert_eq!(collection.targets.unwrap().removed_views, 2);
+}

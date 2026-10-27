@@ -1022,6 +1022,42 @@ fn wholesale_reservation_refuses_a_command_using_the_target() {
 }
 
 #[test]
+fn adoption_keeps_the_callers_lease_until_the_command_finishes() {
+    if !in_own_process(
+        module_path!(),
+        "adoption_keeps_the_callers_lease_until_the_command_finishes",
+    ) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let config = lease_test_config(directory.path(), true);
+    let workspace = lease_checkout(directory.path(), "project");
+    let target = workspace.join("target");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("artifact"), b"outputs").unwrap();
+    let lease = ViewLease::reserve(&config.target.root, &workspace)
+        .unwrap()
+        .unwrap();
+
+    let outcome = adopt_existing(&config, &workspace, &target, false, &lease).unwrap();
+    let view = outcome.managed.unwrap();
+    assert_eq!(std::fs::read(view.join("artifact")).unwrap(), b"outputs");
+    assert_eq!(
+        remove_workspace(&config.target.root, &workspace).unwrap(),
+        RemoveOutcome::Active,
+        "adoption must leave the command's lease held"
+    );
+    assert!(view.join("artifact").is_file());
+
+    drop(lease);
+    assert!(
+        ViewLease::reserve(&config.target.root, &workspace)
+            .unwrap()
+            .is_some()
+    );
+}
+
+#[test]
 fn adoption_reservation_protects_the_record_and_move() {
     if !in_own_process(
         module_path!(),
@@ -1136,4 +1172,28 @@ fn restore_reservation_protects_placement_and_workspace_state() {
         std::fs::read(view.join("artifact")).unwrap(),
         b"restored outputs"
     );
+}
+
+#[test]
+#[cfg(unix)]
+fn dropping_a_lease_unlocks_descriptors_that_share_its_open_file() {
+    if !in_own_process(
+        module_path!(),
+        "dropping_a_lease_unlocks_descriptors_that_share_its_open_file",
+    ) {
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let root = directory.path().join("targets");
+    let workspace = lease_checkout(directory.path(), "workspace");
+    let lease = ViewLease::acquire(&root, &workspace).unwrap();
+    // A duplicate refers to the same open file description as an inherited fd.
+    let inherited = lease._file.try_clone().unwrap();
+    assert!(ViewLease::reserve(&root, &workspace).unwrap().is_none());
+    drop(lease);
+    assert!(
+        ViewLease::reserve(&root, &workspace).unwrap().is_some(),
+        "dropping the command's lease must unlock even while another descriptor lives"
+    );
+    drop(inherited);
 }

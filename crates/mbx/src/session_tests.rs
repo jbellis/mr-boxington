@@ -2353,3 +2353,38 @@ fn seed_incremental_shim_does_not_read_the_user_override() {
         (name == "MBX_SEED_INCREMENTAL").then(|| OsString::from("0"))
     }));
 }
+
+#[test]
+fn rustc_shim_entry_reserves_stderr_before_reporting_diagnostics() {
+    const CHILD: &str = "MBX_TEST_RUSTC_WARNING_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        // The harness's first argument is --exact, an absent compiler.
+        assert_eq!(run_rustc_shim(), std::process::ExitCode::from(1));
+        report_shim_warning("warning after rustc shim entry");
+        return;
+    }
+    let directory = tempfile::tempdir().unwrap();
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "session::tests::rustc_shim_entry_reserves_stderr_before_reporting_diagnostics",
+            "--nocapture",
+        ])
+        .current_dir(directory.path())
+        .env(CHILD, "1")
+        .env("MBX_SOCKET", directory.path().join("missing-agent.sock"))
+        .env_remove("MBX_PREVIOUS_RUSTC_WRAPPER")
+        .env_remove("MBX_PREVIOUS_RUSTC_WORKSPACE_WRAPPER")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("the rustc shim failed to execute rustc"),
+        "{stderr}"
+    );
+    assert!(
+        !stderr.contains("warning after rustc shim entry"),
+        "{stderr}"
+    );
+}

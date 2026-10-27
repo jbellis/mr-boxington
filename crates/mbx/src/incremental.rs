@@ -2392,6 +2392,12 @@ mod tests {
         set_mtime(&stamp, recent);
         stamp_use(&directory, None);
         assert_eq!(mtime(&stamp), recent as i64, "throttled");
+        set_mtime(&stamp, now_secs() - 120);
+        stamp_use(&directory, None);
+        assert!(
+            mtime(&stamp) >= now_secs() as i64 - 5,
+            "refresh after a minute"
+        );
         set_mtime(&stamp, 1000);
         stamp_use(&directory, None);
         assert!(mtime(&stamp) >= now_secs() as i64 - 5);
@@ -3027,6 +3033,24 @@ mod tests {
         .unwrap();
         assert_eq!(within_budget.removed_units, 0);
         assert_eq!(within_budget.remaining_bytes, before.bytes);
+
+        let preview = collect(
+            cache.path(),
+            None,
+            Some(Duration::from_secs(60)),
+            true,
+            true,
+            None,
+        )
+        .unwrap();
+        assert_eq!(preview.removed_units, 1);
+        assert_eq!(
+            preview.removed_bytes, 0,
+            "the other unit still owns the inode"
+        );
+        assert_eq!(preview.remaining_bytes, before.bytes);
+        assert!(old.exists());
+        assert!(linked.exists());
 
         let one_removed = collect(
             cache.path(),
@@ -3718,6 +3742,27 @@ mod tests {
             1,
             "no staging directory is left behind"
         );
+    }
+
+    #[test]
+    fn seeding_copies_nested_session_contents_without_sharing_them() {
+        let cache = tempfile::tempdir().unwrap();
+        let unit = "blake3/0123456789";
+        let own = checkout_with_sessions(cache.path(), "own", 40, unit, &[]);
+        let donor = checkout_with_sessions(cache.path(), "donor", 20, unit, &["s-1-a-finished"]);
+        let relative = Path::new("widget-0abc/s-1-a-finished/nested/deeper/state.bin");
+        let original = donor.join(unit).join(relative);
+        std::fs::create_dir_all(original.parent().unwrap()).unwrap();
+        std::fs::write(&original, b"nested state").unwrap();
+
+        assert_eq!(
+            seed(&own, unit).unwrap(),
+            Some(PathBuf::from("/work/donor"))
+        );
+        let copied = own.join(unit).join(relative);
+        assert_eq!(std::fs::read(&copied).unwrap(), b"nested state");
+        std::fs::write(&copied, b"recipient state").unwrap();
+        assert_eq!(std::fs::read(&original).unwrap(), b"nested state");
     }
 
     #[test]

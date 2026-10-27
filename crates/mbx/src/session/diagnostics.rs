@@ -100,3 +100,13 @@ pub(super) fn diagnostic_message(message: &str) -> String {
     }
     message
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn diagnostic_messages_replace_nul_before_forwarding() {
+        assert_eq!(diagnostic_message("before\0after"), "before; after");
+    }
+}

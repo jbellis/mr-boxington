@@ -723,6 +723,33 @@ pub fn dispatch() -> Option<ExitCode> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn nested_overlays_keep_keys_changed_only_by_the_outer_session() {
+        const CHILD: &str = "MBX_TEST_NESTED_OVERLAY_CHILD";
+        const OUTER: &str = "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUNNER";
+        if std::env::var_os(CHILD).is_some() {
+            remember_caller();
+            let mut overlay = BTreeMap::from([("MBX_BUILD".into(), "nested-build".into())]);
+            record_overlay(&mut overlay).unwrap();
+            let restore: Restore = serde_json::from_str(&overlay[RESTORE]).unwrap();
+            assert!(restore.0.contains(&(OUTER.into(), None)));
+            return;
+        }
+        let restore = Restore(vec![(OUTER.into(), None), (RESTORE.into(), None)]);
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "cli::launch::tests::nested_overlays_keep_keys_changed_only_by_the_outer_session",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env(OUTER, "outer-launch-shim")
+            .env(RESTORE, serde_json::to_string(&restore).unwrap())
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+    }
+
     #[cfg(unix)]
     #[test]
     fn wrapper_paths_with_non_unicode_bytes_cannot_enter_the_managed_environment() {

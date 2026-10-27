@@ -275,6 +275,26 @@ pub(crate) fn save(path: &Path, state: &State) -> eyre::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_domain_is_named_by_its_cgroup_device_and_inode() {
+        use sha2::Digest;
+        use std::os::unix::fs::MetadataExt;
+
+        let identities: Vec<_> = crate::cgroup::memory_directories()
+            .iter()
+            .filter_map(|path| std::fs::metadata(path).ok())
+            .map(|metadata| format!("{}:{}\n", metadata.dev(), metadata.ino()))
+            .collect();
+        if identities.is_empty() {
+            assert_eq!(domain(), "host");
+        } else {
+            // Paths repeat across containers; kernel identities do not.
+            let digest = sha2::Sha256::digest(identities.concat());
+            assert_eq!(domain(), hex::encode(&digest[..8]));
+        }
+    }
+
     fn memory(available: u64) -> Reading {
         Reading {
             total: Some(100),

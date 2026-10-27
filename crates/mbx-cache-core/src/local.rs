@@ -802,6 +802,41 @@ mod tests {
     }
 
     #[test]
+    fn replaces_a_conflicting_result_when_its_metadata_is_missing() {
+        let directory = tempfile::tempdir().unwrap();
+        let cas = LocalCas::new(directory.path());
+        let actions = LocalActionCache::new(directory.path());
+        let action = CacheDigest::blake3(b"action");
+        cas.store_bytes(&action, b"action").unwrap();
+        let metadata = CacheDigest::blake3(b"old metadata");
+        let metadata_path = cas.store_bytes(&metadata, b"old metadata").unwrap();
+        let first = RemoteActionResult {
+            action: action.clone(),
+            metadata: Some(metadata),
+            output_root: None,
+            version: 1,
+        };
+        let metadata = CacheDigest::blake3(b"new metadata");
+        cas.store_bytes(&metadata, b"new metadata").unwrap();
+        let second = RemoteActionResult {
+            metadata: Some(metadata),
+            ..first.clone()
+        };
+        actions.store(&first).unwrap();
+        assert_eq!(
+            actions.store_unless_restorable(&second, |_| true).unwrap(),
+            ActionStoreOutcome::KeptExisting
+        );
+
+        fs::remove_file(metadata_path).unwrap();
+        assert_eq!(
+            actions.store_unless_restorable(&second, |_| true).unwrap(),
+            ActionStoreOutcome::Stored
+        );
+        assert_eq!(actions.find(&action).unwrap(), Some(second));
+    }
+
+    #[test]
     fn keeps_a_different_result_until_its_objects_are_gone() {
         let directory = tempfile::tempdir().unwrap();
         let cas = LocalCas::new(directory.path());

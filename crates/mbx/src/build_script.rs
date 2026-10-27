@@ -2199,6 +2199,25 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn resolved_target_link_searches_outside_out_dir_are_not_cached() {
+        let directory = tempfile::tempdir().unwrap();
+        let managed = directory.path().join("managed");
+        std::fs::create_dir_all(managed.join("gn_out/obj")).unwrap();
+        let target = directory.path().join("target");
+        std::os::unix::fs::symlink(&managed, &target).unwrap();
+        let mappings = [PathMapping::new(&target, "target")];
+        let resolved = target.join("gn_out/obj").canonicalize().unwrap();
+        let stdout = format!("cargo:rustc-link-search=native={}\n", resolved.display());
+
+        assert!(
+            parse_prediction_with_mappings(&stdout, &mappings)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn embedded_root_needles_include_the_resolved_spelling() {
         let directory = tempfile::tempdir().unwrap();
         let managed = std::fs::canonicalize(directory.path())
