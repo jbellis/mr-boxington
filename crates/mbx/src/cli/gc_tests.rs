@@ -1124,15 +1124,17 @@ fn a_short_disk_retries_targets_after_sparse_files_release_little_space() {
     drop(probe);
     std::fs::remove_file(probe_path).unwrap();
     let config = super::cargo_tests::managed_target_config(directory.path());
-    let views = [("older", 1), ("newer", 2)].map(|(name, updated_secs)| {
+    let mut views = Vec::new();
+    for (name, updated_secs) in [("older", 1), ("newer", 2)] {
         let view = low_disk_view(&config, directory.path(), name, updated_secs, &[], false);
         // Logical eviction exceeds the shortfall, but releases almost no blocks.
-        std::fs::File::create(view.join("sparse"))
-            .unwrap()
-            .set_len(128 * 1024 * 1024 * 1024)
-            .unwrap();
-        view
-    });
+        let sparse = std::fs::File::create(view.join("sparse")).unwrap();
+        if let Err(error) = sparse.set_len(128 * 1024 * 1024 * 1024) {
+            eprintln!("skipping: the test filesystem cannot hold a 128 GiB file: {error}");
+            return;
+        }
+        views.push(view);
+    }
     let available = crate::util::disk_space(&config.target.root)
         .unwrap()
         .available;
