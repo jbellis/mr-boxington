@@ -25,7 +25,10 @@ impl Fixture {
             &cargo,
             r#"#!/bin/sh
 for arg do
-  if [ "$arg" = metadata ] && [ "$REJECT_METADATA" = 1 ]; then exit 1; fi
+  if [ "$arg" = metadata ] && [ "$REJECT_METADATA" = 1 ]; then
+    echo 'error: metadata probe fixture failed to download component' >&2
+    exit 17
+  fi
 done
 exec "$REAL_CARGO" "$@"
 "#,
@@ -490,4 +493,30 @@ fn external_flags_cannot_hide_a_project_after_failed_metadata() {
         );
     }
     assert!(!f.root.join("external-ran").exists());
+}
+
+#[test]
+fn failed_metadata_reports_cargos_reason() {
+    let f = Fixture::new();
+    let project = f.project("project");
+    for shim in [false, true] {
+        let output = f
+            .command(shim)
+            .current_dir(&project)
+            .arg("build")
+            .env("REJECT_METADATA", "1")
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("could not verify Cargo build storage"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("metadata probe fixture failed to download component"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("exit status: 17"), "{stderr}");
+    }
 }

@@ -146,9 +146,13 @@ fn run_cargo_shim_inner() -> Result<ExitCode> {
         )?;
     }
     let target_dir_env = std::env::var_os(CARGO_TARGET_DIR_ENV);
-    let roots = match cargo_roots(&real_cargo, &string_arguments, target_dir_env.as_deref()) {
-        Some(roots) => roots,
-        None => match failed_probe(&real_cargo, &arguments, target_dir_env.as_deref()) {
+    let roots = match super::cargo::cargo_roots_reported(
+        &real_cargo,
+        &string_arguments,
+        target_dir_env.as_deref(),
+    ) {
+        Ok(roots) => roots,
+        Err(reason) => match failed_probe(&real_cargo, &arguments, target_dir_env.as_deref()) {
             FailedProbe::Roots(roots) => *roots,
             FailedProbe::Passthrough => return run_real_cargo(&real_cargo, &arguments),
             FailedProbe::Reject => {
@@ -156,7 +160,7 @@ fn run_cargo_shim_inner() -> Result<ExitCode> {
                     .map(|hint| format!(" ({hint})"))
                     .unwrap_or_default();
                 eyre::bail!(
-                    "could not verify Cargo build storage: metadata probing failed{hint}; run cargo metadata --no-deps --format-version 1 with the same manifest and configuration options to diagnose it"
+                    "could not verify Cargo build storage: metadata probing failed{hint}; run cargo metadata --no-deps --format-version 1 with the same manifest and configuration options to diagnose it: {reason}"
                 )
             }
         },
