@@ -1908,7 +1908,7 @@ fn read_view_record(path: &Path) -> Option<ViewRecord> {
 /// shim, which run with a working directory of their own. Lexically and not by
 /// canonicalizing: the directory may not exist yet, and resolving symlinks here
 /// would break the very mapping it exists to serve.
-fn views_root(root: &Path) -> PathBuf {
+pub(crate) fn views_root(root: &Path) -> PathBuf {
     let views = root.join(VIEWS_DIR);
     std::path::absolute(&views).unwrap_or(views)
 }

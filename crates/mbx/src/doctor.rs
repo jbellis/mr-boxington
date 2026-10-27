@@ -161,6 +161,16 @@ async fn check(config: &Config, toolchain: Option<&str>) -> Vec<Check> {
         command_check("rustc", &rustc, toolchain),
     ];
     checks.push(cache_check(&config.cache_dir));
+    checks.push(atime_check(
+        &config.store_dir(),
+        "cache eviction cannot tell recently read objects from unused ones",
+    ));
+    if config.target.views {
+        checks.push(atime_check(
+            &crate::target::views_root(&config.target.root),
+            "unused-unit collection is skipped and seeding cannot filter by recent use",
+        ));
+    }
     #[cfg(unix)]
     checks.push(session_check());
     checks.push(Check::pass(
@@ -314,6 +324,49 @@ fn cache_check(cache_dir: &Path) -> Check {
     }
 }
 
+fn atime_check(directory: &Path, impact: &str) -> Check {
+    atime_check_with(directory, impact, crate::target_units::probe_access_times)
+}
+
+fn atime_check_with(
+    directory: &Path,
+    impact: &str,
+    probe: impl FnOnce(&Path) -> std::io::Result<bool>,
+) -> Check {
+    let location = directory.display();
+    match existing_ancestor(directory).and_then(|parent| probe(&parent)) {
+        Ok(true) => Check::pass("atime", format!("{location}: reads refresh access times")),
+        Ok(false) => Check::warn(
+            "atime",
+            format!(
+                "{location}: reads do not refresh access times; {impact}; {}",
+                if cfg!(target_os = "linux") {
+                    "enable atime with relatime or strictatime instead of noatime; on ZFS set atime=on and relatime=on"
+                } else {
+                    "enable access-time updates in the filesystem settings"
+                }
+            ),
+        ),
+        Err(error) => Check::warn(
+            "atime",
+            format!(
+                "{location}: could not probe access times ({error}); {impact} if reads do not refresh them"
+            ),
+        ),
+    }
+}
+
+/// Inspect the destination filesystem without creating missing directories.
+fn existing_ancestor(directory: &Path) -> std::io::Result<PathBuf> {
+    std::path::absolute(directory)?
+        .ancestors()
+        .find(|path| path.exists())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::NotFound, "no directory ancestor exists")
+        })
+}
+
 /// Probe both the managed root and Cargo's resolved output location. An existing
 /// target or an explicit Cargo target setting can keep a build outside the
 /// managed root, even when managed views are enabled.
@@ -388,13 +441,7 @@ fn reflink_check_with(
         // Avoid creating target directories just to inspect them. The closest
         // existing ancestor uses the destination filesystem; an existing target
         // symlink is followed by tempdir_in, just as a real restore follows it.
-        let absolute_target = std::path::absolute(target_dir)?;
-        let parent = absolute_target
-            .ancestors()
-            .find(|path| path.exists())
-            .ok_or_else(|| {
-                std::io::Error::new(std::io::ErrorKind::NotFound, "no target ancestor exists")
-            })?;
+        let parent = existing_ancestor(target_dir)?;
         let destination_dir = tempfile::Builder::new()
             .prefix("mbx-reflink-")
             .tempdir_in(parent)?;
@@ -695,6 +742,85 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         assert_eq!(cache_check(directory.path()).severity, Severity::Pass);
         assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn access_times_are_advisory_and_disabled_reads_explain_the_remedy() {
+        let directory = tempfile::tempdir().unwrap();
+        for tracked in [true, false] {
+            let check = atime_check_with(directory.path(), "eviction loses recent use", |_| {
+                Ok(tracked)
+            });
+            assert_eq!(check.name, "atime");
+            assert!(
+                check
+                    .detail
+                    .contains(&directory.path().display().to_string())
+            );
+            if tracked {
+                assert_eq!(check.severity, Severity::Pass);
+                assert!(check.detail.contains("reads refresh access times"));
+            } else {
+                assert_eq!(check.severity, Severity::Warn);
+                assert!(check.detail.contains("eviction loses recent use"));
+                if cfg!(target_os = "linux") {
+                    assert!(check.detail.contains("relatime or strictatime"));
+                    assert!(check.detail.contains("atime=on and relatime=on"));
+                } else {
+                    assert!(check.detail.contains("filesystem settings"));
+                }
+                let json = serde_json::to_value(&check).unwrap();
+                assert_eq!(json["severity"], "warn");
+            }
+        }
+    }
+
+    #[test]
+    fn an_access_time_probe_error_is_not_reported_as_disabled_atime() {
+        let directory = tempfile::tempdir().unwrap();
+        let check = atime_check_with(directory.path(), "collection is skipped", |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert_eq!(check.severity, Severity::Warn);
+        assert!(check.detail.contains("could not probe access times"));
+        assert!(!check.detail.contains("reads do not refresh access times"));
+    }
+
+    #[test]
+    fn missing_atime_destinations_use_the_existing_ancestor_without_creating_them() {
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("not-created/targets");
+        let check = atime_check_with(&missing, "collection is skipped", |parent| {
+            assert_eq!(parent, directory.path());
+            crate::target_units::probe_access_times(parent)
+        });
+        assert!(check.detail.contains(&missing.display().to_string()));
+        assert!(
+            !check.detail.contains("could not probe"),
+            "{}",
+            check.detail
+        );
+        assert!(!missing.exists());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atime_probes_follow_existing_directory_symlinks() {
+        let workspace = tempfile::tempdir().unwrap();
+        let target = tempfile::tempdir().unwrap();
+        let link = workspace.path().join("targets");
+        std::os::unix::fs::symlink(target.path(), &link).unwrap();
+        let check = atime_check_with(&link, "collection is skipped", |parent| {
+            assert_eq!(parent.canonicalize()?, target.path().canonicalize()?);
+            crate::target_units::probe_access_times(parent)
+        });
+        assert!(
+            !check.detail.contains("could not probe"),
+            "{}",
+            check.detail
+        );
+        assert_eq!(std::fs::read_dir(target.path()).unwrap().count(), 0);
     }
 
     #[cfg(unix)]
