@@ -725,19 +725,22 @@ mod tests {
         // The directory need not exist: budgets are resolved before the cache
         // directory is created.
         let missing = directory.path().join("not").join("created").join("yet");
-        // ZFS capacity can move as other datasets allocate from the pool.
-        // Compare exact sizes only across a stable pair of parent readings.
+        // ZFS capacity can move as other datasets allocate from the pool, and
+        // move back. Retry until the missing path and both parent readings
+        // agree; a lookup that measures the wrong disk never does.
+        let mut readings = (None, None, None);
         for _ in 0..50 {
-            let before = disk_total_bytes(directory.path()).expect("the test disk has a size");
-            let measured = disk_total_bytes(&missing);
-            let after = disk_total_bytes(directory.path()).expect("the test disk has a size");
-            if before == after {
-                assert_eq!(measured, Some(before));
+            readings = (
+                disk_total_bytes(directory.path()),
+                disk_total_bytes(&missing),
+                disk_total_bytes(directory.path()),
+            );
+            if readings.0.is_some() && readings.0 == readings.1 && readings.1 == readings.2 {
                 return;
             }
             std::thread::sleep(Duration::from_millis(20));
         }
-        panic!("the test disk's capacity never settled");
+        panic!("the missing path never measured the parent's disk: {readings:?}");
     }
 
     #[test]
