@@ -1051,8 +1051,8 @@ struct FlightRecord {
 /// anyway. A flight is a lock keyed by the invocation digest, taken just
 /// before a real compilation starts. Whoever holds it compiles; anyone else
 /// arriving at the same invocation blocks on the lock instead of the
-/// compiler, which is never slower -- the holder finishes no later than the
-/// duplicate would have -- and wakes to a store that already has the result.
+/// compiler, then tries to restore the published result. Invocations can share
+/// arguments while their input contents differ, so a restore can miss.
 ///
 /// The handoff needs more than the lock, because a cold waiter has no way to
 /// build the action key on its own: the key hashes inputs only the compiler's
@@ -1068,9 +1068,12 @@ struct FlightRecord {
 /// and the compilation proceeds as if flights did not exist. A holder that
 /// dies releases the lock with its process; a holder that publishes nothing
 /// -- a failed or uncacheable compile -- wakes its waiters to a miss, and the
-/// first of them compiles. That serializes what would have run in parallel,
-/// which is the accepted cost: it is rare (the compile usually failed for
-/// them all), and for the out-of-memory case it is the desirable behavior.
+/// first of them compiles while holding the lock, giving later waiters a
+/// chance to reuse its result. If a holder published a changed prediction
+/// while we waited but it does not restore, we release the lock before
+/// compiling: different inputs must not serialize a queue of builds. Waiting
+/// is bounded, and a timed-out build compiles without a flight. Predictions
+/// are written atomically, including by compilers that released their lock.
 pub(crate) struct Flight {
     lock: Option<fslock::LockFile>,
     path: PathBuf,
@@ -1080,12 +1083,45 @@ pub(crate) struct Flight {
     waited: bool,
     /// The prediction found under the lock, when it describes this invocation.
     inherited: Option<String>,
+    published_while_waiting: bool,
+    wait_duration: Duration,
 }
 
 impl Flight {
     /// Whether this process blocked behind another compiling the same thing.
     pub(crate) fn waited(&self) -> bool {
         self.waited
+    }
+
+    /// Whether the record changed to an existing prediction while we waited.
+    pub(crate) fn published_while_waiting(&self) -> bool {
+        self.published_while_waiting
+    }
+
+    /// Release occupancy while retaining the path for a later atomic `leave`.
+    pub(crate) fn release(&mut self) {
+        drop(self.lock.take());
+    }
+
+    /// Finish the wrapper's restore attempt before returning or compiling.
+    pub(crate) fn finish_restore(&mut self, hit: bool) {
+        if !self.waited {
+            return;
+        }
+        let outcome = if hit {
+            "restore hit"
+        } else if self.published_while_waiting() {
+            self.release();
+            "restore missed, flight released"
+        } else {
+            "restore missed, flight kept"
+        };
+        crate::session::report_shim_debug(&format!(
+            "flight {}-{} waited {:.3}s: {outcome}",
+            self.adapter,
+            self.invocation,
+            self.wait_duration.as_secs_f64()
+        ));
     }
 
     /// The prediction the previous holder left, if any.
@@ -1097,8 +1133,8 @@ impl Flight {
     ///
     /// Written beside the lock file rather than into it, because the lock
     /// file's contents belong to the lock: releasing one truncates it. The
-    /// record is only ever read and written under the lock, and the write is
-    /// atomic besides, so a reader can never see half of one. It is not
+    /// write is atomic, so readers cannot see half a record even when a
+    /// compiler has released its flight before publishing. It is not
     /// fsynced: a record lost to a crash costs the next build of this
     /// invocation a cold key, and a torn one fails to parse and is ignored.
     /// The disk round trip was paid once per compilation, on the shim's
@@ -1233,10 +1269,19 @@ impl Drop for Flight {
 /// Returns holding the lock. If another process was already compiling this
 /// invocation, that means having waited for it to finish -- which is the
 /// point: on waking, `inherited` usually restores and the compiler never
-/// runs. `None` means flights could not be used; the compilation just runs.
-pub(crate) fn flight(adapter: &'static str, invocation: &str) -> Option<Flight> {
+/// runs. `None` means flights could not be used or the wait reached its
+/// limit; the compilation just runs.
+pub(crate) fn flight(adapter: &'static str, invocation: &str, label: &str) -> Option<Flight> {
     let pool = pool()?;
-    match flight_at(&pool.dir, adapter, invocation) {
+    match flight_at_inner(
+        &pool.dir,
+        adapter,
+        invocation,
+        label,
+        FlightWait::default(),
+        || {},
+        crate::session::report_shim_warning,
+    ) {
         Ok(flight) => Some(flight),
         Err(error) => {
             debug!("compiling outside a flight: {error:#}");
@@ -1245,21 +1290,62 @@ pub(crate) fn flight(adapter: &'static str, invocation: &str) -> Option<Flight> 
     }
 }
 
+const FLIGHT_POLL_MAX: Duration = Duration::from_millis(100);
+const FLIGHT_WAIT_MIN: Duration = Duration::from_secs(10 * 60);
+
+struct FlightWait {
+    notice: Duration,
+    limit: Option<Duration>,
+}
+
+impl Default for FlightWait {
+    fn default() -> Self {
+        Self {
+            notice: SLOW_WAIT_NOTICE,
+            limit: None,
+        }
+    }
+}
+
+fn flight_wait_limit(record: Option<&[u8]>) -> Duration {
+    record
+        .and_then(|bytes| serde_json::from_slice::<FlightRecord>(bytes).ok())
+        .and_then(|record| serde_json::from_str::<serde_json::Value>(&record.payload).ok())
+        .and_then(|payload| {
+            payload
+                .get("compiler_duration_ns")
+                .and_then(|value| value.as_u64())
+        })
+        .map(|ns| {
+            Duration::from_nanos(ns)
+                .saturating_mul(4)
+                .max(FLIGHT_WAIT_MIN)
+        })
+        .unwrap_or(FLIGHT_WAIT_MIN)
+}
+
+#[cfg(test)]
 fn flight_at(pool_dir: &Path, adapter: &'static str, invocation: &str) -> Result<Flight> {
     flight_at_inner(
         pool_dir,
         adapter,
         invocation,
-        #[cfg(test)]
+        invocation,
+        FlightWait::default(),
         || {},
+        |_| {},
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn flight_at_inner(
     pool_dir: &Path,
     adapter: &'static str,
     invocation: &str,
-    #[cfg(test)] on_wait: impl FnOnce(),
+    label: &str,
+    policy: FlightWait,
+    on_wait: impl FnOnce(),
+    mut warning: impl FnMut(&str),
 ) -> Result<Flight> {
     let _phase = crate::phase_timing::phase("flight_wait");
     let dir = pool_dir.join(INFLIGHT_DIR);
@@ -1268,13 +1354,50 @@ fn flight_at_inner(
     let path = dir.join(format!("{adapter}-{invocation}"));
     let mut lock = fslock::LockFile::open(&path)?;
     let waited = !lock.try_lock()?;
+    let started = Instant::now();
+    let mut before = None;
     if waited {
-        #[cfg(test)]
+        before = std::fs::read(record_path(&path)).ok();
+        let limit = policy
+            .limit
+            .unwrap_or_else(|| flight_wait_limit(before.as_deref()));
+        crate::session::report_shim_debug(&format!("waiting for flight {adapter}-{invocation}"));
         on_wait();
-        lock.lock()?;
+        let mut delay = POLL_INITIAL;
+        let mut notified = false;
+        loop {
+            let elapsed = started.elapsed();
+            if elapsed >= limit {
+                warning(&format!(
+                    "stopped waiting after {:.1} minutes for another build compiling {label} with the same arguments; this build is compiling it itself",
+                    elapsed.as_secs_f64() / 60.0
+                ));
+                crate::session::report_shim_debug(&format!(
+                    "flight {adapter}-{invocation} waited {:.3}s: wait limit reached, compiling without a flight",
+                    elapsed.as_secs_f64()
+                ));
+                eyre::bail!("flight {adapter}-{invocation} wait limit reached");
+            }
+            if !notified && elapsed >= policy.notice {
+                warning(&format!(
+                    "waited 1 minute for another build compiling {label} with the same arguments; this build will reuse its result if it matches, or compile when it finishes"
+                ));
+                notified = true;
+            }
+            if lock.try_lock()? {
+                break;
+            }
+            std::thread::sleep(
+                jittered(delay)
+                    .min(FLIGHT_POLL_MAX)
+                    .min(limit.saturating_sub(started.elapsed())),
+            );
+            delay = (delay * 2).min(FLIGHT_POLL_MAX);
+        }
     }
-    let inherited = std::fs::read(record_path(&path))
-        .ok()
+    let after = std::fs::read(record_path(&path)).ok();
+    let published_while_waiting = waited && after.is_some() && after != before;
+    let inherited = after
         .and_then(|bytes| serde_json::from_slice::<FlightRecord>(&bytes).ok())
         .filter(|record| {
             record.version == FLIGHT_VERSION
@@ -1289,6 +1412,8 @@ fn flight_at_inner(
         invocation: invocation.to_string(),
         waited,
         inherited,
+        published_while_waiting,
+        wait_duration: started.elapsed(),
     })
 }
 

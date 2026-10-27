@@ -8593,3 +8593,144 @@ fn late_workspace_wrappers_keep_objects_when_they_skip_rustc() {
         }
     }
 }
+
+/// A waiter with different inputs must not serialize the builds behind it.
+/// With no new publication it must retain occupancy, so the next build can
+/// reuse its own result. Compiler and flight barriers make both cases exact.
+#[cfg(unix)]
+#[test]
+fn a_flight_waiter_releases_only_after_a_fresh_prediction_misses() {
+    use std::time::{Duration, Instant};
+
+    for publishes in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        let store = directory.path().join("store");
+        write_project(&project);
+        let wrapper = directory.path().join("gated-rustc");
+        let entered = directory.path().join("compiler-entered");
+        let release = directory.path().join("release-compiler");
+        std::fs::write(
+            &wrapper,
+            r#"#!/bin/sh
+case " $* " in
+  *" --crate-name fixture "*)
+    : > "$TEST_COMPILER_ENTERED"
+    while [ ! -e "$TEST_RELEASE_COMPILER" ]; do sleep 0.02; done
+    ;;
+esac
+exec "$TEST_REAL_RUSTC" "$@"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real_rustc = which::which("rustc").unwrap();
+        let settings = [
+            ("MBX_LOG", "debug"),
+            ("MBX_TARGET_VIEWS", "0"),
+            ("MBX_LEARNED_INCREMENTAL", "0"),
+            ("CARGO_INCREMENTAL", "0"),
+            ("RUSTC", wrapper.to_str().unwrap()),
+            ("TEST_REAL_RUSTC", real_rustc.to_str().unwrap()),
+            ("TEST_COMPILER_ENTERED", entered.to_str().unwrap()),
+            ("TEST_RELEASE_COMPILER", release.to_str().unwrap()),
+        ];
+        std::fs::write(&release, "").unwrap();
+        build_with(
+            &project,
+            &store,
+            &directory.path().join("seed.json"),
+            &settings,
+        );
+        let records = find_files(&store.join("scheduler/inflight"), |path| {
+            path.extension().is_some_and(|ext| ext == "prediction")
+        });
+        assert_eq!(records.len(), 1, "one fixture invocation: {records:?}");
+        let record_path = &records[0];
+        let original = std::fs::read(record_path).unwrap();
+        let lock_path = record_path.with_extension("");
+        let mut holder = fslock::LockFile::open(&lock_path).unwrap();
+        assert!(holder.try_lock().unwrap());
+        // The old prediction remains initially. A holder that publishes an
+        // updated duration changes the record bytes but cannot restore the
+        // waiter's changed source from the seeded cache.
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "pub fn changed() -> u32 { 42 }\n",
+        )
+        .unwrap();
+        std::fs::remove_file(&entered).unwrap();
+        std::fs::remove_file(&release).unwrap();
+        let log = directory.path().join("waiter.stderr");
+        let mut command = isolated_cargo_command(
+            mbx_command(),
+            &project,
+            &store,
+            &directory.path().join("waiter.json"),
+            &["build", "--offline"],
+            &settings,
+        );
+        command
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap());
+        let mut waiter = BuildChildGuard::new(command.spawn().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let text = std::fs::read_to_string(&log).unwrap();
+            if text.contains("waiting for flight rustc-") {
+                break;
+            }
+            assert!(
+                waiter.try_wait().unwrap().is_none(),
+                "waiter exited: {text}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "waiter did not join flight: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        if publishes {
+            let mut record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            let mut payload: serde_json::Value =
+                serde_json::from_str(record["payload"].as_str().unwrap()).unwrap();
+            payload["compiler_duration_ns"] = serde_json::json!(123456789);
+            record["payload"] = serde_json::Value::String(serde_json::to_string(&payload).unwrap());
+            std::fs::write(record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        }
+        drop(holder);
+        while !entered.exists() {
+            assert!(
+                waiter.try_wait().unwrap().is_none(),
+                "waiter exited: {}",
+                std::fs::read_to_string(&log).unwrap()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "compiler did not reach barrier: {}",
+                std::fs::read_to_string(&log).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut third_party = fslock::LockFile::open(&lock_path).unwrap();
+        let available_during_compile = third_party.try_lock().unwrap();
+        // Release the compiler even if the occupancy assertion will fail.
+        std::fs::write(&release, "").unwrap();
+        drop(third_party);
+        let output = waiter.wait_with_output().unwrap();
+        let stderr = std::fs::read_to_string(&log).unwrap();
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(
+            available_during_compile, publishes,
+            "fresh publication={publishes}; third-party lock availability during the waiter's real compile: {stderr}"
+        );
+        assert!(
+            stderr.contains(if publishes {
+                "restore missed, flight released"
+            } else {
+                "restore missed, flight kept"
+            }),
+            "{stderr}"
+        );
+    }
+}

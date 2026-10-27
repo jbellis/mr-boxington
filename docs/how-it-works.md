@@ -211,8 +211,21 @@ releases its permits, so a crashed build cannot wedge its siblings.
 Concurrent builds also stop repeating each other. Separate CI jobs with fresh
 targets can otherwise repeat the same dependency compilations. With mbx, a
 compilation identical to one already running against the same cache directory
-waits for that one to finish and restores its result from the cache. The
-finished compilation also leaves its input list behind, so a job arriving
+waits for that one to finish and tries to restore its result from the cache.
+If the holder publishes a changed prediction while a build waits, but the
+result does not match that build's inputs, the waiting build releases the
+flight and compiles through the permit pool. Other waiting builds can then
+check the result without waiting for that compile. If the holder publishes
+nothing, the next build keeps the flight while compiling, so later builds
+can reuse its result.
+
+After 60 seconds, mbx prints a warning naming the crate or C/C++ compilation
+it is waiting for. A build stops waiting after 10 minutes, or four times the
+compile duration in the previous prediction, whichever is longer. If there
+is no recorded duration, the limit is 10 minutes. At the limit, mbx prints a
+warning and compiles through the permit pool without holding a flight.
+
+The finished compilation also leaves its input list behind, so a job arriving
 after it is already done can build the cache key it would otherwise lack and
 hit where it would have compiled cold. Both paths rehash every input before
 trusting anything, so the worst a stale record can do is fall back
