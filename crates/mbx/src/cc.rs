@@ -221,7 +221,9 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
         flight.finish_restore(false);
     }
     let mut remote_claim = None;
-    if flight.is_some() {
+    // A released flight compiles now rather than wait on a fleet promise; see
+    // the rustc wrapper.
+    if flight.as_ref().is_some_and(|flight| !flight.released()) {
         match session::request_agent(&[AgentRequest::JoinActionPromise {
             adapter: PREDICTION_ADAPTER.into(),
             invocation: invocation_digest.clone(),

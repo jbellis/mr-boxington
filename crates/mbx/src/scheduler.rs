@@ -1103,6 +1103,11 @@ impl Flight {
         drop(self.lock.take());
     }
 
+    /// Whether this flight gave up its lock after an unusable handoff.
+    pub(crate) fn released(&self) -> bool {
+        self.lock.is_none()
+    }
+
     /// Finish the wrapper's restore attempt before returning or compiling.
     pub(crate) fn finish_restore(&mut self, hit: bool) {
         if !self.waited {
