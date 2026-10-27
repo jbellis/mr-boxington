@@ -1110,7 +1110,19 @@ fn a_panicking_automatic_collector_records_before_the_previous_hook_aborts() {
 #[cfg(unix)]
 #[test]
 fn a_short_disk_retries_targets_after_sparse_files_release_little_space() {
+    use std::os::unix::fs::MetadataExt as _;
+
     let directory = tempfile::tempdir().unwrap();
+    // Probe with a small file before creating the large logical fixtures.
+    let probe_path = directory.path().join("sparse-probe");
+    let probe = std::fs::File::create(&probe_path).unwrap();
+    probe.set_len(1024 * 1024).unwrap();
+    if probe.metadata().unwrap().blocks() * 512 >= 1024 * 1024 {
+        eprintln!("skipping: the test filesystem does not create sparse files with set_len");
+        return;
+    }
+    drop(probe);
+    std::fs::remove_file(probe_path).unwrap();
     let config = super::cargo_tests::managed_target_config(directory.path());
     let views = [("older", 1), ("newer", 2)].map(|(name, updated_secs)| {
         let view = low_disk_view(&config, directory.path(), name, updated_secs, &[], false);

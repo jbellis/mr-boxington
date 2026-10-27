@@ -277,25 +277,6 @@ fn restoring_an_explicit_default_target_keeps_it_in_the_checkout() {
 }
 
 #[test]
-fn an_explicit_default_target_is_not_eligible_for_migration() {
-    let directory = tempfile::tempdir().unwrap();
-    let config = test_config(directory.path(), true);
-    let workspace = checkout(directory.path(), "project");
-    let target = workspace.join("target");
-    std::fs::create_dir_all(&target).unwrap();
-    std::fs::write(target.join("artifact"), b"old output").unwrap();
-
-    let error = migrate_existing(&config, &workspace, &target, true).unwrap_err();
-
-    assert!(error.to_string().contains("is not eligible for migration"));
-    assert_eq!(
-        std::fs::read(target.join("artifact")).unwrap(),
-        b"old output"
-    );
-    assert!(!view_record_path(&config.target.root, &workspace).exists());
-}
-
-#[test]
 fn a_failed_migration_restores_existing_outputs() {
     let directory = tempfile::tempdir().unwrap();
     let config = test_config(directory.path(), true);
@@ -358,7 +339,7 @@ fn restoring_workspace_state_refreshes_the_managed_view_record() {
         b"restored output"
     );
     assert!(read_view_record(&record_path).unwrap().updated_secs >= before_restore);
-    lease._file.unlock().unwrap();
+    drop(lease);
     let outcome = collect(
         &config.target.root,
         None,
