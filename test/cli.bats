@@ -93,8 +93,33 @@ setup() {
   assert_success
   assert_output --partial "cargo"
   assert_output --partial "cache"
+  assert_output --partial "atime"
   assert_output --partial "remote"
   assert_output --partial "0 failures"
+}
+
+@test "doctor probes cache access times and only enabled managed targets" {
+  local target_root="$BATS_TEST_TMPDIR/not-created/targets"
+  run env MBX_TARGET_ROOT="$target_root" "$MBX_BIN" doctor --json
+  assert_success
+  python3 - "$MBX_CACHE_DIR" "$target_root" "$output" <<'PY'
+import json, sys
+checks = [check for check in json.loads(sys.argv[3])["checks"] if check["name"] == "atime"]
+assert len(checks) == 2, checks
+assert checks[0]["detail"].startswith(sys.argv[1] + ":"), checks
+assert checks[1]["detail"].startswith(sys.argv[2] + "/v1:"), checks
+PY
+  assert_dir_not_exist "$target_root"
+
+  run env MBX_TARGET_ROOT="$target_root" MBX_TARGET_VIEWS=0 "$MBX_BIN" doctor --json
+  assert_success
+  python3 - "$MBX_CACHE_DIR" "$output" <<'PY'
+import json, sys
+checks = [check for check in json.loads(sys.argv[2])["checks"] if check["name"] == "atime"]
+assert len(checks) == 1, checks
+assert checks[0]["detail"].startswith(sys.argv[1] + ":"), checks
+PY
+  assert_dir_not_exist "$target_root"
 }
 
 @test "doctor reports the Cargo selected by the active project wrapper" {
@@ -324,6 +349,7 @@ global_config_file() {
   run "$MBX_BIN" doctor --json
   assert_success
   assert_output --partial '"checks"'
+  assert_output --partial '"name": "atime"'
   assert_output --partial '"failures": 0'
 }
 

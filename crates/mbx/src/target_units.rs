@@ -47,19 +47,21 @@ pub(crate) struct UnitOutcome {
 /// that, an access time says when the unit was built, not when it was last
 /// used, and a unit that stays fresh would look unused.
 pub(crate) fn access_times_tracked(directory: &Path) -> bool {
-    let probe = || -> std::io::Result<bool> {
-        let file = tempfile::NamedTempFile::new_in(directory)?;
-        std::io::Write::write_all(&mut file.as_file(), b"access time probe")?;
-        let past = SystemTime::now() - 2 * ACCESS_TIME_SLACK;
-        file.as_file().set_times(
-            std::fs::FileTimes::new()
-                .set_accessed(past)
-                .set_modified(past),
-        )?;
-        std::fs::File::open(file.path())?.read_to_end(&mut Vec::new())?;
-        Ok(std::fs::metadata(file.path())?.accessed()? > past + ACCESS_TIME_SLACK)
-    };
-    probe().unwrap_or(false)
+    probe_access_times(directory).unwrap_or(false)
+}
+
+/// Keep probe failures distinct from disabled access times for `mbx doctor`.
+pub(crate) fn probe_access_times(directory: &Path) -> std::io::Result<bool> {
+    let file = tempfile::NamedTempFile::new_in(directory)?;
+    std::io::Write::write_all(&mut file.as_file(), b"access time probe")?;
+    let past = SystemTime::now() - 2 * ACCESS_TIME_SLACK;
+    file.as_file().set_times(
+        std::fs::FileTimes::new()
+            .set_accessed(past)
+            .set_modified(past),
+    )?;
+    std::fs::File::open(file.path())?.read_to_end(&mut Vec::new())?;
+    Ok(std::fs::metadata(file.path())?.accessed()? > past + ACCESS_TIME_SLACK)
 }
 
 /// Remove the units in the target directory `view` that no build has used for
