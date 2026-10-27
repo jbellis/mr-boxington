@@ -1943,10 +1943,10 @@ fn private_incremental_flag(directory: &Path) -> OsString {
 
 /// Whether mbx may add incremental state to this rustc invocation.
 ///
-/// With `-C lto` unset, rustc runs local ThinLTO above opt-level 0 when it
-/// has multiple codegen units. Incremental ThinLTO can make those units
-/// disagree, leaving an rlib with unresolved internal symbols. Keep mbx reuse
-/// off at opt-level 2 or higher, except when LTO is off or there is one CGU.
+/// rustc runs local ThinLTO above opt-level 0 when LTO is unset and there are
+/// multiple codegen units. Incremental ThinLTO can leave an rlib whose units do
+/// not link. mbx blocks opt-level 2 and higher; opt-level 1 stays allowed for
+/// Cargo parity. `-C lto=n|no|off|false` and `codegen-units=1` avoid this mode.
 fn mbx_incremental_is_safe(arguments: &[OsString]) -> bool {
     mbx_incremental_unsafe_reason(arguments).is_none()
 }
