@@ -190,14 +190,8 @@ pub(crate) struct RawConfig {
     /// It applies in CI too, and it overrides `incremental` and learned
     /// incremental reuse. Workspace crates then compile with that state
     /// instead of restoring or publishing shared results, and crates that link
-    /// them stay private as well. mbx skips compiles that request LTO. It also
-    /// skips opt-level 2 or higher (including `s` and `z`) when `lto` is unset
-    /// and `codegen-units` is not 1. With unset `lto`, rustc runs local ThinLTO
-    /// above opt-level 0 when there are multiple codegen units. Incremental
-    /// ThinLTO can produce codegen units that do not link. For compiles without
-    /// LTO, `lto=n`, `no`, `off`, or `false`, and `codegen-units=1` avoid this
-    /// restriction. Opt-level 0 and 1 stay eligible unless LTO is requested.
-    /// The first build can be slower. Ignored
+    /// them stay private as well. It follows the same LTO and optimization
+    /// limits as `learned_incremental`. The first build can be slower. Ignored
     /// for compilations selected for verification by `MBX_VERIFY` or
     /// `verify_sample_rate`. This may also be set in workspace `.mbx.toml`; the
     /// environment variable wins.
@@ -210,14 +204,12 @@ pub(crate) struct RawConfig {
     /// crate's outputs, and those of crates that link them, stay out of the
     /// shared cache. Off in CI (`CI` set to `1`, `true`, or `yes`), while
     /// `incremental` or `eager_incremental` is in effect, and for compilations
-    /// selected for verification by `MBX_VERIFY` or `verify_sample_rate`. mbx
-    /// skips compiles that request LTO. It also skips opt-level 2 or higher
-    /// (including `s` and `z`) when `lto` is unset and `codegen-units` is not
-    /// 1. With unset `lto`, rustc runs local ThinLTO above opt-level 0 when
-    /// there are multiple codegen units. Incremental ThinLTO can produce units
-    /// that do not link. For compiles without LTO, `lto=n`, `no`, `off`, or
-    /// `false`, and `codegen-units=1` avoid this restriction. Opt-level 0 and 1
-    /// stay eligible unless LTO is requested.
+    /// selected for verification by `MBX_VERIFY` or `verify_sample_rate`.
+    /// Not used for compiles that use LTO or are optimized at opt-level 2 or
+    /// higher (including `s` and `z`), where rustc's incremental local ThinLTO
+    /// can produce rlibs that do not link. A profile with `lto = "off"` or
+    /// `codegen-units = 1` stays eligible; Cargo's default `lto = false` does
+    /// not.
     #[usage(
         key = "learned_incremental",
         env = "MBX_LEARNED_INCREMENTAL",

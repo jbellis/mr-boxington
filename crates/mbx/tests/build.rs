@@ -2720,16 +2720,19 @@ fn learned_incremental_skips_optimized_compiles_and_keeps_dev_levels() {
 
     let project = tempfile::tempdir().unwrap();
     write_project(project.path());
+    // The churn identity includes rustc's profile arguments. Seed and edit
+    // under the same release-derived profile so this tests the hot-unit gate.
     let manifest = project.path().join("Cargo.toml");
     let mut manifest_contents = std::fs::read_to_string(&manifest).unwrap();
     manifest_contents
         .push_str("\n[profile.measure]\ninherits = \"release\"\nopt-level = 3\nlto = false\n");
     std::fs::write(&manifest, manifest_contents).unwrap();
     generate_lockfile(project.path());
-    build_with(
+    cargo_with(
         project.path(),
         store.path(),
         &reports.path().join("release-cold.json"),
+        &["build", "--profile", "measure", "--offline"],
         &[("MBX_LEARNED_INCREMENTAL", "1")],
     );
     std::fs::write(
