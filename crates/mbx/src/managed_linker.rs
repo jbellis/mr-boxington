@@ -655,11 +655,12 @@ mod tests {
         ]
         .map(str::to_owned);
         assert!(
-            resolve(
+            resolve_with_environment(
                 &LinkerSettings::default(),
                 cache.path(),
                 &HttpSettings::default(),
-                &arguments
+                &arguments,
+                None,
             )
             .unwrap()
             .is_none()

@@ -1073,12 +1073,15 @@ fn an_explicit_compiler_or_toolchain_wins_over_cargos_own() {
 fn a_compiler_named_in_cargo_configuration_is_left_to_cargo() {
     const ISOLATED_ENV: &str = "MBX_TEST_ISOLATED_CARGO_CONFIG_ENV";
     if std::env::var_os(ISOLATED_ENV).is_none() {
+        // The host's Cargo config can name a compiler too.
+        let cargo_home = tempfile::tempdir().unwrap();
         let output = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
                 "cli::cargo_tests::a_compiler_named_in_cargo_configuration_is_left_to_cargo",
             ])
             .env(ISOLATED_ENV, "1")
+            .env("CARGO_HOME", cargo_home.path())
             .env_remove("RUSTC")
             .env_remove("CARGO_BUILD_RUSTC")
             .output()
