@@ -2771,6 +2771,48 @@ fn eager_incremental_skips_optimized_compiles() {
     assert_eq!(compiled_incrementally(&stats), 0, "{stats}\n{stderr}");
 }
 
+#[test]
+fn response_file_profiles_follow_incremental_safety_gates() {
+    for (mode, level, expected) in [
+        ("MBX_LEARNED_INCREMENTAL", "0", true),
+        ("MBX_LEARNED_INCREMENTAL", "3", false),
+        ("MBX_EAGER_INCREMENTAL", "0", true),
+        ("MBX_EAGER_INCREMENTAL", "3", false),
+    ] {
+        let store = tempfile::tempdir().unwrap();
+        let project = tempfile::tempdir().unwrap();
+        let reports = tempfile::tempdir().unwrap();
+        write_project(project.path());
+        generate_lockfile(project.path());
+        let response = project.path().join("profile.rsp");
+        std::fs::write(&response, format!("-Copt-level={level}\n")).unwrap();
+        let flags = format!("@{}", response.display());
+        let environment = [(mode, "1"), ("RUSTFLAGS", flags.as_str())];
+        build_with(
+            project.path(),
+            store.path(),
+            &reports.path().join("cold.json"),
+            &environment,
+        );
+        std::fs::write(
+            project.path().join("src/lib.rs"),
+            "pub fn double(value: u32) -> u32 { value * 2 + 1 }\n",
+        )
+        .unwrap();
+        let (stats, stderr) = build_with(
+            project.path(),
+            store.path(),
+            &reports.path().join("edit.json"),
+            &environment,
+        );
+        assert_eq!(
+            compiled_incrementally(&stats) > 0,
+            expected,
+            "{mode} opt{level}: {stats}\n{stderr}"
+        );
+    }
+}
+
 /// Deleting a source file is an edit. The last compilation's dep-info still
 /// names the file, and the crate keeps its private incremental state rather
 /// than failing to read it.

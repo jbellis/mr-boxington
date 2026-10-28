@@ -2614,6 +2614,29 @@ fn mbx_incremental_safety_ignores_non_utf8_arguments() {
 }
 
 #[test]
+fn mbx_incremental_safety_expands_response_files() {
+    let directory = tempfile::tempdir().unwrap();
+    let response = directory.path().join("profile arguments.rsp");
+    let mut argument = OsString::from("@");
+    argument.push(&response);
+    let safe = |contents: &str, overrides: &[&str]| {
+        std::fs::write(&response, contents).unwrap();
+        let mut arguments = vec![argument.clone()];
+        arguments.extend(overrides.iter().map(OsString::from));
+        mbx_incremental_is_safe(&arguments)
+    };
+
+    assert!(!safe("-C\nopt-level=3\n", &[]));
+    assert!(!safe("-Copt-level=0\n-Clto=thin\n", &[]));
+    assert!(safe("-Copt-level=3\n-Ccodegen-units=1\n", &[]));
+    assert!(safe("-Copt-level=3\n", &["-Clto=off"]));
+    assert!(safe("-Copt-level=3\n", &["-Copt-level=1"]));
+    assert!(!safe("-Copt-level=3\n-Ccodegen-units=1\n", &["-Clto=fat"]));
+    assert!(safe("-Copt-level=0\n", &[]));
+    assert!(safe("-Copt-level=1\n", &[]));
+}
+
+#[test]
 fn bypassed_library_incremental_gate_keeps_safe_and_rejects_optimized_invocations() {
     let arguments = [
         "--crate-type=staticlib",

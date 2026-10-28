@@ -1952,6 +1952,9 @@ fn mbx_incremental_is_safe(arguments: &[OsString]) -> bool {
 }
 
 fn mbx_incremental_unsafe_reason(arguments: &[OsString]) -> Option<&'static str> {
+    // Cargo uses response files for long compiler commands. Read the same
+    // effective code-generation options as the invocation parser and rustc.
+    let arguments = profile_arguments(arguments);
     let mut opt_level: Option<String> = None;
     let mut lto: Option<String> = None;
     let mut codegen_units: Option<String> = None;
