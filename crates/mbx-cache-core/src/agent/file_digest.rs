@@ -832,10 +832,12 @@ mod tests {
             return;
         }
         let cache = CountingCache(std::sync::atomic::AtomicUsize::new(0));
-        let snapshot =
-            capture_file_snapshot(&path, &cache, true, true, std::fs::metadata(&path).unwrap())
-                .unwrap()
-                .unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        // Settled: a racy identity skips the ledger by design.
+        let observed_at = metadata.modified().unwrap() + std::time::Duration::from_secs(3);
+        let snapshot = capture_file_snapshot(&path, &cache, true, true, metadata, observed_at)
+            .unwrap()
+            .unwrap();
         assert_eq!(snapshot.content, Some(CacheDigest::blake3(b"nfs bytes")));
         assert_eq!(cache.0.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
