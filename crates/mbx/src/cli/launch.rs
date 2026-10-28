@@ -646,10 +646,17 @@ impl Launch {
         environment.insert("PATH".into(), path.to_string_lossy().into_owned());
         environment.insert(self.runner_key.clone(), SHIM.into());
         environment.insert(CAPTURE.into(), self.capture.to_string_lossy().into_owned());
-        environment.insert(
-            FORWARD.into(),
-            serde_json::to_string(&which::which(cargo)?.canonicalize()?.into_os_string())?,
-        );
+        // Without a resolvable Cargo the launch still runs; a shim then just
+        // starts a fresh scope, as before the handoff existed.
+        if let Some(cargo) = which::which(cargo)
+            .ok()
+            .and_then(|path| path.canonicalize().ok())
+        {
+            environment.insert(
+                FORWARD.into(),
+                serde_json::to_string(&cargo.into_os_string())?,
+            );
+        }
         Ok(())
     }
 
