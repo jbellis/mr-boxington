@@ -146,9 +146,12 @@ fn cargo_with_settings_bypass_log_and_roots(
                     super::shim::FailedProbe::Passthrough => {
                         return run_cargo(&cargo, arguments, BTreeMap::new());
                     }
-                    super::shim::FailedProbe::Reject => eyre::bail!(
-                        "could not verify Cargo build storage: metadata probing failed; run cargo metadata --no-deps --format-version 1 with the same manifest and configuration options to diagnose it: {reason}"
-                    ),
+                    super::shim::FailedProbe::Reject(retry_reason) => {
+                        let reason = retry_reason.unwrap_or(reason);
+                        eyre::bail!(
+                            "could not verify Cargo build storage: metadata probing failed; run cargo metadata --no-deps --format-version 1 with the same manifest and configuration options to diagnose it: {reason}"
+                        )
+                    }
                 },
             }
         }

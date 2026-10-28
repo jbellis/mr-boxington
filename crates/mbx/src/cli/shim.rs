@@ -155,7 +155,8 @@ fn run_cargo_shim_inner() -> Result<ExitCode> {
         Err(reason) => match failed_probe(&real_cargo, &arguments, target_dir_env.as_deref()) {
             FailedProbe::Roots(roots) => *roots,
             FailedProbe::Passthrough => return run_real_cargo(&real_cargo, &arguments),
-            FailedProbe::Reject => {
+            FailedProbe::Reject(retry_reason) => {
+                let reason = retry_reason.unwrap_or(reason);
                 let hint = take_loop_note()
                     .map(|hint| format!(" ({hint})"))
                     .unwrap_or_default();
@@ -438,8 +439,8 @@ pub(super) enum FailedProbe {
     Roots(Box<super::cargo::Roots>),
     /// Hand the invocation to Cargo as it was typed.
     Passthrough,
-    /// Refuse it: the build storage cannot be verified.
-    Reject,
+    /// Refuse it, carrying the expanded probe's failure if it was retried.
+    Reject(Option<eyre::Report>),
 }
 
 /// Decide what a failed roots probe leaves the caller able to do.
@@ -459,18 +460,21 @@ pub(super) fn failed_probe(
     // Ask again as Cargo will read it: the roots belong to the package the
     // expansion names, though the child still receives the command line as it
     // was typed, since Cargo expands the alias itself.
+    let mut retry_reason = None;
     if let Some(resolved) = &invocation
         && resolved.arguments != arguments
         && let Ok(expanded) = super::strings(&resolved.arguments)
-        && let Some(roots) = super::cargo::cargo_roots(cargo, &expanded, target_dir_env)
     {
-        return FailedProbe::Roots(Box::new(roots));
+        match super::cargo::cargo_roots_reported(cargo, &expanded, target_dir_env) {
+            Ok(roots) => return FailedProbe::Roots(Box::new(roots)),
+            Err(reason) => retry_reason = Some(reason),
+        }
     }
     if metadata_failure_passthrough(invocation.as_ref()) {
         note_uncached_passthrough(invocation.as_ref());
         return FailedProbe::Passthrough;
     }
-    FailedProbe::Reject
+    FailedProbe::Reject(retry_reason)
 }
 
 /// Say that a command is running without a cache session. An external

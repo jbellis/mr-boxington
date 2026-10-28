@@ -25,7 +25,7 @@ impl Fixture {
             &cargo,
             r#"#!/bin/sh
 for arg do
-  if [ "$arg" = metadata ] && [ "$REJECT_METADATA" = 1 ]; then
+  if [ "$arg" = metadata ] && { [ "$REJECT_METADATA" = 1 ] || [ "$PWD" = "$REJECT_METADATA_ROOT" ]; }; then
     echo 'error: metadata probe fixture failed to download component' >&2
     exit 17
   fi
@@ -583,5 +583,35 @@ fn failed_metadata_reports_cargos_reason() {
             "{stderr}"
         );
         assert!(stderr.contains("exit status: 17"), "{stderr}");
+    }
+}
+
+#[test]
+fn failed_alias_metadata_reports_the_expanded_projects_reason() {
+    let f = Fixture::new();
+    let project = f.project("alias project");
+    f.config(&format!(
+        "[alias]\ni={}\n",
+        array(&["install", "--path", project.to_str().unwrap()])
+    ));
+    for shim in [false, true] {
+        let output = f
+            .command(shim)
+            .arg("i")
+            .env("REJECT_METADATA_ROOT", &project)
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("could not verify Cargo build storage"),
+            "{stderr}"
+        );
+        assert!(
+            stderr.contains("metadata probe fixture failed to download component"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("exit status: 17"), "{stderr}");
+        assert!(!stderr.contains("could not find `Cargo.toml`"), "{stderr}");
     }
 }
