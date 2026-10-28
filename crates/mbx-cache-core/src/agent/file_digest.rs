@@ -157,7 +157,8 @@ impl FileIdentity {
 ///
 /// Most filesystems provide a stable metadata-change token, so the inexpensive
 /// identity is sufficient once its timestamp tick has settled. Recently written
-/// files carry a content digest to detect another write within that tick.
+/// files carry a content digest alongside their metadata to detect another
+/// write within that tick.
 /// Linux NFS can reconcile client and server timestamps after a writer has
 /// closed the file, making two metadata reads disagree without any intervening
 /// write. Those files carry a content digest instead,
@@ -168,6 +169,7 @@ impl FileIdentity {
 pub struct FileSnapshot {
     identity: FileIdentity,
     content: Option<CacheDigest>,
+    require_full_identity: bool,
 }
 
 impl FileSnapshot {
@@ -211,20 +213,26 @@ impl FileSnapshot {
 
     /// Whether `identity` and `content` still describe this snapshot.
     ///
-    /// A content-backed snapshot ignores both timestamps: NFS can reconcile
-    /// mtime as well as ctime without a content change. Matching endpoint
-    /// digests cannot detect an intervening edit that restores the original
-    /// bytes. Digest-cache lookup still uses timestamps to decide when a
-    /// digest needs refreshing; this comparison performs no additional reads.
+    /// Recently written local sources require both their full metadata
+    /// identity and content digest to match. NFS and explicitly requested
+    /// content snapshots ignore both timestamps: they can change without a
+    /// content change. For those timestamp-tolerant snapshots, matching digests
+    /// cannot detect an intervening edit that restores the original bytes.
+    /// Digest-cache lookup still uses timestamps to decide when a digest needs
+    /// refreshing; this comparison performs no additional reads.
     pub fn matches(&self, identity: Option<&FileIdentity>, content: &CacheDigest) -> bool {
         self.content.as_ref().map_or_else(
             || identity == Some(&self.identity),
             |before| {
                 before == content
                     && identity.is_some_and(|after| {
-                        self.identity.path == after.path
-                            && self.identity.len == after.len
-                            && self.identity.object == after.object
+                        if self.require_full_identity {
+                            &self.identity == after
+                        } else {
+                            self.identity.path == after.path
+                                && self.identity.len == after.len
+                                && self.identity.object == after.object
+                        }
                     })
             },
         )
@@ -241,6 +249,7 @@ impl From<FileIdentity> for FileSnapshot {
         Self {
             identity,
             content: None,
+            require_full_identity: true,
         }
     }
 }
@@ -287,7 +296,7 @@ fn metadata_identity_is_unreliable(
 
 /// `unreliable` selects the ledger identity the filesystem calls for, as
 /// [`digest_file_validated`] does when it records one; `content_identity`
-/// asks for the bytes to be compared as well.
+/// asks for bytes to be compared while tolerating timestamp changes.
 fn capture_file_snapshot(
     path: &Path,
     digests: &dyn FileDigestCache,
@@ -354,7 +363,11 @@ fn capture_file_snapshot(
     } else {
         (identity, None)
     };
-    Ok(Some(FileSnapshot { identity, content }))
+    Ok(Some(FileSnapshot {
+        identity,
+        content,
+        require_full_identity: !unreliable && !content_identity,
+    }))
 }
 
 fn digest_cache_identity(
@@ -1110,6 +1123,40 @@ mod tests {
         assert!(snapshot.proves_content_change());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_racy_local_snapshot_rejects_an_edit_that_restores_the_original_bytes() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("input.rs");
+        std::fs::write(&path, b"fn main() {}").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let observed_at = metadata.modified().unwrap();
+        let snapshot = capture_file_snapshot(
+            &path,
+            &NoFileDigestCache,
+            false,
+            false,
+            metadata,
+            observed_at,
+        )
+        .unwrap()
+        .unwrap();
+        let original = CacheDigest::blake3_file(&path).unwrap();
+        assert!(snapshot.matches(Some(&snapshot.identity), &original));
+
+        std::fs::write(&path, b"fn main(){ }").unwrap();
+        std::fs::write(&path, b"fn main() {}").unwrap();
+        let restored = CacheDigest::blake3_file(&path).unwrap();
+        assert_eq!(original, restored);
+        // Model a changed ctime independently of the host's timestamp tick.
+        // The compiler may have consumed the intervening bytes even though
+        // discovery sees the original content and mtime again.
+        let mut after = snapshot.identity.clone();
+        let (seconds, nanos) = after.changed.unwrap();
+        after.changed = Some((seconds + 1, nanos));
+        assert!(!snapshot.matches(Some(&after), &restored));
+    }
+
     #[test]
     fn a_settled_snapshot_keeps_the_metadata_only_path() {
         let directory = tempfile::tempdir().unwrap();
@@ -1193,35 +1240,37 @@ mod tests {
 
     #[test]
     fn a_content_snapshot_ignores_timestamp_churn_but_detects_changed_bytes() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = directory.path().join("input.rs");
-        std::fs::write(&path, b"fn main() {}").unwrap();
-        let snapshot = capture_file_snapshot(
-            &path,
-            &NoFileDigestCache,
-            true,
-            true,
-            std::fs::metadata(&path).unwrap(),
-            SystemTime::now(),
-        )
-        .unwrap()
-        .unwrap();
+        for (unreliable, content_identity) in [(true, false), (true, true), (false, true)] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("input.rs");
+            std::fs::write(&path, b"fn main() {}").unwrap();
+            let snapshot = capture_file_snapshot(
+                &path,
+                &NoFileDigestCache,
+                unreliable,
+                content_identity,
+                std::fs::metadata(&path).unwrap(),
+                SystemTime::now(),
+            )
+            .unwrap()
+            .unwrap();
 
-        let mut identity = snapshot.identity.clone();
-        identity.changed = identity
-            .changed
-            .map(|(seconds, nanos)| (seconds + 1, nanos));
-        let digest = CacheDigest::blake3_file(&path).unwrap();
-        assert!(snapshot.matches(Some(&identity), &digest));
-        assert!(snapshot.proves_content_change());
+            let mut identity = snapshot.identity.clone();
+            identity.changed = identity
+                .changed
+                .map(|(seconds, nanos)| (seconds + 1, nanos));
+            let digest = CacheDigest::blake3_file(&path).unwrap();
+            assert!(snapshot.matches(Some(&identity), &digest));
+            assert!(snapshot.proves_content_change());
 
-        identity.modified = SystemTime::UNIX_EPOCH;
-        assert!(snapshot.matches(Some(&identity), &digest));
+            identity.modified = SystemTime::UNIX_EPOCH;
+            assert!(snapshot.matches(Some(&identity), &digest));
 
-        std::fs::write(&path, b"fn main(){ }").unwrap();
-        let identity = FileIdentity::describe(&path, &std::fs::metadata(&path).unwrap());
-        let digest = CacheDigest::blake3_file(&path).unwrap();
-        assert!(!snapshot.matches(identity.as_ref(), &digest));
+            std::fs::write(&path, b"fn main(){ }").unwrap();
+            let identity = FileIdentity::describe(&path, &std::fs::metadata(&path).unwrap());
+            let digest = CacheDigest::blake3_file(&path).unwrap();
+            assert!(!snapshot.matches(identity.as_ref(), &digest));
+        }
     }
 
     #[test]
@@ -1280,6 +1329,7 @@ mod tests {
         let snapshot = FileSnapshot {
             identity: identity.clone(),
             content: Some(digest.clone()),
+            require_full_identity: false,
         };
         // Client/server reconciliation can move either timestamp in either
         // direction. None of these observations proves another write.
