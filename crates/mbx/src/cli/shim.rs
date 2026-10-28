@@ -763,7 +763,7 @@ fn resolve_real_cargo_from(
 fn run_real_cargo(cargo: &OsStr, arguments: &[OsString]) -> Result<ExitCode> {
     let mut command = Command::new(cargo);
     command.args(arguments);
-    super::launch::forward_build_path(&mut command)?;
+    super::launch::forward_cargo_environment(&mut command)?;
     let status = command
         .status()
         .wrap_err_with(|| format!("failed to run {}", cargo.to_string_lossy()))?;
