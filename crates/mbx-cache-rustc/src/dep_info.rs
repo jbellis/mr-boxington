@@ -1107,6 +1107,9 @@ mod tests {
         // Let the coarse ZFS timestamp tick advance before this same-length rewrite.
         std::thread::sleep(std::time::Duration::from_millis(20));
         std::fs::write(&source, "pub fn library() {1}\n").unwrap();
+        let discovered = invocation
+            .discover_inputs(&dep_info, directory.path())
+            .unwrap();
         assert_eq!(
             discovered.verify_not_modified_since_with_snapshots(
                 SystemTime::now() + std::time::Duration::from_secs(60),
