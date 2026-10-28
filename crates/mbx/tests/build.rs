@@ -8790,9 +8790,15 @@ exec "$TEST_REAL_RUSTC" "$@"
         let lock_path = record_path.with_extension("");
         let mut holder = fslock::LockFile::open(&lock_path).unwrap();
         assert!(holder.try_lock().unwrap());
-        // The old prediction remains initially. A holder that publishes an
-        // updated duration changes the record bytes but cannot restore the
-        // waiter's changed source from the seeded cache.
+        // Model a new holder and publish before the waiter even arrives.
+        // Its seeded inputs cannot restore the waiter's changed source.
+        let attempt = lock_path.with_extension("attempt");
+        std::fs::write(&attempt, "test-holder-attempt").unwrap();
+        if publishes {
+            let mut record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            record["attempt"] = serde_json::json!("test-holder-attempt");
+            std::fs::write(record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        }
         std::fs::write(
             project.join("src/lib.rs"),
             "pub fn changed() -> u32 { 42 }\n",
@@ -8828,14 +8834,6 @@ exec "$TEST_REAL_RUSTC" "$@"
                 "waiter did not join flight: {text}"
             );
             std::thread::sleep(Duration::from_millis(10));
-        }
-        if publishes {
-            let mut record: serde_json::Value = serde_json::from_slice(&original).unwrap();
-            let mut payload: serde_json::Value =
-                serde_json::from_str(record["payload"].as_str().unwrap()).unwrap();
-            payload["compiler_duration_ns"] = serde_json::json!(123456789);
-            record["payload"] = serde_json::Value::String(serde_json::to_string(&payload).unwrap());
-            std::fs::write(record_path, serde_json::to_vec(&record).unwrap()).unwrap();
         }
         drop(holder);
         while !entered.exists() {

@@ -1041,6 +1041,8 @@ struct FlightRecord {
     adapter: String,
     invocation: String,
     payload: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    attempt: Option<String>,
 }
 
 /// Exclusive occupancy of one invocation identity, machine-wide.
@@ -1069,8 +1071,8 @@ struct FlightRecord {
 /// dies releases the lock with its process; a holder that publishes nothing
 /// -- a failed or uncacheable compile -- wakes its waiters to a miss, and the
 /// first of them compiles while holding the lock, giving later waiters a
-/// chance to reuse its result. If a holder published a changed prediction
-/// while we waited but it does not restore, we release the lock before
+/// chance to reuse its result. If the previous holder published a prediction
+/// before releasing its lock but it does not restore, we release the lock before
 /// compiling: different inputs must not serialize a queue of builds. Waiting
 /// is bounded, and a timed-out build compiles without a flight. Predictions
 /// are written atomically, including by compilers that released their lock.
@@ -1084,6 +1086,7 @@ pub(crate) struct Flight {
     /// The prediction found under the lock, when it describes this invocation.
     inherited: Option<String>,
     published_while_waiting: bool,
+    attempt: String,
     wait_duration: Duration,
 }
 
@@ -1093,7 +1096,7 @@ impl Flight {
         self.waited
     }
 
-    /// Whether the record changed to an existing prediction while we waited.
+    /// Whether the previous holder published the prediction found under the lock.
     pub(crate) fn published_while_waiting(&self) -> bool {
         self.published_while_waiting
     }
@@ -1154,6 +1157,7 @@ impl Flight {
             adapter: self.adapter.into(),
             invocation: self.invocation.clone(),
             payload: payload.into(),
+            attempt: Some(self.attempt.clone()),
         };
         let written = serde_json::to_vec(&record)
             .map_err(eyre::Report::from)
@@ -1162,6 +1166,13 @@ impl Flight {
             debug!("a flight prediction was not left behind: {error:#}");
         }
     }
+}
+
+/// Where the current holder's attempt identity lives, beside its lock.
+fn attempt_path(lock_path: &Path) -> PathBuf {
+    let mut path = lock_path.as_os_str().to_owned();
+    path.push(".attempt");
+    PathBuf::from(path)
 }
 
 /// Where one flight's prediction record lives, beside its lock.
@@ -1173,7 +1184,7 @@ fn record_path(lock_path: &Path) -> PathBuf {
 
 /// How long an untouched flight is kept for.
 ///
-/// Both of a flight's files get a fresh timestamp every time its invocation
+/// A flight's files get a fresh timestamp every time its invocation
 /// really compiles, so age here means nobody has compiled this identity in a
 /// month -- and identities churn with every toolchain and dependency bump,
 /// which is why the directory needs a sweep at all.
@@ -1201,7 +1212,7 @@ pub(crate) fn prune_flights(cache_dir: &Path) {
         let path = entry.path();
         if path
             .extension()
-            .is_some_and(|extension| extension == "prediction")
+            .is_some_and(|extension| extension == "prediction" || extension == "attempt")
         {
             // Swept with its lock below while the lock exists; on its own it
             // is a leftover from an interrupted sweep.
@@ -1219,6 +1230,7 @@ pub(crate) fn prune_flights(cache_dir: &Path) {
         };
         if lock.try_lock().is_ok_and(|taken| taken) {
             let _ = std::fs::remove_file(&record);
+            let _ = std::fs::remove_file(attempt_path(&path));
             // Closed before the removal, because Windows will not delete a
             // file that is still open anywhere.
             drop(lock);
@@ -1360,12 +1372,11 @@ fn flight_at_inner(
     let mut lock = fslock::LockFile::open(&path)?;
     let waited = !lock.try_lock()?;
     let started = Instant::now();
-    let mut before = None;
     if waited {
-        before = std::fs::read(record_path(&path)).ok();
+        let previous = std::fs::read(record_path(&path)).ok();
         let limit = policy
             .limit
-            .unwrap_or_else(|| flight_wait_limit(before.as_deref()));
+            .unwrap_or_else(|| flight_wait_limit(previous.as_deref()));
         crate::session::report_shim_debug(&format!("waiting for flight {adapter}-{invocation}"));
         on_wait();
         let mut delay = POLL_INITIAL;
@@ -1400,16 +1411,28 @@ fn flight_at_inner(
             delay = (delay * 2).min(FLIGHT_POLL_MAX);
         }
     }
-    let after = std::fs::read(record_path(&path)).ok();
-    let published_while_waiting = waited && after.is_some() && after != before;
-    let inherited = after
+    // Both reads happen under the lock. A holder may publish before we even
+    // arrive, or spend time storing artifacts after publishing its prediction.
+    let previous_attempt = std::fs::read_to_string(attempt_path(&path)).ok();
+    let record = std::fs::read(record_path(&path))
+        .ok()
         .and_then(|bytes| serde_json::from_slice::<FlightRecord>(&bytes).ok())
         .filter(|record| {
             record.version == FLIGHT_VERSION
                 && record.adapter == adapter
                 && record.invocation == invocation
-        })
-        .map(|record| record.payload);
+        });
+    let published_while_waiting = waited
+        && previous_attempt.as_ref().is_some_and(|attempt| {
+            record.as_ref().and_then(|record| record.attempt.as_ref()) == Some(attempt)
+        });
+    let inherited = record.map(|record| record.payload);
+    // Establish this attempt before returning to either compiler wrapper.
+    // A failed write abandons coordination instead of compiling with a stale id.
+    // A process killed before this write has not begun its compilation; the
+    // last established attempt remains the one whose publication we inspected.
+    let attempt = crate::util::random_string(32);
+    crate::util::write_advisory(&attempt_path(&path), attempt.as_bytes())?;
     Ok(Flight {
         lock: Some(lock),
         path,
@@ -1418,6 +1441,7 @@ fn flight_at_inner(
         waited,
         inherited,
         published_while_waiting,
+        attempt,
         wait_duration: started.elapsed(),
     })
 }
