@@ -802,12 +802,21 @@ fn a_waiter_wakes_to_what_its_holder_left() {
     let dir = directory.path().to_path_buf();
 
     let holder = flight_at(&dir, "rustc", "abc123").unwrap();
+    holder.leave("previous prediction");
     let blocked = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let waiter_blocked = blocked.clone();
     let waiter = std::thread::spawn(move || {
-        flight_at_inner(&dir, "rustc", "abc123", || {
-            waiter_blocked.store(true, Ordering::Release);
-        })
+        flight_at_inner(
+            &dir,
+            "rustc",
+            "abc123",
+            "crate",
+            FlightWait::default(),
+            || {
+                waiter_blocked.store(true, Ordering::Release);
+            },
+            |_| {},
+        )
         .unwrap()
     });
     wait_until(
@@ -820,6 +829,7 @@ fn a_waiter_wakes_to_what_its_holder_left() {
     let waiter = waiter.join().unwrap();
     assert!(waiter.waited(), "the second flight blocked on the first");
     assert_eq!(waiter.inherited(), Some("freshly published"));
+    assert!(waiter.published_while_waiting());
 }
 
 #[test]
@@ -865,6 +875,7 @@ fn the_sweep_keeps_fresh_and_held_flights_and_drops_the_rest() {
         for path in [
             inflight.join(name),
             inflight.join(format!("{name}.prediction")),
+            inflight.join(format!("{name}.attempt")),
         ] {
             if path.exists() {
                 std::fs::File::options()
@@ -883,6 +894,7 @@ fn the_sweep_keeps_fresh_and_held_flights_and_drops_the_rest() {
 
     assert!(!inflight.join("rustc-old").exists(), "stale flights go");
     assert!(!inflight.join("rustc-old.prediction").exists());
+    assert!(!inflight.join("rustc-old.attempt").exists());
     assert!(inflight.join("rustc-fresh").exists(), "fresh flights stay");
     assert!(inflight.join("rustc-fresh.prediction").exists());
     assert!(
@@ -5000,4 +5012,203 @@ fn cpu_only_compile_admission_does_not_read_compiler_history() {
     assert_eq!(demand.observation.get().unwrap().resources, plan.resources);
     assert_eq!(plan.resources.memory_bytes, 0);
     drop(permit);
+}
+
+#[test]
+fn a_released_flight_can_still_publish() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut first = flight_at(dir.path(), "rustc", "release").unwrap();
+    first.release();
+    let second = flight_at(dir.path(), "rustc", "release").unwrap();
+    assert!(!second.waited());
+    first.leave("published after release");
+    drop(second);
+    assert_eq!(
+        flight_at(dir.path(), "rustc", "release")
+            .unwrap()
+            .inherited(),
+        Some("published after release")
+    );
+}
+
+#[test]
+fn an_unpublished_holder_does_not_release_its_waiter_on_a_miss() {
+    for old_record in [None, Some("unchanged prediction")] {
+        let dir = tempfile::tempdir().unwrap();
+        if let Some(payload) = old_record {
+            let previous = flight_at(dir.path(), "rustc", "unchanged").unwrap();
+            previous.leave(payload);
+        }
+        let holder = flight_at(dir.path(), "rustc", "unchanged").unwrap();
+        let mut waiter = flight_at_inner(
+            dir.path(),
+            "rustc",
+            "unchanged",
+            "crate",
+            FlightWait::default(),
+            || drop(holder),
+            |_| {},
+        )
+        .unwrap();
+        assert!(!waiter.published_while_waiting());
+        waiter.finish_restore(false);
+        let mut probe = fslock::LockFile::open(&waiter.path).unwrap();
+        assert!(!probe.try_lock().unwrap());
+    }
+}
+
+#[test]
+fn a_flight_wait_warns_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let holder = flight_at(dir.path(), "rustc", "notice").unwrap();
+    let mut messages = Vec::new();
+    // The notice is checked before each lock attempt, so a zero threshold
+    // fires on the first pass whatever the scheduling, and the holder is gone
+    // by then so the wait ends there.
+    let waiter = flight_at_inner(
+        dir.path(),
+        "rustc",
+        "notice",
+        "example_crate",
+        FlightWait {
+            notice: Duration::ZERO,
+            limit: None,
+        },
+        || drop(holder),
+        |message| messages.push(message.to_owned()),
+    )
+    .unwrap();
+    assert!(waiter.waited());
+    assert_eq!(messages.len(), 1, "one notice: {messages:?}");
+    assert!(messages[0].contains("example_crate"));
+}
+
+#[test]
+fn a_flight_wait_times_out_without_a_phantom_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let holder = flight_at(dir.path(), "rustc", "timeout").unwrap();
+    let mut messages = Vec::new();
+    let result = flight_at_inner(
+        dir.path(),
+        "rustc",
+        "timeout",
+        "example_crate",
+        FlightWait {
+            notice: Duration::MAX,
+            limit: Some(Duration::from_millis(35)),
+        },
+        || {},
+        |message| messages.push(message.to_owned()),
+    );
+    assert!(result.is_err());
+    assert_eq!(messages.len(), 1, "one timeout warning: {messages:?}");
+    assert!(messages[0].contains("stopped waiting"));
+    assert!(messages[0].contains("example_crate"));
+    drop(holder);
+    let next = flight_at(dir.path(), "rustc", "timeout").unwrap();
+    assert!(!next.waited());
+}
+
+#[test]
+fn flight_wait_limit_uses_the_previous_compiler_duration() {
+    for (payload, expected) in [
+        ("{}", 600),
+        ("not json", 600),
+        (r#"{"compiler_duration_ns":1000000000}"#, 600),
+        (r#"{"compiler_duration_ns":200000000000}"#, 800),
+        (r#"{"compiler_duration_ns":-1}"#, 600),
+    ] {
+        let record = serde_json::to_vec(&FlightRecord {
+            version: FLIGHT_VERSION,
+            adapter: "rustc".into(),
+            invocation: "limit".into(),
+            payload: payload.into(),
+            attempt: None,
+        })
+        .unwrap();
+        assert_eq!(
+            flight_wait_limit(Some(&record)),
+            Duration::from_secs(expected)
+        );
+    }
+    assert_eq!(flight_wait_limit(None), FLIGHT_WAIT_MIN);
+}
+
+#[test]
+fn a_holder_publishing_before_the_waiter_arrives_releases_it_on_a_miss() {
+    for adapter in ["rustc", "cc"] {
+        let dir = tempfile::tempdir().unwrap();
+        let holder = flight_at(dir.path(), adapter, "early").unwrap();
+        holder.leave("already published");
+        let mut waiter = flight_at_inner(
+            dir.path(),
+            adapter,
+            "early",
+            "crate",
+            FlightWait::default(),
+            || drop(holder),
+            |_| {},
+        )
+        .unwrap();
+        assert!(waiter.waited());
+        assert_eq!(waiter.inherited(), Some("already published"));
+        assert!(waiter.published_while_waiting());
+        waiter.finish_restore(false);
+        let mut probe = fslock::LockFile::open(&waiter.path).unwrap();
+        assert!(
+            probe.try_lock().unwrap(),
+            "{adapter} waiter must compile in parallel"
+        );
+    }
+}
+
+#[test]
+fn legacy_predictions_do_not_release_waiters_on_a_miss() {
+    let dir = tempfile::tempdir().unwrap();
+    let holder = flight_at(dir.path(), "rustc", "legacy").unwrap();
+    holder.leave("old format");
+    let path = record_path(&holder.path);
+    let mut record: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+    record.as_object_mut().unwrap().remove("attempt");
+    std::fs::write(path, serde_json::to_vec(&record).unwrap()).unwrap();
+    let mut waiter = flight_at_inner(
+        dir.path(),
+        "rustc",
+        "legacy",
+        "crate",
+        FlightWait::default(),
+        || drop(holder),
+        |_| {},
+    )
+    .unwrap();
+    assert_eq!(waiter.inherited(), Some("old format"));
+    assert!(!waiter.published_while_waiting());
+    waiter.finish_restore(false);
+    let mut probe = fslock::LockFile::open(&waiter.path).unwrap();
+    assert!(!probe.try_lock().unwrap());
+}
+
+#[test]
+fn a_released_publish_is_not_attributed_to_the_current_holder() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut released = flight_at(dir.path(), "cc", "late").unwrap();
+    released.release();
+    let holder = flight_at(dir.path(), "cc", "late").unwrap();
+    released.leave("late publication from an earlier attempt");
+    let mut waiter = flight_at_inner(
+        dir.path(),
+        "cc",
+        "late",
+        "file.c",
+        FlightWait::default(),
+        || drop(holder),
+        |_| {},
+    )
+    .unwrap();
+    assert!(waiter.inherited().is_some());
+    assert!(!waiter.published_while_waiting());
+    waiter.finish_restore(false);
+    let mut probe = fslock::LockFile::open(&waiter.path).unwrap();
+    assert!(!probe.try_lock().unwrap());
 }

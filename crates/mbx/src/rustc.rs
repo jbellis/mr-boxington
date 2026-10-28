@@ -430,12 +430,12 @@ pub(crate) fn compile(
     // waking from that wait, or finding the prediction a finished flight left
     // behind, is one more chance to restore instead of compile. Never in
     // verify mode, whose whole point is running the compiler.
-    let flight = if verify || private_inputs || learned.engaged() {
+    let mut flight = if verify || private_inputs || learned.engaged() {
         None
     } else {
         join_flight(&compilation)
     };
-    if let Some(flight) = &flight
+    if let Some(flight) = &mut flight
         // Only when the payload can say something a lookup this session has
         // not already said: either we waited and it is freshly published, or
         // nothing was ever looked up and it is the first prediction we have.
@@ -453,6 +453,7 @@ pub(crate) fn compile(
             Some(&mut current_diagnostic),
         ) {
             Ok(Some(cached)) => {
+                flight.flight.finish_restore(true);
                 install_build_script_shim(&invocation, &outputs, &cached.action);
                 let _ = replay_bytes(&cached.stdout, &cached.stderr);
                 return Ok(ExitCode::SUCCESS);
@@ -470,6 +471,9 @@ pub(crate) fn compile(
             }
         }
     }
+    if let Some(flight) = &mut flight {
+        flight.flight.finish_restore(false);
+    }
     // An active unit whose environment changed was left to the lookups above.
     // When none of them got far enough to plan its churn, as when no
     // prediction survives to key it, the change still keeps private state.
@@ -486,6 +490,10 @@ pub(crate) fn compile(
         // Incremental artifacts are deliberately never published, so they
         // must not acquire a fleet lease whose promise they cannot fulfill.
         && !learned.engaged()
+        // A released flight just learned that builds with this key differ in
+        // their inputs. Waiting on a fleet promise could queue behind another
+        // compile it cannot use, so it compiles now.
+        && !flight.flight.released()
     {
         match session::request_agent(&[AgentRequest::JoinActionPromise {
             adapter: "rustc".into(),
@@ -3170,7 +3178,11 @@ fn join_flight(compilation: &Compilation<'_>) -> Option<InvocationFlight> {
         Ok(compilation.invocation.invocation_digest(&context)?)
     })()
     .ok()?;
-    let flight = crate::scheduler::flight("rustc", &invocation.hash)?;
+    let flight = crate::scheduler::flight(
+        "rustc",
+        &invocation.hash,
+        compilation.invocation.crate_name(),
+    )?;
     Some(InvocationFlight { flight, invocation })
 }
 

@@ -11,12 +11,19 @@ use std::process::Command;
 use std::process::{Child, Output, Stdio};
 
 #[cfg(unix)]
-struct BuildChildGuard(Option<Child>);
+struct BuildChildGuard(Option<Child>, Option<libc::pid_t>);
 
 #[cfg(unix)]
 impl BuildChildGuard {
     fn new(child: Child) -> Self {
-        Self(Some(child))
+        Self(Some(child), None)
+    }
+
+    fn spawn_group(command: &mut Command) -> std::io::Result<Self> {
+        use std::os::unix::process::CommandExt as _;
+        let child = command.process_group(0).spawn()?;
+        let group = child.id() as libc::pid_t;
+        Ok(Self(Some(child), Some(group)))
     }
 
     fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
@@ -40,6 +47,11 @@ impl Drop for BuildChildGuard {
         let Some(child) = self.0.as_mut() else {
             return;
         };
+        if let Some(group) = self.1 {
+            // SAFETY: spawn_group creates a distinct process group whose id is
+            // the unreaped child's pid. Kill descendants even if mbx exited.
+            unsafe { libc::kill(-group, libc::SIGKILL) };
+        }
         if child.try_wait().ok().flatten().is_none() {
             let _ = child.kill();
         }
@@ -8731,4 +8743,186 @@ fn late_workspace_wrappers_keep_objects_when_they_skip_rustc() {
             );
         }
     }
+}
+
+/// A waiter with different inputs must not serialize the builds behind it.
+/// With no new publication it must retain occupancy, so the next build can
+/// reuse its own result. Compiler and flight barriers make both cases exact.
+#[cfg(unix)]
+#[test]
+fn a_flight_waiter_releases_only_after_a_fresh_prediction_misses() {
+    use std::time::{Duration, Instant};
+
+    struct ReleaseCompiler(PathBuf);
+    impl Drop for ReleaseCompiler {
+        fn drop(&mut self) {
+            let _ = std::fs::write(&self.0, "");
+        }
+    }
+
+    for publishes in [true, false] {
+        let directory = tempfile::tempdir().unwrap();
+        let project = directory.path().join("project");
+        let store = directory.path().join("store");
+        write_project(&project);
+        let wrapper = directory.path().join("gated-rustc");
+        let entered = directory.path().join("compiler-entered");
+        let release = directory.path().join("release-compiler");
+        std::fs::write(
+            &wrapper,
+            r#"#!/bin/sh
+case " $* " in
+  *" --crate-name fixture "*)
+    : > "$TEST_COMPILER_ENTERED"
+    while [ ! -e "$TEST_RELEASE_COMPILER" ]; do sleep 0.02; done
+    ;;
+esac
+exec "$TEST_REAL_RUSTC" "$@"
+"#,
+        )
+        .unwrap();
+        std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let real_rustc = which::which("rustc").unwrap();
+        let settings = [
+            ("MBX_LOG", "debug"),
+            ("MBX_TARGET_VIEWS", "0"),
+            ("MBX_LEARNED_INCREMENTAL", "0"),
+            ("CARGO_INCREMENTAL", "0"),
+            ("RUSTC", wrapper.to_str().unwrap()),
+            ("TEST_REAL_RUSTC", real_rustc.to_str().unwrap()),
+            ("TEST_COMPILER_ENTERED", entered.to_str().unwrap()),
+            ("TEST_RELEASE_COMPILER", release.to_str().unwrap()),
+        ];
+        std::fs::write(&release, "").unwrap();
+        build_with(
+            &project,
+            &store,
+            &directory.path().join("seed.json"),
+            &settings,
+        );
+        let records = find_files(&store.join("scheduler/inflight"), |path| {
+            path.extension().is_some_and(|ext| ext == "prediction")
+        });
+        assert_eq!(records.len(), 1, "one fixture invocation: {records:?}");
+        let record_path = &records[0];
+        let original = std::fs::read(record_path).unwrap();
+        let lock_path = record_path.with_extension("");
+        let mut holder = fslock::LockFile::open(&lock_path).unwrap();
+        assert!(holder.try_lock().unwrap());
+        // Model a new holder and publish before the waiter even arrives.
+        // Its seeded inputs cannot restore the waiter's changed source.
+        let attempt = lock_path.with_extension("attempt");
+        std::fs::write(&attempt, "test-holder-attempt").unwrap();
+        if publishes {
+            let mut record: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            record["attempt"] = serde_json::json!("test-holder-attempt");
+            std::fs::write(record_path, serde_json::to_vec(&record).unwrap()).unwrap();
+        }
+        std::fs::write(
+            project.join("src/lib.rs"),
+            "pub fn changed() -> u32 { 42 }\n",
+        )
+        .unwrap();
+        std::fs::remove_file(&entered).unwrap();
+        std::fs::remove_file(&release).unwrap();
+        let log = directory.path().join("waiter.stderr");
+        let mut command = isolated_cargo_command(
+            mbx_command(),
+            &project,
+            &store,
+            &directory.path().join("waiter.json"),
+            &["build", "--offline"],
+            &settings,
+        );
+        command
+            .stdout(Stdio::null())
+            .stderr(std::fs::File::create(&log).unwrap());
+        let mut waiter = BuildChildGuard::spawn_group(&mut command).unwrap();
+        // Declared after the child so unwinding opens the barrier before the
+        // direct child is killed. TempDir outlives both guards.
+        let _release_compiler = ReleaseCompiler(release.clone());
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let text = std::fs::read_to_string(&log).unwrap();
+            if text.contains("waiting for flight rustc-") {
+                break;
+            }
+            assert!(
+                waiter.try_wait().unwrap().is_none(),
+                "waiter exited: {text}"
+            );
+            assert!(
+                Instant::now() < deadline,
+                "waiter did not join flight: {text}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        drop(holder);
+        while !entered.exists() {
+            assert!(
+                waiter.try_wait().unwrap().is_none(),
+                "waiter exited: {}",
+                std::fs::read_to_string(&log).unwrap()
+            );
+            assert!(
+                Instant::now() < deadline,
+                "compiler did not reach barrier: {}",
+                std::fs::read_to_string(&log).unwrap()
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut third_party = fslock::LockFile::open(&lock_path).unwrap();
+        let available_during_compile = third_party.try_lock().unwrap();
+        // Release the compiler even if the occupancy assertion will fail.
+        std::fs::write(&release, "").unwrap();
+        drop(third_party);
+        let output = waiter.wait_with_output().unwrap();
+        let stderr = std::fs::read_to_string(&log).unwrap();
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(
+            available_during_compile, publishes,
+            "fresh publication={publishes}; third-party lock availability during the waiter's real compile: {stderr}"
+        );
+        assert!(
+            stderr.contains(if publishes {
+                "restore missed, flight released"
+            } else {
+                "restore missed, flight kept"
+            }),
+            "{stderr}"
+        );
+    }
+}
+
+/// Cleanup must close pipes inherited by grandchildren, even after a panic.
+#[cfg(unix)]
+#[test]
+fn build_child_guard_kills_the_compiler_process_group_on_unwind() {
+    use std::io::{BufRead as _, Read as _};
+
+    let mut command = Command::new("sh");
+    command
+        .arg("-c")
+        .arg("sleep 60 & echo ready; wait")
+        .stdout(Stdio::piped());
+    let mut child = BuildChildGuard::spawn_group(&mut command).unwrap();
+    let mut stdout = std::io::BufReader::new(child.0.as_mut().unwrap().stdout.take().unwrap());
+    let mut ready = String::new();
+    stdout.read_line(&mut ready).unwrap();
+    assert_eq!(ready.trim(), "ready");
+    let result = std::panic::catch_unwind(move || {
+        let _child = child;
+        panic!("exercise compiler cleanup on a failed assertion");
+    });
+    assert!(result.is_err());
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut remaining = String::new();
+        let result = stdout.read_to_string(&mut remaining);
+        let _ = sender.send(result);
+    });
+    receiver
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .expect("a compiler descendant still holds the output pipe open")
+        .unwrap();
 }

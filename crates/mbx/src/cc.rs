@@ -173,12 +173,16 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
     // waited for rather than duplicated, and the prediction a finished
     // flight left behind is one more chance to restore. Never in verify
     // mode, whose whole point is running the compiler.
-    let flight = if verify {
+    let mut flight = if verify {
         None
     } else {
-        crate::scheduler::flight(PREDICTION_ADAPTER, &invocation_digest.hash)
+        crate::scheduler::flight(
+            PREDICTION_ADAPTER,
+            &invocation_digest.hash,
+            &compilation_name(&invocation),
+        )
     };
-    if let Some(flight) = &flight
+    if let Some(flight) = &mut flight
         // Only when the payload can say something this session's own lookup
         // has not already said: either we waited and it is freshly
         // published, or nothing was ever looked up and it is the first
@@ -196,6 +200,7 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
             None,
         ) {
             Ok(Some((action, cached, discovered))) => {
+                flight.finish_restore(true);
                 write_caller_depfile(
                     &invocation,
                     discovered.files().map(|input| input.path.as_path()),
@@ -212,8 +217,13 @@ pub fn compile(compiler: &OsStr, arguments: &[OsString], language: CcLanguage) -
             }
         }
     }
+    if let Some(flight) = &mut flight {
+        flight.finish_restore(false);
+    }
     let mut remote_claim = None;
-    if flight.is_some() {
+    // A released flight compiles now rather than wait on a fleet promise; see
+    // the rustc wrapper.
+    if flight.as_ref().is_some_and(|flight| !flight.released()) {
         match session::request_agent(&[AgentRequest::JoinActionPromise {
             adapter: PREDICTION_ADAPTER.into(),
             invocation: invocation_digest.clone(),
